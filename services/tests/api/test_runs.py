@@ -67,6 +67,7 @@ def _mock_run(
     run.configuration_version_id = None
     run.module_overrides = None
     run.created_by = "test@example.com"
+    run.has_json_output = False
     return run
 
 
@@ -777,3 +778,150 @@ class TestCLIApplyGuard:
                 headers=_AUTH,
             )
         assert resp.status_code == 200
+
+
+# ── /plans/{id}/json-output (#280) ─────────────────────────────────────
+
+
+class TestPlanJsonOutput:
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    @patch("terrapod.api.routers.runs.get_storage")
+    @patch("terrapod.api.routers.runs.run_service.get_run")
+    async def test_redirects_to_presigned_url_when_present(
+        self, mock_get_run, mock_get_storage, *_mocks
+    ):
+        run = _mock_run()
+        run.has_json_output = True
+        mock_get_run.return_value = run
+
+        mock_storage = AsyncMock()
+        mock_storage.exists = AsyncMock(return_value=True)
+        presigned = MagicMock()
+        presigned.url = "https://storage.example/plans/x.json-output?sig=abc"
+        mock_storage.presigned_get_url = AsyncMock(return_value=presigned)
+        mock_get_storage.return_value = mock_storage
+
+        app, _db = _make_app(_user())
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url=_BASE, follow_redirects=False
+        ) as c:
+            resp = await c.get(f"/api/v2/plans/plan-{run.id}/json-output", headers=_AUTH)
+
+        assert resp.status_code == 302
+        assert resp.headers["location"] == presigned.url
+        mock_storage.exists.assert_awaited_once_with(
+            f"plans/{run.workspace_id}/{run.id}.json-output"
+        )
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    @patch("terrapod.api.routers.runs.get_storage")
+    @patch("terrapod.api.routers.runs.run_service.get_run")
+    async def test_404_when_object_missing(self, mock_get_run, mock_get_storage, *_mocks):
+        """Belt-and-braces: flag is True but the object is gone (retention deleted
+        the artifact between the upload and now). Endpoint must 404, not 302 to
+        a signed URL pointing at nothing."""
+        run = _mock_run()
+        run.has_json_output = True  # flag set; storage missing
+        mock_get_run.return_value = run
+
+        mock_storage = AsyncMock()
+        mock_storage.exists = AsyncMock(return_value=False)
+        mock_get_storage.return_value = mock_storage
+
+        app, _db = _make_app(_user())
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.get(f"/api/v2/plans/plan-{run.id}/json-output", headers=_AUTH)
+
+        assert resp.status_code == 404
+        mock_storage.exists.assert_awaited_once()
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    @patch("terrapod.api.routers.runs.get_storage")
+    @patch("terrapod.api.routers.runs.run_service.get_run")
+    async def test_fast_path_404_skips_storage_when_flag_false(
+        self, mock_get_run, mock_get_storage, *_mocks
+    ):
+        """When `has_json_output=False`, the endpoint must return 404 without
+        touching storage at all — that's the optimization the flag exists for."""
+        run = _mock_run()
+        run.has_json_output = False
+        mock_get_run.return_value = run
+
+        mock_storage = AsyncMock()
+        mock_storage.exists = AsyncMock(return_value=True)  # would lie if asked
+        mock_get_storage.return_value = mock_storage
+
+        app, _db = _make_app(_user())
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.get(f"/api/v2/plans/plan-{run.id}/json-output", headers=_AUTH)
+
+        assert resp.status_code == 404
+        mock_storage.exists.assert_not_called()
+        mock_storage.presigned_get_url.assert_not_called()
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    @patch("terrapod.api.routers.runs.run_service.get_run")
+    async def test_404_for_unknown_plan(self, mock_get_run, *_mocks):
+        mock_get_run.return_value = None
+        app, _db = _make_app(_user())
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.get(f"/api/v2/plans/plan-{uuid.uuid4()}/json-output", headers=_AUTH)
+        assert resp.status_code == 404
+
+
+# ── _plan_json json-output attribute gating (#280) ─────────────────────
+
+
+class TestPlanJsonAttribute:
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    @patch("terrapod.api.routers.runs.resolve_workspace_permission")
+    @patch("terrapod.api.routers.runs.run_service.get_run")
+    async def test_attribute_present_when_uploaded(self, mock_get_run, mock_resolve, *_mocks):
+        mock_resolve.return_value = "read"
+        run = _mock_run(status="planned")
+        run.has_json_output = True
+        mock_get_run.return_value = run
+
+        ws = _mock_workspace(ws_id=run.workspace_id)
+        app, mock_db = _make_app(_user())
+        mock_db.get.return_value = ws
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.get(f"/api/v2/plans/plan-{run.id}", headers=_AUTH)
+
+        attrs = resp.json()["data"]["attributes"]
+        assert "json-output" in attrs
+        assert attrs["json-output"].endswith(f"/api/v2/plans/{run.id}/json-output")
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    @patch("terrapod.api.routers.runs.resolve_workspace_permission")
+    @patch("terrapod.api.routers.runs.run_service.get_run")
+    async def test_attribute_absent_when_not_uploaded(self, mock_get_run, mock_resolve, *_mocks):
+        """Don't advertise a URL we know would 404. Older / errored / failed-upload
+        runs must not carry the `json-output` attribute."""
+        mock_resolve.return_value = "read"
+        run = _mock_run(status="planned")
+        run.has_json_output = False
+        mock_get_run.return_value = run
+
+        ws = _mock_workspace(ws_id=run.workspace_id)
+        app, mock_db = _make_app(_user())
+        mock_db.get.return_value = ws
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.get(f"/api/v2/plans/plan-{run.id}", headers=_AUTH)
+
+        attrs = resp.json()["data"]["attributes"]
+        assert "json-output" not in attrs

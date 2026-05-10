@@ -402,10 +402,10 @@ if [ "$TP_PHASE" = "plan" ]; then
     # Redirect to file so $! gives the plan PID for correct signal forwarding.
     # A background tail -f streams output to pod logs in real-time.
     PLAN_ARGS="-input=false -detailed-exitcode"
-    # Only save plan file if not plan-only (plan file is discarded for plan-only runs)
-    if [ "${TP_PLAN_ONLY:-false}" != "true" ]; then
-        PLAN_ARGS="$PLAN_ARGS -out=tfplan"
-    fi
+    # Always write the binary plan file. For non-plan-only runs the apply
+    # phase consumes it; for plan-only runs we still need it as input to
+    # `tofu show -json` for the json-output artifact.
+    PLAN_ARGS="$PLAN_ARGS -out=tfplan"
     if [ "${TP_REFRESH_ONLY:-false}" = "true" ]; then
         PLAN_ARGS="$PLAN_ARGS -refresh-only"
     fi
@@ -449,11 +449,31 @@ if [ "$TP_PHASE" = "plan" ]; then
     [ -f /tmp/plan.log ] && cat /tmp/plan.log >> "$COMBINED_LOG"
 
     # Upload plan file (best-effort) — separate artifact, not a log.
-    if [ -n "$TP_API_URL" ] && [ -f tfplan ]; then
+    # Skip for plan-only runs: there is no apply phase that would consume
+    # the binary, so don't burn storage on it.
+    if [ -n "$TP_API_URL" ] && [ -f tfplan ] && [ "${TP_PLAN_ONLY:-false}" != "true" ]; then
         curl -sSf --max-time "$TP_UPLOAD_TIMEOUT" -X PUT -H "$AUTH_HEADER" \
             -H "Content-Type: application/octet-stream" \
             --data-binary @tfplan \
             "${TP_API_URL}/api/terrapod/v1/runs/${TP_RUN_ID}/artifacts/plan-file" || true
+    fi
+
+    # Emit + upload structured JSON plan (`tofu show -json`). Best-effort:
+    # large plans can produce multi-MB JSON, and a failed upload here
+    # MUST NOT fail the run — the read endpoint just returns 404. The
+    # presence of `tfplan` is the right gate: -detailed-exitcode 1
+    # (errored) doesn't produce one; both 0 (no changes) and 2 (changes)
+    # do.
+    if [ -n "$TP_API_URL" ] && [ -f tfplan ]; then
+        if "$TP_BIN" show -json tfplan > /tmp/plan.json 2> /tmp/plan-show.err; then
+            curl -sSf --max-time "$TP_UPLOAD_TIMEOUT" -X PUT -H "$AUTH_HEADER" \
+                -H "Content-Type: application/json" \
+                --data-binary @/tmp/plan.json \
+                "${TP_API_URL}/api/terrapod/v1/runs/${TP_RUN_ID}/artifacts/plan-json-output" \
+                || log "[entrypoint] plan-json-output upload failed (non-fatal)"
+        else
+            log "[entrypoint] $TP_BIN show -json tfplan failed (non-fatal): $(head -c 500 /tmp/plan-show.err)"
+        fi
     fi
 
 elif [ "$TP_PHASE" = "apply" ]; then

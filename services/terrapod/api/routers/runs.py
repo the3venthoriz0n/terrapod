@@ -16,6 +16,8 @@ Endpoints:
     POST   /api/terrapod/v1/runs/{run_id}/actions/retry        (retry run — create new run from terminal run)
     GET    /api/terrapod/v1/runs/{run_id}/plan                 (plan details)
     GET    /api/v2/plans/{plan_id}                    (plan details by ID)
+    GET    /api/v2/plans/{plan_id}/log                (plan log stream)
+    GET    /api/v2/plans/{plan_id}/json-output        (structured JSON plan; 302 → presigned)
     GET    /api/terrapod/v1/runs/{run_id}/apply                (apply details)
     GET    /api/v2/applies/{apply_id}                 (apply details by ID)
     PATCH  /api/terrapod/v1/listeners/{id}/runs/{run_id}       (listener status update)
@@ -30,7 +32,7 @@ from datetime import UTC
 from typing import Literal
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Request, Response, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
@@ -47,7 +49,7 @@ from terrapod.logging_config import get_logger
 from terrapod.services import agent_pool_service, run_service
 from terrapod.services.workspace_rbac_service import has_permission, resolve_workspace_permission
 from terrapod.storage import get_storage
-from terrapod.storage.keys import apply_log_key, plan_log_key
+from terrapod.storage.keys import apply_log_key, plan_json_output_key, plan_log_key
 from terrapod.storage.protocol import ObjectNotFoundError
 
 router = APIRouter(prefix="/api/v2", tags=["runs"])
@@ -722,15 +724,18 @@ def _plan_json(run: Run) -> dict:
     from terrapod.config import settings
 
     base = settings.auth.callback_base_url.rstrip("/")
+    attrs: dict = {
+        "status": _plan_status(run),
+        "log-read-url": f"{base}/api/v2/plans/{run.id}/log",
+        "has-changes": run.status in ("planned", "confirmed", "applying", "applied"),
+    }
+    if run.has_json_output:
+        attrs["json-output"] = f"{base}/api/v2/plans/{run.id}/json-output"
     return {
         "data": {
             "id": f"plan-{run.id}",
             "type": "plans",
-            "attributes": {
-                "status": _plan_status(run),
-                "log-read-url": f"{base}/api/v2/plans/{run.id}/log",
-                "has-changes": run.status in ("planned", "confirmed", "applying", "applied"),
-            },
+            "attributes": attrs,
             "links": {
                 "self": f"/api/v2/plans/plan-{run.id}",
             },
@@ -1279,6 +1284,43 @@ async def plan_log(
         limit=limit,
         strip_ansi=format == "plain",
     )
+
+
+@router.get("/plans/{plan_id}/json-output")
+async def plan_json_output(
+    plan_id: str = Path(...),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Serve the structured JSON plan output (`tofu show -json`).
+
+    go-tfe's `Plans.ReadJSONOutput` consumes this endpoint via
+    `tofu show -json` against a remote run. Response is raw JSON bytes;
+    auth is by capability (the plan UUID), matching `/plans/{id}/log`.
+    A 302 to a presigned storage URL is fine — `req.Do` follows
+    redirects.
+    """
+    try:
+        run_uuid = uuid.UUID(plan_id.removeprefix("plan-").removeprefix("run-"))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Plan not found") from None
+    run = await run_service.get_run(db, run_uuid)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    # Fast path: the flag is the source of truth. Avoid a storage call
+    # for runs that never produced JSON (errored, older, upload failed).
+    if not run.has_json_output:
+        raise HTTPException(status_code=404, detail="JSON plan output not available")
+
+    storage = get_storage()
+    key = plan_json_output_key(str(run.workspace_id), str(run.id))
+    # Belt-and-braces: retention may have deleted the artifact while
+    # leaving the flag intact, in which case we must not redirect to a
+    # signed URL pointing at a missing object.
+    if not await storage.exists(key):
+        raise HTTPException(status_code=404, detail="JSON plan output not available")
+    url = await storage.presigned_get_url(key)
+    return RedirectResponse(url=url.url, status_code=302)
 
 
 @router.get("/applies/{apply_id}/log")
