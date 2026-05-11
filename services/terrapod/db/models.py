@@ -309,6 +309,26 @@ class Workspace(Base):
         ARRAY(String(255)), nullable=False, server_default="{}"
     )
 
+    # VCS workflow mode — see #282 + docs/vcs-workflows.md
+    # - merge_then_apply (default, TFE/HCP standard): PR runs are speculative;
+    #   apply happens against the merged commit on the default branch.
+    # - apply_then_merge (Atlantis standard, opt-in): PR runs are full
+    #   plan-and-apply with saved tfplan; apply runs against the PR head and
+    #   the user drives apply via PR comments.
+    vcs_workflow: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="merge_then_apply", default="merge_then_apply"
+    )
+
+    # Auto-merge after apply succeeds. Available in both modes; primary use is
+    # apply_then_merge. When all PR-affected workspaces meet their per-mode
+    # required state, the merge fires via the VCS provider's merge API.
+    auto_merge: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", default=False
+    )
+    auto_merge_strategy: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="merge", default="merge"
+    )  # merge, squash, rebase
+
     # Drift detection
     drift_detection_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     drift_detection_interval_seconds: Mapped[int] = mapped_column(
@@ -852,6 +872,61 @@ class AutodiscoveryRule(Base):
     )
 
 
+class PRSession(Base):
+    """Conversation state for one PR/MR in apply-then-merge mode (#282).
+
+    Tracks the edit-in-place status comment, the current head SHA, the
+    poll cursors for comments/reviews, and the lifecycle state of the PR.
+    One row per (connection, repo, pr_number). Created lazily when the
+    first apply-then-merge workspace plans against the PR.
+    """
+
+    __tablename__ = "pr_sessions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=generate_uuid7
+    )
+
+    vcs_connection_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("vcs_connections.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    vcs_connection: Mapped["VCSConnection"] = relationship(
+        "VCSConnection", foreign_keys=[vcs_connection_id], lazy="joined"
+    )
+    repo: Mapped[str] = mapped_column(String(500), nullable=False)  # owner/name
+    pr_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    head_sha: Mapped[str] = mapped_column(String(40), nullable=False, default="")
+
+    # Edit-in-place status comment id from the VCS provider (string because
+    # GitHub uses int64s but GitLab and other providers may differ).
+    status_comment_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # Poll cursors — last item we've processed via webhook or poll, so the
+    # poll fallback doesn't re-dispatch already-handled events. Strings to
+    # accommodate provider-specific id shapes.
+    last_processed_comment_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_processed_review_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # PR lifecycle state. Mirrors the VCS provider's notion: open, closed
+    # (without merge), or merged. Closed/merged sessions are kept for
+    # historical audit but don't dispatch commands.
+    state: Mapped[str] = mapped_column(String(20), nullable=False, default="open")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+    __table_args__ = (
+        sa.UniqueConstraint("vcs_connection_id", "repo", "pr_number", name="uq_pr_session"),
+        sa.Index("ix_pr_sessions_open", "vcs_connection_id", "state"),
+    )
+
+
 # --- Variables ---
 
 
@@ -1092,6 +1167,15 @@ class Run(Base):
     vcs_branch: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     vcs_pull_request_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # Apply-then-merge bookkeeping (#282)
+    # Populated when the apply gate rejects (e.g. branch protection blocks merge);
+    # surfaced on the run UI and on the PR status comment.
+    vcs_apply_blocked_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # VCS-side actor for comment-driven actions. Recorded directly (no Terrapod
+    # identity mapping) — see "Authorization model" in #282.
+    vcs_actor_login: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    vcs_actor_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     plan_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     plan_finished_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -1141,14 +1225,30 @@ class AuditLog(Base):
     actor_email: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     actor_ip: Mapped[str] = mapped_column(String(45), nullable=False, default="")
     action: Mapped[str] = mapped_column(
-        String(20), nullable=False
-    )  # HTTP method: GET, POST, PATCH, DELETE
+        String(40), nullable=False
+    )  # HTTP method for API events; verb (apply/plan/merge/...) for VCS events
     resource_type: Mapped[str] = mapped_column(String(63), nullable=False, default="")
     resource_id: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     status_code: Mapped[int] = mapped_column(Integer, nullable=False)
     request_id: Mapped[str] = mapped_column(String(63), nullable=False, default="")
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     detail: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    # Dual-actor model (#282).
+    # - actor_type: "terrapod_user" (HTTP/UI/API), "vcs_user" (PR comment),
+    #   "system" (background tasks).
+    # - origin: "api", "terrapod_ui", "pr_comment", "system".
+    # - actor_login: VCS-side display login (e.g. GitHub username) when
+    #   actor_type is vcs_user; empty otherwise.
+    # - actor_id: provider-side immutable user id (e.g. GitHub user id) when
+    #   actor_type is vcs_user; empty otherwise.
+    actor_type: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="terrapod_user"
+    )
+    origin: Mapped[str] = mapped_column(String(20), nullable=False, server_default="api")
+    actor_login: Mapped[str] = mapped_column(String(255), nullable=False, server_default="")
+    actor_id: Mapped[str] = mapped_column(String(64), nullable=False, server_default="")
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
@@ -1157,6 +1257,7 @@ class AuditLog(Base):
         Index("ix_audit_logs_timestamp", "timestamp"),
         Index("ix_audit_logs_actor_email", "actor_email"),
         Index("ix_audit_logs_resource", "resource_type", "resource_id"),
+        Index("ix_audit_logs_actor_type", "actor_type"),
     )
 
 
