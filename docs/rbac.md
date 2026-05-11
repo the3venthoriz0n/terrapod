@@ -2,6 +2,8 @@
 
 Terrapod uses a label-based RBAC system instead of Terraform Enterprise's team model. Labels replace teams entirely -- a "team" is just a label. This document covers the permission model, role configuration, and common patterns.
 
+> Note: Workspaces configured for **[apply-then-merge](vcs-workflows.md)** delegate authorization for PR-comment-driven actions (`terrapod plan`, `terrapod apply`, `terrapod merge`) to the VCS provider's repo permissions and branch protection — Terrapod's label-based RBAC described here does **not** gate those actions. RBAC continues to apply to everything else (UI navigation, CLI runs, state access, settings changes).
+
 ---
 
 ## Permission Model
@@ -364,6 +366,8 @@ The web UI displays this field as **"Labels (tags)"** to make the dual purpose e
 ### Labels Browser
 
 Labels are also queryable as a first-class navigation surface via the **Labels** page in the web UI (and the `GET /api/terrapod/v1/labels[/{key}[/{value}]]` endpoints — see [API Reference](api-reference.md#labels)). It lists every key in use, drills into the values for a key, and from a value lists every entity carrying it — workspaces, modules, providers, and pools.
+
+![Labels Browser](images/labels-browser.png)
 
 The browser is **read-only**: editing happens on each entity's own page. It is **RBAC-filtered**: a label only appears if you can `read` at least one entity that carries it, and the per-key/value listings only count entities you can see. There is no admin escape hatch — `admin`/`audit` see everything because their underlying RBAC grants them read on every entity, not because the labels page treats them specially.
 
