@@ -30,10 +30,18 @@ from terrapod.api.metrics import (
     VCS_PRS_DETECTED,
     VCS_RUNS_CREATED,
 )
-from terrapod.db.models import AutodiscoveryRule, Run, VCSConnection, Workspace, utc_now
+from terrapod.db.models import (
+    AutodiscoveryRule,
+    PRSession,
+    Run,
+    VCSConnection,
+    Workspace,
+    utc_now,
+)
 from terrapod.db.session import get_db_session
 from terrapod.logging_config import get_logger
 from terrapod.services import github_service, gitlab_service, run_service
+from terrapod.services.scheduler import enqueue_trigger
 from terrapod.services.vcs_archive_cache import VCSArchiveCache, materialize_archive
 from terrapod.services.vcs_provider import PullRequest
 from terrapod.services.workspace_autodiscovery_service import autodiscover_for_paths
@@ -413,6 +421,188 @@ async def _poll_workspace_branch(
         )
 
 
+async def _upsert_pr_session(
+    db: AsyncSession,
+    conn: VCSConnection,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+) -> PRSession:
+    """Find or create the PRSession row for this (connection, repo, PR).
+
+    Updates `head_sha` if the PR has new commits. Idempotent — designed
+    to be called every poll cycle that sees an open PR. Returns the
+    persisted row (flushed but not committed; caller drives the commit).
+    """
+    existing = await db.execute(
+        select(PRSession).where(
+            PRSession.vcs_connection_id == conn.id,
+            PRSession.repo == repo,
+            PRSession.pr_number == pr_number,
+        )
+    )
+    sess = existing.scalar_one_or_none()
+    if sess is None:
+        sess = PRSession(
+            vcs_connection_id=conn.id,
+            repo=repo,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            state="open",
+        )
+        db.add(sess)
+        await db.flush()
+        return sess
+    if sess.head_sha != head_sha:
+        sess.head_sha = head_sha
+    if sess.state != "open":
+        sess.state = "open"
+    return sess
+
+
+async def _poll_pr_comments(
+    db: AsyncSession,
+    conn: VCSConnection,
+    repo: str,
+) -> None:
+    """Poll-fallback for `issue_comment` / `note` webhooks (#282).
+
+    For each open PRSession on this (connection, repo), fetch comments
+    since the last processed comment id and dispatch any `terrapod ...`
+    commands via the scheduler. The scheduler's per-comment-id dedup
+    key ensures webhook+poll racing doesn't double-dispatch.
+
+    Required for deployments where the GitHub App doesn't have
+    `issue_comment` webhook delivery (firewalled installs, local dev
+    stacks, App permission upgrade not yet accepted) — webhooks
+    accelerate, polling is the source of truth.
+    """
+    sessions = await db.execute(
+        select(PRSession).where(
+            PRSession.vcs_connection_id == conn.id,
+            PRSession.repo == repo,
+            PRSession.state == "open",
+        )
+    )
+    open_sessions = list(sessions.scalars().all())
+    if not open_sessions:
+        return
+
+    owner, repo_name = repo.split("/", 1)
+    for sess in open_sessions:
+        try:
+            if conn.provider == "github":
+                comments = await github_service.list_pr_comments_typed(
+                    conn, owner, repo_name, sess.pr_number, since=None
+                )
+            elif conn.provider == "gitlab":
+                comments = await gitlab_service.list_pr_comments_typed(
+                    conn, owner, repo_name, sess.pr_number, since=None
+                )
+            else:
+                continue
+        except Exception as e:
+            logger.warning(
+                "comment poll: provider call failed",
+                repo=repo,
+                pr_number=sess.pr_number,
+                error=str(e),
+            )
+            continue
+
+        # Filter to comments newer than the last processed id (string
+        # compare is fine — GitHub + GitLab comment ids are
+        # monotonically increasing integers as strings).
+        new_comments = [
+            c
+            for c in comments
+            if sess.last_processed_comment_id is None
+            or int(c.id) > int(sess.last_processed_comment_id)
+        ]
+        for c in new_comments:
+            # Local import to avoid pulling the parser into the global
+            # import graph for this single use.
+            from terrapod.services.vcs_command_parser import is_command_comment
+
+            if not is_command_comment(c.body):
+                continue
+            await enqueue_trigger(
+                "vcs_comment_dispatch",
+                {
+                    "connection_id": str(conn.id),
+                    "repo": repo,
+                    "pr_number": sess.pr_number,
+                    "comment_id": c.id,
+                    "actor_login": c.author_login,
+                    "actor_user_id": c.author_user_id,
+                    "body": c.body,
+                },
+                dedup_key=f"vcs_cmd:{conn.id}:{repo}:{sess.pr_number}:{c.id}",
+            )
+            logger.info(
+                "comment poll: dispatched terrapod command",
+                repo=repo,
+                pr_number=sess.pr_number,
+                comment_id=c.id,
+                author=c.author_login,
+            )
+        if new_comments:
+            # Advance the cursor regardless of whether any comments
+            # matched the parser — saves us re-scanning prose comments.
+            sess.last_processed_comment_id = max((c.id for c in new_comments), key=lambda x: int(x))
+
+
+async def _reconcile_closed_pr_sessions(
+    db: AsyncSession,
+    conn: VCSConnection,
+    repo: str,
+    open_pr_numbers: set[int],
+) -> None:
+    """Detect PRs that have been closed since the last poll and clean up.
+
+    For each open PRSession on this (connection, repo) that's no longer
+    in the VCS provider's open-PR list, cancel any active runs to release
+    the workspace lock and mark the session as `closed`. This is the
+    poll-cycle fallback for the `pull_request:closed` webhook (which
+    phase 4 wires up). Hook-and-poll per #282: webhooks accelerate, polling
+    is the source of truth.
+    """
+    sessions = await db.execute(
+        select(PRSession).where(
+            PRSession.vcs_connection_id == conn.id,
+            PRSession.repo == repo,
+            PRSession.state == "open",
+        )
+    )
+    for sess in sessions.scalars().all():
+        if sess.pr_number in open_pr_numbers:
+            continue
+        # PR no longer in the open list — cancel active runs, close session.
+        active = await db.execute(
+            select(Run).where(
+                Run.vcs_pull_request_number == sess.pr_number,
+                Run.status.notin_(run_service.TERMINAL_STATES),
+            )
+        )
+        for run in active.scalars().all():
+            try:
+                await run_service.cancel_run(db, run, force=True)
+                logger.info(
+                    "Canceled run for closed PR",
+                    run_id=str(run.id),
+                    pr_number=sess.pr_number,
+                    repo=repo,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to cancel run for closed PR",
+                    run_id=str(run.id),
+                    pr_number=sess.pr_number,
+                    error=str(e),
+                )
+        sess.state = "closed"
+
+
 async def _poll_workspace_prs(
     db: AsyncSession,
     ws: Workspace,
@@ -425,6 +615,17 @@ async def _poll_workspace_prs(
 ) -> None:
     """Check open PRs/MRs targeting the tracked branch for speculative plans."""
     prs = await _list_open_prs(conn, owner, repo, branch)
+
+    # Hook-and-poll fallbacks (#282). Only run for apply-then-merge —
+    # default-mode PR runs are plan-only and don't drive any of this.
+    if ws.vcs_workflow == "apply_then_merge":
+        open_pr_numbers = {pr.number for pr in prs}
+        # PR-closed: cancel runs, release workspace locks.
+        await _reconcile_closed_pr_sessions(db, conn, f"{owner}/{repo}", open_pr_numbers)
+        # Comment polling: dispatch any new `terrapod ...` commands the
+        # webhook either didn't deliver (no subscription, firewall) or
+        # raced with this poll cycle (dedup key in dispatcher handles the race).
+        await _poll_pr_comments(db, conn, f"{owner}/{repo}")
 
     for pr in prs:
         # Check if we already have any run for this PR + SHA (avoid duplicates)
@@ -505,6 +706,20 @@ async def _poll_workspace_prs(
                     error=repr(e),
                 )
 
+        # Branch on workspace mode (#282).
+        # - merge_then_apply (default): PR run is speculative plan-only.
+        # - apply_then_merge: PR run is a full plan-and-apply that saves
+        #   the tfplan and sits in `planned` waiting on a user comment.
+        #   The non-speculative run holds the workspace lock through
+        #   `planned` (confirmed via Q8 in #282 — non-plan-only runs
+        #   only release the lock at terminal/applied/cancelled).
+        is_apply_then_merge = ws.vcs_workflow == "apply_then_merge"
+        speculative = not is_apply_then_merge
+        if is_apply_then_merge:
+            message = f"Plan for PR #{pr.number}: {pr.title}"
+        else:
+            message = f"Speculative plan for PR #{pr.number}: {pr.title}"
+
         run = await _create_vcs_run(
             db,
             ws,
@@ -513,15 +728,27 @@ async def _poll_workspace_prs(
             repo,
             pr.head_sha,
             pr.head_ref,
-            speculative=True,
+            speculative=speculative,
             pr_number=pr.number,
-            message=f"Speculative plan for PR #{pr.number}: {pr.title}",
+            message=message,
             cache=cache,
             fetch_paths=fetch_paths,
         )
 
         if run:
             VCS_RUNS_CREATED.labels(provider=conn.provider, type="pr").inc()
+            # For apply-then-merge, upsert the conversation-state row so
+            # later phases (status comment, dispatcher) can hang state
+            # off a stable PRSession id without re-querying the VCS.
+            if is_apply_then_merge:
+                sess = await _upsert_pr_session(db, conn, f"{owner}/{repo}", pr.number, pr.head_sha)
+                # Fire the status-comment refresh asynchronously so the
+                # poll cycle isn't blocked on the VCS API write.
+                await enqueue_trigger(
+                    "vcs_status_comment_update",
+                    {"session_id": str(sess.id)},
+                    dedup_key=f"vcs_status:{sess.id}",
+                )
             await db.commit()
             logger.info(
                 "Speculative run created for PR",
