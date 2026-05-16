@@ -30,6 +30,7 @@ from __future__ import annotations
 import re
 import uuid
 from pathlib import PurePosixPath
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -300,14 +301,113 @@ class AutodiscoveryNameCollision(RuntimeError):
 # ── Top-level entry point ────────────────────────────────────────────────
 
 
+# Side-effect-free preview entry. Same matching logic as
+# `autodiscover_for_paths`, but returns what *would* be created rather
+# than persisting. The UI's "Scan repo" preview hits this; an operator
+# can then confirm to fall through to materialisation.
+async def preview_for_paths(
+    db: AsyncSession,
+    rule: AutodiscoveryRule,
+    file_paths: list[str],
+) -> list[dict[str, Any]]:
+    """For a single rule + a walked file list, return the preview rows
+    the UI renders:
+
+    - `workspace_name` (post `name_template`, sanitised, truncated)
+    - `working_directory` (the file's dirname)
+    - `collision` — True iff this row would NOT create a workspace
+      (it would reuse a workspace already bound to the directory, or
+      it would be skipped because the derived name clashes with an
+      unrelated workspace). False iff the scan would create it.
+    - `existing_autodiscovered` — True iff the no-op is a reuse of a
+      workspace this same rule already materialised (the common
+      already-backfilled case — distinct from a "real" name clash with
+      a user- or other-rule-created workspace)
+
+    This must predict `find_or_autocreate_workspace` exactly so the
+    "Provision N" count matches what the scan creates. That function
+    resolves in two stages and so must this preview:
+      1. reuse any workspace already claiming
+         `(vcs_connection_id, vcs_repo_url, working_directory)` —
+         regardless of its name;
+      2. otherwise, if the derived name is taken by an unrelated
+         workspace, skip (name collision);
+      3. otherwise, create.
+
+    The output is grouped by `(rule, root_directory)` so multiple files
+    in the same directory only appear once, matching the materialise path.
+    """
+    # Same grouping rule as autodiscover_for_paths.
+    roots: dict[str, str] = {}  # root_directory -> workspace_name
+    for path in file_paths:
+        if not rule.enabled:
+            break
+        if not rule_claims_path(rule, path):
+            continue
+        root = derive_root_directory(path)
+        if root in roots:
+            continue
+        roots[root] = derive_workspace_name(rule, root)
+
+    if not roots:
+        return []
+
+    # Stage 1 (mirrors find_or_autocreate_workspace Lookup #1): one SELECT
+    # for every workspace already bound to this rule's (connection, repo)
+    # at any of the candidate directories — reuse-by-directory wins over
+    # name regardless of how the workspace was created.
+    dir_bound_result = await db.execute(
+        select(Workspace.working_directory, Workspace.autodiscovery_rule_id).where(
+            Workspace.vcs_connection_id == rule.vcs_connection_id,
+            Workspace.vcs_repo_url == rule.repo_url,
+            Workspace.working_directory.in_(list(roots.keys())),
+        )
+    )
+    dir_bound: dict[str, uuid.UUID | None] = {row[0]: row[1] for row in dir_bound_result.all()}
+
+    # Stage 2 (mirrors Lookup #2): names already taken by *any* workspace.
+    names = list(set(roots.values()))
+    name_taken_result = await db.execute(select(Workspace.name).where(Workspace.name.in_(names)))
+    name_taken: set[str] = {row[0] for row in name_taken_result.all()}
+
+    preview: list[dict[str, Any]] = []
+    for root, name in roots.items():
+        if root in dir_bound:
+            # Reuse-by-directory: scan no-ops, no workspace created.
+            collision = True
+            existing_autodiscovered = dir_bound[root] == rule.id
+        elif name in name_taken:
+            # Derived name clashes with an unrelated workspace: scan
+            # raises AutodiscoveryNameCollision and skips this row.
+            collision = True
+            existing_autodiscovered = False
+        else:
+            # Scan will create this workspace.
+            collision = False
+            existing_autodiscovered = False
+        preview.append(
+            {
+                "workspace_name": name,
+                "working_directory": root,
+                "collision": collision,
+                "existing_autodiscovered": existing_autodiscovered,
+            }
+        )
+    # Stable ordering by working_directory so the UI table is deterministic.
+    preview.sort(key=lambda r: r["working_directory"])
+    return preview
+
+
 async def autodiscover_for_paths(
     db: AsyncSession,
     rules: list[AutodiscoveryRule],
     changed_files: list[str],
 ) -> list[Workspace]:
     """For a set of changed files, return the list of workspaces that
-    should be created/used. New workspaces are persisted; existing
-    workspaces are returned untouched.
+    were *newly created* this call. Existing workspaces that the rule
+    would map to are looked up (so subsequent VCS polls bind their runs
+    to the right workspace) but excluded from the return — callers
+    use the return length as a "created this cycle" count.
 
     Idempotent across repeated calls with the same inputs.
     """
@@ -329,8 +429,9 @@ async def autodiscover_for_paths(
     created: list[Workspace] = []
     for (_rule_id, root), rule in matches.items():
         try:
-            ws, _ = await find_or_autocreate_workspace(db, rule, root)
-            created.append(ws)
+            ws, was_created = await find_or_autocreate_workspace(db, rule, root)
+            if was_created:
+                created.append(ws)
         except AutodiscoveryNameCollision:
             # Logged inside; skip to next match.
             continue

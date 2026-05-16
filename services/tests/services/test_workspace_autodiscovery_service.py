@@ -9,13 +9,16 @@ integration tests that run against a real session.
 from __future__ import annotations
 
 import uuid
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from terrapod.services.workspace_autodiscovery_service import (
     _is_terraform_file,
     _match_glob,
     derive_root_directory,
     derive_workspace_name,
+    preview_for_paths,
     rule_claims_path,
 )
 
@@ -175,3 +178,156 @@ class TestDeriveWorkspaceName:
         rule = _rule(name="monorepo")
         result = derive_workspace_name(rule, long_path.rstrip("/"))
         assert len(result) <= 90
+
+
+# ── Preview (#311) ───────────────────────────────────────────────────────
+
+
+def _preview_db(
+    dir_bound: dict[str, uuid.UUID | None] | None = None,
+    name_taken: set[str] | None = None,
+) -> AsyncMock:
+    """Build a mock AsyncSession for `preview_for_paths`, which issues
+    two queries in order, mirroring `find_or_autocreate_workspace`:
+
+    1. Stage 1 — workspaces already bound to the rule's
+       (connection, repo, working_directory). `dir_bound` maps
+       working_directory → autodiscovery_rule_id (or None for a
+       manually-created workspace at that directory).
+    2. Stage 2 — names already taken by any workspace. `name_taken`
+       is the set of colliding names.
+    """
+    dir_bound = dir_bound or {}
+    name_taken = name_taken or set()
+    db = AsyncMock()
+    r1 = MagicMock()
+    r1.all = MagicMock(return_value=list(dir_bound.items()))
+    r2 = MagicMock()
+    r2.all = MagicMock(return_value=[(n,) for n in name_taken])
+    db.execute = AsyncMock(side_effect=[r1, r2])
+    return db
+
+
+class TestPreviewForPaths:
+    @pytest.mark.asyncio
+    async def test_groups_files_by_directory(self):
+        rule = _rule(pattern="accounts/*/**/*.tf")
+        files = [
+            "accounts/alpha/network/main.tf",
+            "accounts/alpha/network/variables.tf",  # same directory; should collapse
+            "accounts/beta/compute/main.tf",
+        ]
+        db = _preview_db({})
+        preview = await preview_for_paths(db, rule, files)
+        names = sorted(e["working_directory"] for e in preview)
+        assert names == ["accounts/alpha/network", "accounts/beta/compute"]
+
+    @pytest.mark.asyncio
+    async def test_flags_collision_with_user_workspace(self):
+        """The derived name is taken by an unrelated workspace (not bound
+        to this directory). `find_or_autocreate_workspace` would raise
+        AutodiscoveryNameCollision, so the row is a no-op: colliding but
+        NOT existing_autodiscovered.
+        """
+        rule = _rule(pattern="accounts/*/**/*.tf")
+        files = ["accounts/alpha/network/main.tf"]
+        db = _preview_db(name_taken={"accounts-alpha-network"})
+        preview = await preview_for_paths(db, rule, files)
+        assert len(preview) == 1
+        assert preview[0]["collision"] is True
+        assert preview[0]["existing_autodiscovered"] is False
+
+    @pytest.mark.asyncio
+    async def test_flags_existing_autodiscovered(self):
+        """The common already-backfilled case — this rule already
+        materialised a workspace for this directory. Mirrors Lookup #1
+        (reuse-by-directory), so the preview must read the
+        directory-bound query, not a name match.
+        """
+        rule = _rule(pattern="accounts/*/**/*.tf")
+        files = ["accounts/alpha/network/main.tf"]
+        db = _preview_db(dir_bound={"accounts/alpha/network": rule.id})
+        preview = await preview_for_paths(db, rule, files)
+        assert preview[0]["collision"] is True
+        assert preview[0]["existing_autodiscovered"] is True
+
+    @pytest.mark.asyncio
+    async def test_directory_bound_under_different_name_is_noop(self):
+        """Regression (#312): a workspace already bound to this
+        (connection, repo, directory) under a DIFFERENT name. The scan
+        reuses it (creates nothing), so preview must report collision —
+        not a phantom "will create". Before the fix, preview only
+        checked by name and mispredicted this as creatable, breaking the
+        "Provision N workspaces" promise.
+        """
+        rule = _rule(pattern="accounts/*/**/*.tf")
+        files = ["accounts/alpha/network/main.tf"]
+        # Directory bound (to this rule) but the derived name is free.
+        db = _preview_db(dir_bound={"accounts/alpha/network": rule.id}, name_taken=set())
+        preview = await preview_for_paths(db, rule, files)
+        assert len(preview) == 1
+        assert preview[0]["collision"] is True
+        assert preview[0]["existing_autodiscovered"] is True
+
+    @pytest.mark.asyncio
+    async def test_directory_bound_to_other_rule_is_noop_not_ours(self):
+        """Directory already claimed by a *different* rule (or a manual
+        workspace with no rule). Scan reuses it; preview must show a
+        no-op that is NOT flagged as discovered by this rule.
+        """
+        rule = _rule(pattern="accounts/*/**/*.tf")
+        files = ["accounts/alpha/network/main.tf"]
+        db = _preview_db(dir_bound={"accounts/alpha/network": uuid.uuid4()})
+        preview = await preview_for_paths(db, rule, files)
+        assert preview[0]["collision"] is True
+        assert preview[0]["existing_autodiscovered"] is False
+
+    @pytest.mark.asyncio
+    async def test_clean_row_would_be_created(self):
+        """Neither directory-bound nor name-taken → scan creates it.
+        This is the row the 'Provision N' count must include."""
+        rule = _rule(pattern="accounts/*/**/*.tf")
+        files = ["accounts/alpha/network/main.tf"]
+        db = _preview_db()
+        preview = await preview_for_paths(db, rule, files)
+        assert preview[0]["collision"] is False
+        assert preview[0]["existing_autodiscovered"] is False
+
+    @pytest.mark.asyncio
+    async def test_disabled_rule_returns_nothing(self):
+        """A disabled rule has nothing to preview — short-circuit the
+        whole walk. The /scan endpoint force-enables for explicit user
+        action, but /preview should reflect the rule's actual state.
+        """
+        rule = _rule(enabled=False, pattern="accounts/*/**/*.tf")
+        files = ["accounts/alpha/network/main.tf"]
+        db = _preview_db({})
+        preview = await preview_for_paths(db, rule, files)
+        assert preview == []
+
+    @pytest.mark.asyncio
+    async def test_no_matches_returns_empty_without_db_query(self):
+        """If the matcher rejects everything we shouldn't even query the
+        DB for collisions. Saves a round trip on a misconfigured rule
+        against a huge repo."""
+        rule = _rule(pattern="this-prefix-matches-nothing/*.tf")
+        files = ["accounts/alpha/network/main.tf"]
+        db = _preview_db({})
+        preview = await preview_for_paths(db, rule, files)
+        assert preview == []
+        db.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ignore_pattern_filters_out_matches(self):
+        rule = _rule(
+            pattern="accounts/*/**/*.tf",
+            ignore_patterns=["accounts/*/modules/**"],
+        )
+        files = [
+            "accounts/alpha/network/main.tf",
+            "accounts/alpha/modules/vpc/main.tf",  # ignored
+        ]
+        db = _preview_db({})
+        preview = await preview_for_paths(db, rule, files)
+        assert len(preview) == 1
+        assert preview[0]["working_directory"] == "accounts/alpha/network"
