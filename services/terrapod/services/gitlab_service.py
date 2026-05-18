@@ -248,6 +248,41 @@ async def get_changed_files(
     return list(files)
 
 
+async def get_pr_file_changes(
+    conn: VCSConnection, owner: str, repo: str, base_sha: str, head_sha: str
+) -> list[dict[str, str | None]] | None:
+    """Per-file change records for rename/delete detection (#314).
+
+    Returns ``{"status", "path", "old_path"}`` records (status one of
+    added|removed|modified|renamed). None on truncation — the caller
+    MUST then skip lifecycle detection (a partial diff could wrongly
+    move/destroy a workspace).
+    """
+    api = _api_url(conn)
+    project = _project_path(owner, repo)
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{api}/projects/{project}/repository/compare",
+            params={"from": base_sha, "to": head_sha, "per_page": 500},
+            headers=_headers(conn),
+        )
+        resp.raise_for_status()
+    diffs = resp.json().get("diffs", [])
+    if len(diffs) >= 500:
+        return None
+    out: list[dict[str, str | None]] = []
+    for d in diffs:
+        if d.get("deleted_file"):
+            out.append({"status": "removed", "path": d["old_path"], "old_path": None})
+        elif d.get("new_file"):
+            out.append({"status": "added", "path": d["new_path"], "old_path": None})
+        elif d.get("renamed_file"):
+            out.append({"status": "renamed", "path": d["new_path"], "old_path": d["old_path"]})
+        else:
+            out.append({"status": "modified", "path": d["new_path"], "old_path": None})
+    return out
+
+
 async def list_repo_tree(conn: VCSConnection, owner: str, repo: str, ref: str) -> list[str] | None:
     """List every file path in the repo at `ref`.
 
@@ -427,6 +462,7 @@ async def get_pull_request(
             return None
         resp.raise_for_status()
     mr = resp.json()
+    mr_state = mr.get("state") or ""
     return PullRequest(
         number=mr["iid"],
         head_sha=mr.get("sha") or "",
@@ -434,6 +470,8 @@ async def get_pull_request(
         title=mr.get("title") or "",
         draft=bool(mr.get("draft", False)),
         author_login=(mr.get("author") or {}).get("username", ""),
+        state=mr_state,
+        merged=mr_state == "merged" or bool(mr.get("merged_at")),
     )
 
 
