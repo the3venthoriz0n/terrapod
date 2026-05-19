@@ -45,6 +45,76 @@ class TestS3StoreUnit:
             S3Store(bucket="test", presigned_url_expiry_seconds=7200)
             mock_logger.warning.assert_called_once()
 
+    async def test_client_pins_sigv4(self, store: S3Store) -> None:
+        """The S3 client must be created with signature_version=s3v4.
+
+        botocore's implicit default varies by region/endpoint/SDK
+        version; a SigV2 presigned URL is rejected by S3 for any
+        SSE-KMS object and outright in GovCloud/newer regions (#339).
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        captured: dict = {}
+
+        def _client(*args, **kwargs):
+            captured.update(kwargs)
+            cm = MagicMock()
+            cm.__aenter__ = AsyncMock(return_value=MagicMock())
+            return cm
+
+        store._session = MagicMock()
+        store._session.client = _client
+
+        await store._get_client()
+
+        assert "config" in captured, "S3 client created without a botocore Config"
+        assert captured["config"].signature_version == "s3v4"
+
+    async def test_presigned_url_is_sigv4_offline(self, monkeypatch) -> None:
+        """The REAL signing path emits SigV4 — no AWS, no LocalStack.
+
+        `generate_presigned_url` signs locally (HMAC over the request);
+        with static fake creds it needs no network or real bucket. This
+        is the always-on regression guard for #339: a SigV2 URL
+        (`AWSAccessKeyId=`) is rejected by S3 for SSE-KMS objects and in
+        GovCloud; SigV4 (`X-Amz-Algorithm=AWS4-HMAC-SHA256`) is not.
+        """
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+
+        store = S3Store(bucket="kms-bucket", region="us-east-1", prefix="terrapod")
+        try:
+            get_url = (await store.presigned_get_url("state/ws/v1.tfstate")).url
+            put_url = (await store.presigned_put_url("config/cv/archive.tgz")).url
+        finally:
+            await store.close()
+
+        for url in (get_url, put_url):
+            assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in url, f"not SigV4: {url}"
+            assert "AWSAccessKeyId=" not in url, f"SigV2 leaked: {url}"
+
+    async def test_sigv2_is_detectably_different(self, monkeypatch) -> None:
+        """Discriminating negative: a client explicitly forced to the
+        legacy `s3` signer DOES emit `AWSAccessKeyId=` — proving the
+        SigV4 assertion above is meaningful, not vacuous."""
+        from botocore.config import Config
+
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+
+        store = S3Store(bucket="kms-bucket", region="us-east-1")
+        # Force the client to the legacy SigV2 signer.
+        store._client = await store._session.client(
+            "s3", region_name="us-east-1", config=Config(signature_version="s3")
+        ).__aenter__()
+        try:
+            url = (await store.presigned_get_url("k")).url
+        finally:
+            await store.close()
+        assert "AWSAccessKeyId=" in url and "X-Amz-Algorithm=" not in url
+
     async def test_put_stream_multipart(self, store: S3Store) -> None:
         """put_stream should use S3 multipart upload."""
         from unittest.mock import AsyncMock
@@ -146,4 +216,16 @@ class TestS3StoreIntegration:
         assert len(keys) == 2
         assert "integration/list/a.txt" in keys
         assert "integration/list/b.txt" in keys
+        await store.close()
+
+    async def test_presigned_url_is_sigv4(self, store: S3Store | None) -> None:
+        """A real presigned GET URL must be SigV4 (X-Amz-Algorithm=
+        AWS4-HMAC-SHA256), never SigV2 (AWSAccessKeyId=) — SigV2 is
+        rejected by S3 for SSE-KMS objects and in GovCloud (#339)."""
+        if store is None:
+            return
+        await store.put("integration/presign.txt", b"data")
+        presigned = await store.presigned_get_url("integration/presign.txt")
+        assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in presigned.url, presigned.url
+        assert "AWSAccessKeyId=" not in presigned.url, "SigV2 presigned URL generated"
         await store.close()
