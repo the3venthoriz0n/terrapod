@@ -453,14 +453,12 @@ fi
 # older runner that didn't upload a lock file, or an older API without
 # the /lock-file endpoint.
 if [ "$TP_PHASE" = "apply" ] && [ -n "$TP_API_URL" ] && [ -n "$TP_RUN_ID" ]; then
-    LOCK_DL_HTTP=$(curl -sS -o .terraform.lock.hcl -w "%{http_code}" \
-        -H "$AUTH_HEADER" \
-        "${TP_API_URL}/api/terrapod/v1/runs/${TP_RUN_ID}/artifacts/lock-file" 2>/dev/null || echo "000")
-    if [ "$LOCK_DL_HTTP" = "302" ] || [ "$LOCK_DL_HTTP" = "200" ]; then
+    if tp_curl_download .terraform.lock.hcl -H "$AUTH_HEADER" \
+        "${TP_API_URL}/api/terrapod/v1/runs/${TP_RUN_ID}/artifacts/lock-file" 2>/dev/null; then
         log "[entrypoint] Reusing .terraform.lock.hcl from plan phase"
     else
         rm -f .terraform.lock.hcl
-        log "[entrypoint] No plan-phase lock file available (HTTP $LOCK_DL_HTTP); apply init will resolve providers independently"
+        log "[entrypoint] No plan-phase lock file available (HTTP ${TP_LAST_HTTP:-none}); apply init will resolve providers independently"
     fi
 fi
 
