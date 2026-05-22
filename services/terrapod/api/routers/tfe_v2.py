@@ -590,6 +590,7 @@ def _workspace_json(
                 "name": ws.name,
                 "auto-apply": ws.auto_apply,
                 "execution-mode": ws.execution_mode,
+                "state-mode": ws.state_mode,
                 "operations": ws.execution_mode == "agent",
                 "execution-backend": ws.execution_backend,
                 "terraform-version": ws.terraform_version or "",
@@ -877,9 +878,17 @@ async def create_workspace(
             detail="execution-mode must be 'local' or 'agent'",
         )
 
+    state_mode = attrs.get("state-mode", "managed")
+    if state_mode not in ("managed", "external"):
+        raise HTTPException(
+            status_code=422,
+            detail="state-mode must be 'managed' or 'external'",
+        )
+
     ws = Workspace(
         name=name,
         execution_mode=execution_mode,
+        state_mode=state_mode,
         auto_apply=attrs.get("auto-apply", False),
         execution_backend=attrs.get("execution-backend", settings.default_execution_backend),
         terraform_version=attrs.get("terraform-version", settings.default_terraform_version),
@@ -1204,6 +1213,13 @@ async def update_workspace(
                 detail="execution-mode must be 'local' or 'agent'",
             )
         ws.execution_mode = attrs["execution-mode"]
+    if "state-mode" in attrs:
+        if attrs["state-mode"] not in ("managed", "external"):
+            raise HTTPException(
+                status_code=422,
+                detail="state-mode must be 'managed' or 'external'",
+            )
+        ws.state_mode = attrs["state-mode"]
     if "auto-apply" in attrs:
         ws.auto_apply = attrs["auto-apply"]
 
@@ -1450,6 +1466,9 @@ async def list_state_versions(
     """List all state versions for a workspace, ordered by serial DESC."""
     ws, _ = await _require_ws_permission(workspace_id, "read", user, db)
 
+    if ws.state_mode == "external":
+        return JSONResponse(content={"data": []}, headers=_tfe_headers())
+
     result = await db.execute(
         select(StateVersion)
         .where(StateVersion.workspace_id == ws.id)
@@ -1480,6 +1499,8 @@ async def current_state_version(
     workspace RBAC path.
     """
     ws = await _get_workspace_by_id(workspace_id, db)
+    if ws.state_mode == "external":
+        raise HTTPException(status_code=404, detail="State managed externally")
     if not await _runner_state_read_allowed(db, user, ws):
         perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
         if not has_permission(perm, "read"):
@@ -1616,6 +1637,12 @@ async def create_state_version(
 ) -> JSONResponse:
     """Create a new state version. Requires write permission."""
     ws, _ = await _require_ws_permission(workspace_id, "write", user, db)
+
+    if ws.state_mode == "external":
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot create state versions for external-state workspaces",
+        )
 
     body = await request.json()
     attrs = body.get("data", {}).get("attributes", {})

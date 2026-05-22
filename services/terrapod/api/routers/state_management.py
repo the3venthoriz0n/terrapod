@@ -210,6 +210,11 @@ async def upload_state_manual(
     from terrapod.api.routers.tfe_v2 import _get_workspace_by_id
 
     ws = await _get_workspace_by_id(workspace_id, db)
+    if ws.state_mode == "external":
+        raise HTTPException(
+            status_code=409,
+            detail="State managed externally — use the workspace's native backend",
+        )
     perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
     if not has_permission(perm, "write"):
         raise HTTPException(

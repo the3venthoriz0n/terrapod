@@ -59,6 +59,7 @@ def build_job_spec(
     allow_empty_apply: bool = False,
     is_destroy: bool = False,
     working_directory: str = "",
+    state_mode: str = "managed",
 ) -> dict:
     """Build a K8s Job spec for a run phase.
 
@@ -124,6 +125,8 @@ def build_job_spec(
         container_env.append({"name": "TP_DESTROY", "value": "true"})
     if working_directory:
         container_env.append({"name": "TP_WORKING_DIR", "value": working_directory})
+    if state_mode == "external":
+        container_env.append({"name": "TP_STATE_MODE", "value": "external"})
 
     # Termination grace period — passed to entrypoint for time-budgeted shutdown
     container_env.append(

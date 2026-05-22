@@ -277,6 +277,7 @@ async def create_run(
         terraform_version=pinned_version,
         resource_cpu=workspace.resource_cpu,
         resource_memory=workspace.resource_memory,
+        state_mode=workspace.state_mode,
         pool_id=pool_id,
         created_by=created_by,
         is_drift_detection=is_drift_detection,

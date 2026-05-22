@@ -648,6 +648,7 @@ class RunnerListener:
             allow_empty_apply=attrs.get("allow-empty-apply", False),
             is_destroy=attrs.get("is-destroy", False),
             working_directory=attrs.get("working-directory", ""),
+            state_mode=attrs.get("state-mode", "managed"),
         )
 
         namespace = os.environ.get("TERRAPOD_RUNNER_NAMESPACE", "terrapod-runners")

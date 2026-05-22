@@ -33,6 +33,7 @@ interface WorkspacePermissions {
 interface WorkspaceAttrs {
   name: string
   'execution-mode': string
+  'state-mode': 'managed' | 'external'
   'execution-backend': string
   'auto-apply': boolean
   'terraform-version': string
@@ -241,6 +242,7 @@ function WorkspaceDetailContent() {
   const [editMemory, setEditMemory] = useState('')
   const [editAutoApply, setEditAutoApply] = useState(false)
   const [editExecMode, setEditExecMode] = useState('')
+  const [editStateMode, setEditStateMode] = useState<'managed' | 'external'>('managed')
   const [editBackend, setEditBackend] = useState('')
   const [editVersion, setEditVersion] = useState('')
   const [editPoolId, setEditPoolId] = useState<string | null>(null)
@@ -823,6 +825,7 @@ function WorkspaceDetailContent() {
     setEditMemory(workspace.attributes['resource-memory'])
     setEditAutoApply(workspace.attributes['auto-apply'])
     setEditExecMode(workspace.attributes['execution-mode'])
+    setEditStateMode(workspace.attributes['state-mode'] || 'managed')
     setEditBackend(workspace.attributes['execution-backend'] || 'tofu')
     setEditVersion(workspace.attributes['terraform-version'] || '')
     setEditPoolId(workspace.attributes['agent-pool-id'])
@@ -882,6 +885,7 @@ function WorkspaceDetailContent() {
               'resource-memory': editMemory,
               'auto-apply': editAutoApply,
               'execution-mode': editExecMode,
+              'state-mode': editStateMode,
               'execution-backend': editBackend,
               'terraform-version': editVersion,
               'agent-pool-id': editPoolId,
@@ -1510,6 +1514,17 @@ function WorkspaceDetailContent() {
                     </select>
                   ) : (
                     <dd className="mt-1 text-sm text-slate-200">{attrs['execution-mode']}</dd>
+                  )}
+                </div>
+                <div>
+                  <dt className="text-xs text-slate-500">State Mode</dt>
+                  {editing ? (
+                    <select value={editStateMode} onChange={(e) => setEditStateMode(e.target.value as 'managed' | 'external')} className="mt-1 w-full px-2 py-1 text-sm border border-slate-600 rounded bg-slate-700 text-slate-100 focus:outline-none focus:ring-1 focus:ring-brand-500">
+                      <option value="managed">Managed</option>
+                      <option value="external">External</option>
+                    </select>
+                  ) : (
+                    <dd className="mt-1 text-sm text-slate-200">{attrs['state-mode'] === 'external' ? 'External' : 'Managed'}</dd>
                   )}
                 </div>
                 <div>
@@ -2408,6 +2423,13 @@ function WorkspaceDetailContent() {
         {/* State Tab */}
         {activeTab === 'state' && (
           <div>
+            {attrs['state-mode'] === 'external' ? (
+              <div className="rounded-md bg-amber-900/30 border border-amber-700/50 p-4">
+                <p className="text-sm text-amber-200">
+                  State is managed externally by Terraform&apos;s configured backend. State history is not available in Terrapod.
+                </p>
+              </div>
+            ) : (<>
             {/* Confirmation dialog */}
             {confirmStateAction && (
               <div className="bg-red-900/30 border border-red-700/50 rounded-lg p-4 mb-4">
@@ -2587,6 +2609,7 @@ function WorkspaceDetailContent() {
                 </table>
               </div>
             )}
+            </>)}
           </div>
         )}
 

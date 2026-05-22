@@ -344,6 +344,12 @@ class Workspace(Base):
     # State divergence — set when an apply Job succeeds but state upload fails
     state_diverged: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
 
+    # External state mode — "managed" (terrapod owns state) or "external"
+    # (runner uses the code's native backend block, e.g. S3+DynamoDB).
+    state_mode: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="managed", default="managed"
+    )  # managed, external
+
     # Autodiscovery lifecycle (#314). lifecycle_state: active (normal) |
     # pending_deletion (origin dir/PR gone — needs explicit operator
     # action; NEVER auto-destroyed) | archived (soft-deleted after a
@@ -868,6 +874,9 @@ class AutodiscoveryRule(Base):
     )
     execution_backend: Mapped[str] = mapped_column(String(20), nullable=False, default="tofu")
     terraform_version: Mapped[str] = mapped_column(String(50), nullable=False, default="1.12")
+    state_mode: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="managed", default="managed"
+    )  # managed, external — inherited by auto-created workspaces
     resource_cpu: Mapped[str] = mapped_column(String(20), nullable=False, default="1")
     resource_memory: Mapped[str] = mapped_column(String(20), nullable=False, default="2Gi")
     auto_apply: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -1167,6 +1176,9 @@ class Run(Base):
     terraform_version: Mapped[str] = mapped_column(String(20), nullable=False, default="")
     resource_cpu: Mapped[str] = mapped_column(String(20), nullable=False, default="1")
     resource_memory: Mapped[str] = mapped_column(String(20), nullable=False, default="2Gi")
+    state_mode: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="managed", default="managed"
+    )  # managed, external — snapshotted from workspace at creation
     pool_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("agent_pools.id", ondelete="SET NULL"),

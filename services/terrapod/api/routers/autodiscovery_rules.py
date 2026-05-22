@@ -69,6 +69,7 @@ def _rule_json(rule: AutodiscoveryRule) -> dict:
             "ignore-patterns": list(rule.ignore_patterns or []),
             "enabled": rule.enabled,
             "execution-mode": rule.execution_mode,
+            "state-mode": rule.state_mode,
             "execution-backend": rule.execution_backend,
             "agent-pool-id": str(rule.agent_pool_id) if rule.agent_pool_id else None,
             "terraform-version": rule.terraform_version,
@@ -191,6 +192,14 @@ def _coerce_attrs(attrs: dict, *, on_create: bool) -> dict[str, Any]:
                 detail="execution-mode must be 'agent' (autodiscovery is VCS-driven; local-mode workspaces have no executor for queued runs)",
             )
         out["execution_mode"] = em
+    if "state-mode" in attrs:
+        sm = str(attrs["state-mode"])
+        if sm not in ("managed", "external"):
+            raise HTTPException(
+                status_code=422,
+                detail="state-mode must be 'managed' or 'external'",
+            )
+        out["state_mode"] = sm
     if "execution-backend" in attrs:
         eb = str(attrs["execution-backend"])
         if eb not in _VALID_BACKENDS:
@@ -439,6 +448,7 @@ def _build_transient_rule(fields: dict[str, Any], conn: VCSConnection) -> Autodi
         # has NOT NULL constraints on some, so populate with reasonable
         # defaults to satisfy the in-memory construction.
         execution_mode=fields.get("execution_mode", "agent"),
+        state_mode=fields.get("state_mode", "managed"),
         execution_backend=fields.get("execution_backend", "tofu"),
         terraform_version=fields.get("terraform_version", "1.12"),
         resource_cpu=fields.get("resource_cpu", "1"),

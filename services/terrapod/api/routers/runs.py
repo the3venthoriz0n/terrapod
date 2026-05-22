@@ -119,6 +119,7 @@ def _run_json(
                 "terraform-version": run.terraform_version,
                 "resource-cpu": run.resource_cpu,
                 "resource-memory": run.resource_memory,
+                "state-mode": run.state_mode,
                 "error-message": run.error_message,
                 "target-addrs": run.target_addrs or [],
                 "replace-addrs": run.replace_addrs or [],

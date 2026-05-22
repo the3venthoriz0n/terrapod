@@ -140,6 +140,7 @@ function WorkspacesPageInner() {
   const [showCreate, setShowCreate] = useState(false)
   const [newName, setNewName] = useState('')
   const [newExecMode, setNewExecMode] = useState('local')
+  const [newStateMode, setNewStateMode] = useState<'managed' | 'external'>('managed')
   const [newAutoApply, setNewAutoApply] = useState(false)
   const [newBackend, setNewBackend] = useState('tofu')
   const [newVersion, setNewVersion] = useState('1.11')
@@ -271,6 +272,7 @@ function WorkspacesPageInner() {
             attributes: {
               name: newName,
               'execution-mode': newExecMode,
+              'state-mode': newStateMode,
               'execution-backend': newBackend,
               'terraform-version': newVersion,
               'auto-apply': newAutoApply,
@@ -374,6 +376,18 @@ function WorkspacesPageInner() {
                 >
                   <option value="tofu">OpenTofu</option>
                   <option value="terraform">Terraform</option>
+                </select>
+              </div>
+              <div>
+                <label htmlFor="ws-state-mode" className="block text-sm font-medium text-slate-300 mb-1">State Mode</label>
+                <select
+                  id="ws-state-mode"
+                  value={newStateMode}
+                  onChange={(e) => setNewStateMode(e.target.value as 'managed' | 'external')}
+                  className="w-full px-3 py-2 border border-slate-600 rounded-lg bg-slate-700 text-slate-100 focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent"
+                >
+                  <option value="managed">Managed</option>
+                  <option value="external">External</option>
                 </select>
               </div>
               <div>

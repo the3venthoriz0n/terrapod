@@ -268,6 +268,7 @@ async def find_or_autocreate_workspace(
         id=uuid.uuid4(),  # generate_uuid7 default also fine; explicit for log clarity
         name=name,
         execution_mode=rule.execution_mode,
+        state_mode=rule.state_mode,
         execution_backend=rule.execution_backend,
         terraform_version=rule.terraform_version,
         resource_cpu=rule.resource_cpu,
