@@ -67,6 +67,7 @@ def _mock_workspace(
     ws.drift_last_checked_at = None
     ws.drift_status = ""
     ws.state_diverged = False
+    ws.state_mode = "managed"
     ws.vcs_workflow = "merge_then_apply"
     ws.auto_merge = False
     ws.auto_merge_strategy = "merge"

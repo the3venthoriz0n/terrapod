@@ -122,6 +122,7 @@ def _mock_run(
     run.allow_empty_apply = False
     run.resource_cpu = "1"
     run.resource_memory = "2Gi"
+    run.state_mode = "managed"
     run.configuration_version_id = None
     run.created_by = "test@example.com"
     run.resource_additions = None

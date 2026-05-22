@@ -47,6 +47,7 @@ def _mock_rule(
     r.terraform_version = "1.11"
     r.resource_cpu = "1"
     r.resource_memory = "2Gi"
+    r.state_mode = "managed"
     r.auto_apply = False
     r.on_directory_delete = "flag"
     r.labels = {"env": "monorepo"}

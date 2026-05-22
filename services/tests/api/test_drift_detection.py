@@ -47,6 +47,7 @@ def _mock_workspace(ws_id=None, name="test-ws", **overrides):
     ws.drift_last_checked_at = overrides.get("drift_last_checked_at", None)
     ws.drift_status = overrides.get("drift_status", "")
     ws.state_diverged = overrides.get("state_diverged", False)
+    ws.state_mode = overrides.get("state_mode", "managed")
     ws.vcs_workflow = overrides.get("vcs_workflow", "merge_then_apply")
     ws.auto_merge = overrides.get("auto_merge", False)
     ws.auto_merge_strategy = overrides.get("auto_merge_strategy", "merge")
@@ -212,6 +213,7 @@ class TestRunDriftAttributes:
         run.allow_empty_apply = False
         run.resource_cpu = "1"
         run.resource_memory = "2Gi"
+        run.state_mode = "managed"
         run.module_overrides = None
         run.created_by = "test@example.com"
         run.resource_additions = None

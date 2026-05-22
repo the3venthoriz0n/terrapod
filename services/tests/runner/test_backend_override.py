@@ -204,7 +204,7 @@ def _extract_backstop_fragment() -> str:
     """Pull the post-init backend backstop fragment from the entrypoint."""
     text = _find_entrypoint().read_text()
     match = re.search(
-        r'(TP_CONFIGURED_BACKEND=\$\(jq.*?\nlog "\[entrypoint\] Backend verified: local")',
+        r'(TP_CONFIGURED_BACKEND=\$\(jq.*?\n\s*log "\[entrypoint\] Backend verified: local")',
         text,
         re.DOTALL,
     )
