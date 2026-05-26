@@ -80,6 +80,10 @@ export default function PolicySetDetailPage({ params }: { params: Promise<{ id: 
   const [denyNames, setDenyNames] = useState('')
   const [allowLabels, setAllowLabels] = useState('')
   const [denyLabels, setDenyLabels] = useState('')
+  // VCS config edit fields
+  const [vcsRepoUrl, setVcsRepoUrl] = useState('')
+  const [vcsBranch, setVcsBranch] = useState('')
+  const [policyPath, setPolicyPath] = useState('')
 
   // New policy form
   const [showAddPolicy, setShowAddPolicy] = useState(false)
@@ -107,6 +111,9 @@ export default function PolicySetDetailPage({ params }: { params: Promise<{ id: 
       setDenyNames((a['deny-names'] || []).join('\n'))
       setAllowLabels(labelsToText(a['allow-labels'] || {}))
       setDenyLabels(labelsToText(a['deny-labels'] || {}))
+      setVcsRepoUrl(a['vcs-repo-url'] || '')
+      setVcsBranch(a['vcs-branch'] || '')
+      setPolicyPath(a['policy-path'] || '')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load policy set')
     } finally {
@@ -140,6 +147,11 @@ export default function PolicySetDetailPage({ params }: { params: Promise<{ id: 
               'deny-names': linesToList(denyNames),
               'allow-labels': parseLabels(allowLabels),
               'deny-labels': parseLabels(denyLabels),
+              ...(ps?.attributes.source === 'vcs' ? {
+                'vcs-repo-url': vcsRepoUrl,
+                'vcs-branch': vcsBranch,
+                'policy-path': policyPath,
+              } : {}),
             },
           },
         }),
@@ -265,6 +277,31 @@ export default function PolicySetDetailPage({ params }: { params: Promise<{ id: 
                 <label className="block text-xs font-medium text-slate-400 mb-1">Deny names (one per line)</label>
                 <textarea value={denyNames} onChange={(e) => setDenyNames(e.target.value)} rows={3}
                   className="w-full px-3 py-2 font-mono text-xs border border-slate-600 rounded-lg bg-slate-700 text-slate-100 focus:outline-none focus:ring-2 focus:ring-brand-500" />
+              </div>
+            </div>
+          )}
+          {ps.attributes.source === 'vcs' && (
+            <div className="border-t border-slate-700/50 pt-4">
+              <h3 className="text-xs font-semibold text-slate-400 uppercase mb-3">VCS Configuration</h3>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div>
+                  <label className="block text-sm font-medium text-slate-300 mb-1">Repository URL</label>
+                  <input type="text" value={vcsRepoUrl} onChange={(e) => setVcsRepoUrl(e.target.value)}
+                    placeholder="https://github.com/org/policies"
+                    className="w-full px-3 py-2 border border-slate-600 rounded-lg bg-slate-700 text-slate-100 focus:outline-none focus:ring-2 focus:ring-brand-500" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-slate-300 mb-1">Branch</label>
+                  <input type="text" value={vcsBranch} onChange={(e) => setVcsBranch(e.target.value)}
+                    placeholder="main (default)"
+                    className="w-full px-3 py-2 border border-slate-600 rounded-lg bg-slate-700 text-slate-100 focus:outline-none focus:ring-2 focus:ring-brand-500" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-slate-300 mb-1">Policy Path</label>
+                  <input type="text" value={policyPath} onChange={(e) => setPolicyPath(e.target.value)}
+                    placeholder="policies/"
+                    className="w-full px-3 py-2 border border-slate-600 rounded-lg bg-slate-700 text-slate-100 focus:outline-none focus:ring-2 focus:ring-brand-500" />
+                </div>
               </div>
             </div>
           )}
