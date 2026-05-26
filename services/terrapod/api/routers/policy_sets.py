@@ -310,6 +310,15 @@ async def update_policy_set(
     if "deny-names" in attrs:
         ps.deny_names = attrs.get("deny-names", []) or []
 
+    # VCS config fields (only applicable when source=vcs)
+    if ps.source == "vcs":
+        if "vcs-repo-url" in attrs:
+            ps.vcs_repo_url = attrs["vcs-repo-url"] or ""
+        if "vcs-branch" in attrs:
+            ps.vcs_branch = attrs["vcs-branch"] or ""
+        if "policy-path" in attrs:
+            ps.policy_path = attrs["policy-path"] or ""
+
     try:
         await db.commit()
     except IntegrityError as exc:

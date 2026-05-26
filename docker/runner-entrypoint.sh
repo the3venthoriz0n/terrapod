@@ -303,7 +303,11 @@ tp_evaluate_policies() {
             fi
 
             if [ "$_opa_exit" != "0" ]; then
-                _err_msg=$(head -c 1000 /tmp/opa-err.txt | jq -Rs .)
+                _err_raw=$(head -c 1000 /tmp/opa-err.txt 2>/dev/null || true)
+                if [ -z "$_err_raw" ]; then
+                    _err_raw="OPA evaluation failed with exit code $_opa_exit (no stderr output)"
+                fi
+                _err_msg=$(printf '%s' "$_err_raw" | jq -Rs .)
                 _policies_json=$(echo "$_policies_json" | jq \
                     --arg name "$_p_name" --argjson err "$_err_msg" \
                     '. + [{policy: $name, passed: false, violations: [], warnings: [], error: $err}]')
