@@ -666,3 +666,56 @@ Have the **producer's admin** authorize the consumer — via the Terrapod provid
 ### Producer deleted or archived
 
 If the producer workspace was deleted, the grant rows cascade-deleted automatically and the consumer's next read returns 404 (no state). If the producer is `archived` via the [autodiscovery lifecycle](autodiscovery.md), the state is retained until purged — reads continue until then. Restoring an archived producer's grant requires recreating the workspace and re-authorizing the consumers.
+
+---
+
+## Policy enforcement blocking all runs
+
+**Symptom**: after creating or editing an OPA policy set, runs across many (or all) workspaces stop advancing — they sit in `planning` and the run's **Policy Checks** panel shows a mandatory failure.
+
+**Why**: a **mandatory**, broadly-scoped (often `global`) policy set has a policy that denies the plans. A mandatory failure holds the run in `planning` rather than erroring it, so the blast radius is "nothing applies" — recoverable, not destructive. See [policies.md](policies.md).
+
+### Diagnosis
+
+1. Open a blocked run's Policy Checks panel — it names the failing policy set and the specific `deny` messages.
+2. Identify the set: `GET /api/terrapod/v1/policy-sets` — look for `enforcement-level: mandatory` and a broad scope (`global-scope: true` or wide allow-labels).
+3. Decide whether the policy is correct-but-the-infra-is-wrong (fix the Terraform), or the policy itself is wrong/too broad.
+
+### Resolution
+
+Pick the least-disruptive option that fits:
+
+- **Policy is wrong** — fix the Rego (`PATCH /api/terrapod/v1/policies/{id}`) or delete the offending policy. The next reconciler tick re-evaluates held runs automatically.
+- **Set is too broadly scoped** — narrow its allow-labels, or set `enabled: false` on the set (`PATCH /api/terrapod/v1/policy-sets/{id}`) to stop it being evaluated. Disabling does not delete it.
+- **Demote to advisory** — `PATCH` the set's `enforcement-level` to `advisory`; runs then proceed with a warning instead of a block. Note the enforcement level is *snapshotted per evaluation*, so already-recorded blocks are cleared by re-evaluation, not by the edit alone — held runs re-evaluate on the next tick.
+- **Single urgent run** — a workspace admin can override one run from its Policy Checks panel ("Override & Continue").
+
+### Verification
+
+- `GET /api/terrapod/v1/runs/{id}/policy-evaluations` for a previously-blocked run shows the mandatory set now `passed` (or `overridden`).
+- Held runs advance out of `planning` within one reconciler tick (~10s).
+
+---
+
+## Policy evaluation blocked: runner did not evaluate
+
+**Symptom**: a run is held in `planning` and the Policy Checks panel shows one or more mandatory sets with outcome `errored` and a message starting with **"Runner did not evaluate this mandatory policy set."**
+
+**Why**: OPA evaluation runs on the runner (since #343). For every applicable policy set, the runner is expected to POST a row to `/policy-results` before posting `plan-result`. The post-plan gate compares applicable sets to recorded rows and synthesises an `errored` row for any mandatory set that's missing one — fail-closed.
+
+This usually means **the runner image is from before policy-as-code support / does not know about OPA evaluation**. Common during a Helm rolling upgrade when a node has an older runner image cached and `imagePullPolicy: IfNotPresent` keeps using it until the cache is GC'd. The runbook entry can also fire for a newer runner that posted `plan-result` successfully but failed to POST `/policy-results` for one or more applicable sets — uncommon because the runner entrypoint POSTs policy-results before plan-result and exits non-zero on POST failure (so usually the run is errored by the reconciler, not held at the gate).
+
+### Diagnosis
+
+1. Confirm the runner image. Check the Job pod's image: `kubectl get pods -n terrapod -l app.kubernetes.io/component=runner -o jsonpath='{.items[*].spec.containers[*].image}'`. If you see a SHA / tag from before the Terrapod release that introduced #343, the runner is stale.
+2. Check the node's image cache: `kubectl describe pod <tprun-pod>` — the `Containers.runner.Image` and the events around `Pulled` / `Container image already present on machine` tell you whether the node pulled fresh or reused cache.
+
+### Resolution
+
+- **Roll the runner image forward.** Re-deploy with the matching Terrapod version (or restart the affected node so K8s pulls fresh). Future runs on this workspace will then evaluate cleanly.
+- **Release this specific run** — a workspace admin can override the synthetic errored evaluation from the Policy Checks panel; the run resumes immediately.
+
+### Verification
+
+- A fresh run on the same workspace shows the policy set with a real outcome (`passed` / `failed`) rather than the synthetic `errored` message.
+- The runner pod log includes `Fetching policy bundle...` / `Posting N policy evaluation result(s)` lines — confirms it's a post-#343 image.

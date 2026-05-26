@@ -449,6 +449,19 @@ async def complete_plan(
     if run.status != "planning":
         return run
 
+    # Stamp the plan-phase end timestamp now, before the run-task and policy
+    # gates can hold the run in `planning`. Semantically the plan phase is
+    # done (the runner posted plan-result or its Job reported success); the
+    # gates are a downstream platform concern. Doing this here keeps the
+    # `planned-at` UI timestamp tied to "plan finished" rather than "gates
+    # cleared", and makes the field available to anything else that wants
+    # it (metrics, confirm_run, drift detection) regardless of how long
+    # the run is held by a gate.
+    if run.plan_finished_at is None and run.plan_started_at is not None:
+        from terrapod.db.models import now_utc
+
+        run.plan_finished_at = now_utc()
+
     if has_changes is not None:
         run.has_changes = has_changes
 
@@ -463,6 +476,20 @@ async def complete_plan(
                     db, run, "errored", error_message="Post-plan task stage failed"
                 )
             return run
+
+    # Post-plan OPA policy gate (#343). The runner has already evaluated
+    # applicable policies and posted results to /policy-results before
+    # posting plan-result — so by the time we get here the
+    # policy_evaluation rows already exist (or there were no applicable
+    # sets). A mandatory unoverridden failure keeps the run in
+    # `planning` (surfaced via the run's policy-checks attribute) rather
+    # than erroring it — the idempotent complete_plan then re-drives
+    # the run once an admin overrides, with no reconciler race.
+    from terrapod.services import policy_set_service
+
+    gate = await policy_set_service.evaluate_post_plan(db, run)
+    if gate != policy_set_service.GATE_PASSED:
+        return run
 
     run = await transition_run(db, run, "planned")
 
