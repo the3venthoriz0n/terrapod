@@ -137,6 +137,26 @@ func applyCmd(args []string) int {
 		return 1
 	}
 
+	// --workspace mode: pre-seed the state file with the existing
+	// workspace's Terrapod ID so the writer takes the "reused" path
+	// (state push only, no create attempt).
+	if *workspace != "" {
+		sourceID := "direct:" + *workspace
+		if state.WorkspaceBySourceID(sourceID) == nil {
+			existing, lookupErr := c.GetWorkspaceByName(context.Background(), *workspace)
+			if lookupErr != nil {
+				fmt.Fprintf(os.Stderr, "apply: --workspace %q not found in Terrapod: %v\n", *workspace, lookupErr)
+				return 1
+			}
+			state.Workspaces = append(state.Workspaces, framework.WorkspaceRecord{
+				SourceID:   sourceID,
+				SourceName: *workspace,
+				TerrapodID: existing.ID,
+				State:      "created",
+			})
+		}
+	}
+
 	// Resolve plan VCS connections to Terrapod-side connection IDs by
 	// listing existing connections and matching on server URL +
 	// provider. The migrator never creates connections — operators
