@@ -28,9 +28,15 @@ def upgrade() -> None:
         ["vcs_connection_id"], ["id"],
         ondelete="SET NULL",
     )
+    op.create_check_constraint(
+        "ck_policy_sets_source",
+        "policy_sets",
+        "source IN ('inline', 'vcs')",
+    )
 
 
 def downgrade() -> None:
+    op.drop_constraint("ck_policy_sets_source", "policy_sets", type_="check")
     op.drop_constraint("fk_policy_sets_vcs_connection", "policy_sets", type_="foreignkey")
     op.drop_column("policy_sets", "vcs_last_error")
     op.drop_column("policy_sets", "vcs_last_synced_at")

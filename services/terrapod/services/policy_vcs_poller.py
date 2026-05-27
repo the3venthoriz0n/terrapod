@@ -97,6 +97,9 @@ async def _sync_policy_set(db: AsyncSession, ps: PolicySet) -> None:
             return
 
         archive = await provider.download_archive(conn, owner, repo, sha)
+        if len(archive) > _MAX_ARCHIVE_BYTES:
+            ps.vcs_last_error = f"Archive exceeds {_MAX_ARCHIVE_BYTES // (1024 * 1024)} MB limit ({len(archive)} bytes)"
+            return
         rego_files = await asyncio.to_thread(_extract_rego_files, archive, ps.policy_path)
 
         existing = {p.name: p for p in ps.policies}
@@ -143,12 +146,26 @@ async def _sync_policy_set(db: AsyncSession, ps: PolicySet) -> None:
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 
 
-async def sync_policy_set(db: AsyncSession, ps: PolicySet) -> None:
-    """Public entry point for syncing a single VCS policy set.
+async def handle_policy_vcs_sync(payload: dict) -> None:
+    """Triggered handler: sync a single VCS policy set by ID.
 
-    Called by the periodic poller and by the triggered sync action.
+    Enqueued by the POST /policy-sets/{id}/actions/sync endpoint.
     """
-    await _sync_policy_set(db, ps)
+    import uuid
+
+    ps_id = uuid.UUID(payload["policy_set_id"])
+    async with get_db_session() as db:
+        ps = (
+            await db.execute(
+                select(PolicySet)
+                .where(PolicySet.id == ps_id)
+                .options(selectinload(PolicySet.policies))
+            )
+        ).scalar_one_or_none()
+        if ps is None or ps.source != "vcs":
+            return
+        await _sync_policy_set(db, ps)
+        await db.commit()
 
 
 async def policy_vcs_poll_cycle() -> None:
