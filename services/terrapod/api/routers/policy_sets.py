@@ -227,13 +227,17 @@ async def create_policy_set(
     if source == "vcs":
         vcs_conn_id_raw = attrs.get("vcs-connection-id", "")
         if not vcs_conn_id_raw:
-            raise HTTPException(status_code=422, detail="vcs-connection-id is required for VCS policy sets")
+            raise HTTPException(
+                status_code=422, detail="vcs-connection-id is required for VCS policy sets"
+            )
         try:
             vcs_connection_id = uuid.UUID(vcs_conn_id_raw.removeprefix("vcs-"))
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="Invalid vcs-connection-id") from exc
         if not attrs.get("vcs-repo-url"):
-            raise HTTPException(status_code=422, detail="vcs-repo-url is required for VCS policy sets")
+            raise HTTPException(
+                status_code=422, detail="vcs-repo-url is required for VCS policy sets"
+            )
 
     ps = PolicySet(
         name=name,

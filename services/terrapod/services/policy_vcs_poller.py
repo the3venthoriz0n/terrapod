@@ -71,7 +71,7 @@ def _extract_rego_files(archive_bytes: bytes, policy_path: str) -> dict[str, str
             if target_dir:
                 if not relative_path.startswith(target_dir + "/"):
                     continue
-                remainder = relative_path[len(target_dir) + 1:]
+                remainder = relative_path[len(target_dir) + 1 :]
             else:
                 remainder = relative_path
 
@@ -123,11 +123,13 @@ async def _sync_policy_set(db: AsyncSession, ps: PolicySet) -> None:
                     existing[name].rego = rego
                     existing[name].updated_at = now_utc()
             else:
-                db.add(Policy(
-                    policy_set_id=ps.id,
-                    name=name,
-                    rego=rego,
-                ))
+                db.add(
+                    Policy(
+                        policy_set_id=ps.id,
+                        name=name,
+                        rego=rego,
+                    )
+                )
 
         for name, policy in existing.items():
             if name not in rego_files:
