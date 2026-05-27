@@ -33,6 +33,7 @@ Endpoints:
     PUT  /api/v2/state-versions/{id}/json-content — upload JSON state
 """
 
+import asyncio
 import hashlib
 import os
 import re
@@ -1699,18 +1700,78 @@ async def upload_state_content(
     if sv is None:
         raise HTTPException(status_code=404, detail="State version not found")
 
-    state_data = await request.body()
+    # Cap state body size to prevent OOM. Real-world terraform states
+    # rarely exceed ~50 MB; 256 MB is a generous upper bound that
+    # still leaves headroom for the rest of the worker. Bigger states
+    # should be split — terraform itself struggles with multi-GB
+    # state files.
+    #
+    # Streaming the body (rather than `await request.body()`) is
+    # required for two reasons:
+    #   1. Chunked-encoded clients omit Content-Length, so the pre-
+    #      check can't catch them; without streaming we'd allocate
+    #      multi-GB before the post-check fires.
+    #   2. The md5 must be hashed in a worker thread (CLAUDE.md hard
+    #      requirement #13: hashlib.md5 on buffers > 10 MB blocks the
+    #      event loop and trips liveness probes — issue #231).
+    state_max_bytes = 256 * 1024 * 1024
+    cl_raw = request.headers.get("content-length")
+    if cl_raw is not None:
+        try:
+            if int(cl_raw) > state_max_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"State exceeds {state_max_bytes} bytes; split the workspace or contact your operator",
+                )
+        except ValueError:
+            pass  # malformed header — let streaming enforce the cap
+    chunks: list[bytes] = []
+    running = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        running += len(chunk)
+        if running > state_max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"State exceeds {state_max_bytes} bytes; split the workspace or contact your operator",
+            )
+        chunks.append(chunk)
+    state_data = b"".join(chunks)
     if not state_data:
         raise HTTPException(status_code=422, detail="State data is required")
+
+    # Verify the client-supplied md5 (set at create-state-version time)
+    # against what we actually received. Mismatch means the bytes were
+    # mangled in transit — a proxy rewrote the body, a buggy SDK lied,
+    # or there was TCP-level corruption. Reject loudly rather than
+    # writing the wrong bytes under a "valid" hash; terraform would
+    # then plan against garbage. md5 is not a security primitive here
+    # (TLS covers integrity-on-the-wire) but it's a cheap end-to-end
+    # consistency check the TFE V2 protocol already requires.
+    #
+    # MUST run in a worker thread — CLAUDE.md hard requirement #13.
+    # Hashing 256 MB synchronously inside an async handler blocks
+    # the event loop for hundreds of ms, starving health probes and
+    # other concurrent requests.
+    def _md5(data: bytes) -> str:
+        return hashlib.md5(data).hexdigest()  # nosemgrep: insecure-hash-algorithm-md5
+
+    computed_md5 = await asyncio.to_thread(_md5, state_data)
+    if sv.md5 and sv.md5 != computed_md5:
+        raise HTTPException(
+            status_code=422,
+            detail=f"md5 mismatch: client declared {sv.md5} but received bytes hash to {computed_md5}",
+        )
 
     # Store in object storage (encryption at rest delegated to storage backend)
     storage = get_storage()
     key = state_key(str(sv.workspace_id), str(sv.id))
     await storage.put(key, state_data, content_type="application/octet-stream")
 
-    # Update metadata
+    # Update metadata. md5 already verified above; record the trusted value.
     sv.state_size = len(state_data)
-    sv.md5 = hashlib.md5(state_data).hexdigest()  # nosemgrep: insecure-hash-algorithm-md5
+    sv.md5 = computed_md5
 
     # Clear state_diverged flag on successful state upload
     ws = await db.get(Workspace, sv.workspace_id)

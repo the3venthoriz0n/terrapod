@@ -268,3 +268,74 @@ Validate ingress requires web UI to be enabled.
 {{- fail "Ingress is enabled but web.enabled is false. The Ingress routes to the web frontend — set web.enabled=true or disable the Ingress." -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+Validate the optional webhook Ingress:
+  - hostname is required when enabled (every public-internet caller resolves it)
+  - web.enabled is required (the webhook Ingress routes to the web BFF, same
+    as the management Ingress)
+  - paths must be non-empty (an empty allow-list is pointless and would
+    produce an unreachable Ingress)
+*/}}
+{{- define "terrapod.validateWebhookIngress" -}}
+{{- if .Values.webhookIngress.enabled -}}
+{{- if not .Values.webhookIngress.hostname -}}
+{{- fail "webhookIngress.enabled is true but webhookIngress.hostname is empty. Set the public hostname VCS webhooks (and any run-task callbacks) will reach Terrapod at." -}}
+{{- end -}}
+{{- if not .Values.web.enabled -}}
+{{- fail "webhookIngress.enabled is true but web.enabled is false. The webhook Ingress routes to the web frontend — set web.enabled=true." -}}
+{{- end -}}
+{{- if not .Values.webhookIngress.paths -}}
+{{- fail "webhookIngress.enabled is true but webhookIngress.paths is empty. The default allow-list ships in values.yaml; an empty list would produce an Ingress that accepts nothing." -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Resolve the public webhook URL (no trailing slash, with scheme). Used by
+configmap-api.yaml to default `api.config.public_webhook_url` when the
+operator hasn't set it explicitly. Returns empty when no webhook Ingress
+is configured — the API server then falls back to `external_url` for
+webhook URL generation.
+*/}}
+{{- define "terrapod.publicWebhookURL" -}}
+{{- if and .Values.webhookIngress.enabled .Values.webhookIngress.hostname -}}
+{{- $scheme := ternary "https" "http" .Values.webhookIngress.tls -}}
+{{- printf "%s://%s" $scheme .Values.webhookIngress.hostname -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Validate the optional internal Ingress:
+  - hostname is required when enabled (the internal route resolves to it)
+  - web.enabled is required (this Ingress routes to the web BFF, same as
+    the management Ingress)
+  - paths must be non-empty (default is "/")
+*/}}
+{{- define "terrapod.validateInternalIngress" -}}
+{{- if .Values.internalIngress.enabled -}}
+{{- if not .Values.internalIngress.hostname -}}
+{{- fail "internalIngress.enabled is true but internalIngress.hostname is empty. Set the internal hostname that listener pods and runner Jobs will use to reach Terrapod." -}}
+{{- end -}}
+{{- if not .Values.web.enabled -}}
+{{- fail "internalIngress.enabled is true but web.enabled is false. The internal Ingress routes to the web frontend — set web.enabled=true." -}}
+{{- end -}}
+{{- if not .Values.internalIngress.paths -}}
+{{- fail "internalIngress.enabled is true but internalIngress.paths is empty. The default (paths: [\"/\"]) ships in values.yaml; an empty list would produce an Ingress that accepts nothing." -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Resolve the internal API URL (no trailing slash, with scheme). Returns
+empty when the internal Ingress isn't configured. Operators wire this
+into listener.apiUrl when they want listeners + runners to use the
+internal route while users + CLI traffic continue to enter through the
+primary `ingress`.
+*/}}
+{{- define "terrapod.internalAPIURL" -}}
+{{- if and .Values.internalIngress.enabled .Values.internalIngress.hostname -}}
+{{- $scheme := ternary "https" "http" .Values.internalIngress.tls -}}
+{{- printf "%s://%s" $scheme .Values.internalIngress.hostname -}}
+{{- end -}}
+{{- end -}}

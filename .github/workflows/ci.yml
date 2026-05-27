@@ -6,6 +6,11 @@ on:
     tags: ['v[0-9]+.[0-9]+.[0-9]+']
   pull_request:
     branches: [main]
+    # Include `ready_for_review` so a PR opened in draft (which suppresses
+    # the default `opened`/`synchronize` events) starts CI when it's
+    # marked ready. Without this, draft-first PRs need a close+reopen to
+    # get any CI run at all — caught while bringing up #371.
+    types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -140,6 +145,82 @@ jobs:
       - name: Test
         run: go test ./... -v -count=1 -timeout 120s
         working-directory: provider
+
+  # ── go-terrapod Lint ──────────────────────────────────
+  # The public Go SDK lives in go-terrapod/ with its own go.mod (no
+  # provider/migrate-specific deps). Both terraform-provider-terrapod
+  # and terrapod-migrate import from here.
+  go-terrapod-lint:
+    name: go-terrapod Lint
+    needs: prepare
+    if: needs.prepare.outputs.images_exist != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go-terrapod/go.mod
+          cache-dependency-path: go-terrapod/go.sum
+      - name: Vet
+        run: go vet ./...
+        working-directory: go-terrapod
+      - name: Build
+        run: go build ./...
+        working-directory: go-terrapod
+
+  # ── go-terrapod Test ──────────────────────────────────
+  go-terrapod-test:
+    name: go-terrapod Test
+    needs: prepare
+    if: needs.prepare.outputs.images_exist != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go-terrapod/go.mod
+          cache-dependency-path: go-terrapod/go.sum
+      - name: Test
+        run: go test ./... -v -count=1 -timeout 120s
+        working-directory: go-terrapod
+
+  # ── Migrate Lint ──────────────────────────────────────
+  # The terrapod-migrate binary lives in migrate/ with its own go.mod
+  # (the provider doesn't carry go-tfe or the HCL libs). Mirrors the
+  # provider-lint shape so failures look the same to operators.
+  migrate-lint:
+    name: Migrate Lint
+    needs: prepare
+    if: needs.prepare.outputs.images_exist != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: migrate/go.mod
+          cache-dependency-path: migrate/go.sum
+      - name: Vet
+        run: go vet ./...
+        working-directory: migrate
+      - name: Build
+        run: go build ./...
+        working-directory: migrate
+
+  # ── Migrate Test ──────────────────────────────────────
+  migrate-test:
+    name: Migrate Test
+    needs: prepare
+    if: needs.prepare.outputs.images_exist != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: migrate/go.mod
+          cache-dependency-path: migrate/go.sum
+      - name: Test
+        run: go test ./... -v -count=1 -timeout 120s
+        working-directory: migrate
 
   # ── Python Test ────────────────────────────────────────
   python-test:
@@ -371,6 +452,23 @@ jobs:
       && needs.build-images.result == 'success'
       && needs.prepare.outputs.images_exist != 'true'
     runs-on: ubuntu-latest
+    # Whole-job upper bound. Default is GitHub's 360 min, which lets a
+    # wedged step (most commonly Playwright browser install) run for
+    # six hours before anyone notices. 25 min covers a cold-runner
+    # worst-case (image pull + stack boot + node setup + browser
+    # install + test suite) with headroom; anything past that is
+    # genuinely broken, not slow.
+    timeout-minutes: 25
+    env:
+      # Pin Playwright's browser install location to /tmp so both the
+      # downloaded zip (which lands in /tmp/playwright-download-*)
+      # and the extracted browser tree end up on the same directory
+      # path. Default would extract to ~/.cache/ms-playwright/, which
+      # we've seen wedge silently mid-extract — likely because the
+      # final post-extract rename/move spans directories and triggers
+      # extra I/O on the Azure-backed runner disk. Job-scoped so both
+      # the install step and the test run step see the same path.
+      PLAYWRIGHT_BROWSERS_PATH: /tmp/ms-playwright
     permissions:
       contents: read
       packages: read
@@ -418,16 +516,31 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
         working-directory: e2e
+        # Cold npm caches rarely take more than a minute; 5 fails fast.
+        timeout-minutes: 5
 
       - name: Install Playwright browsers
         run: npx playwright install chromium --with-deps
         working-directory: e2e
+        env:
+          # Diagnostic: this step has wedged at ~100% download with no
+          # further output, leaving us to guess which post-download
+          # phase (extract / chmod / metadata-write) is stuck. pw:install
+          # logs each phase, so the next failure shows the actual
+          # wedge site instead of a silent timeout.
+          DEBUG: pw:install
+        # Normal install is 60-90s; 5 min lets a cold runner finish
+        # but kills a wedge fast enough to recover the job.
+        timeout-minutes: 5
 
       - name: Run Playwright tests
         run: npx playwright test
         working-directory: e2e
         env:
           CI: true
+        # Playwright has per-test timeouts of its own, but a hung
+        # worker can outlast them; this is the outer safety net.
+        timeout-minutes: 10
 
       - name: Upload test report
         if: always()
@@ -621,6 +734,23 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GPG_FINGERPRINT: ${{ steps.gpg.outputs.fingerprint }}
 
+      # Build terrapod-migrate binaries and append them to the release
+      # created by the provider's GoReleaser run. Linux/Windows ship as
+      # per-arch zips; macOS ships as a single Universal 2 binary built
+      # by lipo-merging darwin/amd64 + darwin/arm64. See
+      # migrate/.goreleaser.yml — release.mode=append keeps this step
+      # from trying to create a duplicate GitHub Release for the same tag.
+      - name: Build migrate-tool binaries with GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean
+          workdir: migrate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPG_FINGERPRINT: ${{ steps.gpg.outputs.fingerprint }}
+
       - name: Generate release notes
         id: notes
         run: |
@@ -738,6 +868,10 @@ jobs:
       - frontend-lint
       - provider-lint
       - provider-test
+      - go-terrapod-lint
+      - go-terrapod-test
+      - migrate-lint
+      - migrate-test
       - python-test
       - python-audit
       - npm-audit
@@ -761,6 +895,10 @@ jobs:
             "${{ needs.frontend-lint.result }}"
             "${{ needs.provider-lint.result }}"
             "${{ needs.provider-test.result }}"
+            "${{ needs.go-terrapod-lint.result }}"
+            "${{ needs.go-terrapod-test.result }}"
+            "${{ needs.migrate-lint.result }}"
+            "${{ needs.migrate-test.result }}"
             "${{ needs.python-test.result }}"
             "${{ needs.python-audit.result }}"
             "${{ needs.npm-audit.result }}"
