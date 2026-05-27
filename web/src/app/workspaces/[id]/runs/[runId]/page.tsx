@@ -1017,28 +1017,51 @@ function PolicyPanel({
                 )}
               </div>
               {a.result?.error && (
-                <p className="mt-2 text-xs text-amber-300 font-mono">{a.result.error}</p>
+                <div className="mt-2 p-2 bg-red-900/20 rounded border border-red-800/40">
+                  <p className="text-xs text-red-300 font-mono whitespace-pre-wrap">{a.result.error}</p>
+                </div>
               )}
-              {policies
-                .filter((p) => !p.passed || p.warnings.length > 0)
-                .map((p) => (
-                  <div key={p.policy} className="mt-2 text-xs">
-                    <span className="text-slate-300 font-medium">{p.policy}</span>
-                    {p.error && <span className="text-amber-300 font-mono"> — {p.error}</span>}
-                    <ul className="mt-1 ml-3 space-y-0.5">
-                      {p.violations.map((v, i) => (
-                        <li key={`v${i}`} className="text-red-300 font-mono">
-                          &bull; {v}
-                        </li>
-                      ))}
-                      {p.warnings.map((w, i) => (
-                        <li key={`w${i}`} className="text-amber-300 font-mono">
-                          &bull; {w}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                ))}
+              {policies.length > 0 && (
+                <div className="mt-3 space-y-2">
+                  {policies.map((p) => (
+                    <div key={p.policy} className="text-xs border-l-2 pl-3 py-1" style={{borderColor: p.passed ? '#4ade80' : p.error ? '#f59e0b' : '#f87171'}}>
+                      <div className="flex items-center gap-2">
+                        <span className={p.passed ? 'text-green-400' : p.error ? 'text-amber-400' : 'text-red-400'}>
+                          {p.passed ? '✓' : p.error ? '⚠' : '✗'}
+                        </span>
+                        <span className="text-slate-200 font-medium">{p.policy}</span>
+                        {p.passed && <span className="text-green-500">passed</span>}
+                      </div>
+                      {p.error && (
+                        <div className="mt-1 ml-5 p-2 bg-amber-900/20 rounded border border-amber-800/40">
+                          <p className="text-amber-300 font-mono whitespace-pre-wrap">{p.error}</p>
+                        </div>
+                      )}
+                      {!p.passed && !p.error && (!p.violations || p.violations.length === 0) && (
+                        <p className="mt-1 ml-5 text-slate-400 italic">Policy failed without producing a deny message or error output</p>
+                      )}
+                      {p.violations && p.violations.length > 0 && (
+                        <ul className="mt-1 ml-5 space-y-0.5">
+                          {p.violations.map((v: string, i: number) => (
+                            <li key={`v${i}`} className="text-red-300 font-mono">
+                              &bull; {v}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {p.warnings && p.warnings.length > 0 && (
+                        <ul className="mt-1 ml-5 space-y-0.5">
+                          {p.warnings.map((w: string, i: number) => (
+                            <li key={`w${i}`} className="text-amber-300 font-mono">
+                              &bull; {w}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )
         })}
