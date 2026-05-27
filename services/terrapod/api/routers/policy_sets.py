@@ -351,23 +351,29 @@ async def delete_policy_set(
 # ── VCS Sync Action ──────────────────────────────────────────────────
 
 
-@router.post("/policy-sets/{ps_id}/actions/sync")
-async def sync_policy_set(
+@router.post("/policy-sets/{ps_id}/actions/sync", status_code=202)
+async def trigger_sync_policy_set(
     ps_id: str = Path(...),
     user: AuthenticatedUser = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
-    """Trigger an immediate sync of a VCS-sourced policy set."""
+    """Enqueue an immediate sync of a VCS-sourced policy set. Returns 202 Accepted."""
     ps = await _get_policy_set(db, ps_id)
     if ps.source != "vcs":
         raise HTTPException(status_code=409, detail="Only VCS-sourced policy sets can be synced")
 
-    from terrapod.services.policy_vcs_poller import _sync_policy_set
+    from terrapod.services.scheduler import enqueue_trigger
 
-    await _sync_policy_set(db, ps)
-    await db.commit()
-    ps = await _get_policy_set(db, ps_id)
-    return JSONResponse(content={"data": _policy_set_json(ps, embed_policies=True)})
+    await enqueue_trigger(
+        "policy_vcs_sync",
+        payload={"policy_set_id": str(ps.id)},
+        dedup_key=f"policy_vcs_sync:{ps.id}",
+        dedup_ttl=30,
+    )
+    return JSONResponse(
+        content={"data": _policy_set_json(ps, embed_policies=True)},
+        status_code=202,
+    )
 
 
 # ── Policy CRUD ───────────────────────────────────────────────────────
