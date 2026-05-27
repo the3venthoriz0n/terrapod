@@ -8,6 +8,7 @@ table. Deletes policies whose .rego files no longer exist in the repo.
 Registered as a periodic task alongside vcs_poll and registry_vcs_poll.
 """
 
+import asyncio
 import io
 import os
 import tarfile
@@ -113,7 +114,7 @@ async def _sync_policy_set(db: AsyncSession, ps: PolicySet) -> None:
             return
 
         archive = await _download_archive(conn, owner, repo, sha)
-        rego_files = _extract_rego_files(archive, ps.policy_path)
+        rego_files = await asyncio.to_thread(_extract_rego_files, archive, ps.policy_path)
 
         existing = {p.name: p for p in ps.policies}
 
