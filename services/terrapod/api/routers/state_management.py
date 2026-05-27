@@ -74,12 +74,25 @@ async def delete_state_version(
     sv = await _get_state_version(state_version_id, db)
     ws = await _require_sv_workspace_permission(sv, "admin", user, db)
 
-    # Prevent deleting the current (latest) state version
+    # Prevent deleting the current (latest) state version, UNLESS the
+    # record is an unuploaded orphan placeholder. We can't gate on
+    # md5 (it's set at create_state_version time from the client-
+    # declared value, so it's already non-empty for an orphan) — we
+    # gate on state_size, which upload_state_content sets atomically
+    # with the actual bytes. state_size == 0 ⇔ /content PUT never
+    # succeeded ⇔ no real terraform data exists for this row.
+    #
+    # Threat: an admin could create a placeholder at serial N+1 and
+    # then delete the real previous-current at serial N. That's not
+    # a new attack — admin can already delete non-current state
+    # versions, and creating a placeholder + deleting old + deleting
+    # placeholder strings together capabilities admin already has
+    # directly. Logged in audit_log.
     max_serial_result = await db.execute(
         select(func.max(StateVersion.serial)).where(StateVersion.workspace_id == sv.workspace_id)
     )
     max_serial = max_serial_result.scalar_one_or_none()
-    if max_serial is not None and sv.serial == max_serial:
+    if max_serial is not None and sv.serial == max_serial and (sv.state_size or 0) > 0:
         raise HTTPException(
             status_code=409,
             detail="Cannot delete the current state version",

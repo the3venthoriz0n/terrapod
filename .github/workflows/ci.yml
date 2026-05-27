@@ -6,6 +6,11 @@ on:
     tags: ['v[0-9]+.[0-9]+.[0-9]+']
   pull_request:
     branches: [main]
+    # Include `ready_for_review` so a PR opened in draft (which suppresses
+    # the default `opened`/`synchronize` events) starts CI when it's
+    # marked ready. Without this, draft-first PRs need a close+reopen to
+    # get any CI run at all — caught while bringing up #371.
+    types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -140,6 +145,82 @@ jobs:
       - name: Test
         run: go test ./... -v -count=1 -timeout 120s
         working-directory: provider
+
+  # ── go-terrapod Lint ──────────────────────────────────
+  # The public Go SDK lives in go-terrapod/ with its own go.mod (no
+  # provider/migrate-specific deps). Both terraform-provider-terrapod
+  # and terrapod-migrate import from here.
+  go-terrapod-lint:
+    name: go-terrapod Lint
+    needs: prepare
+    if: needs.prepare.outputs.images_exist != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go-terrapod/go.mod
+          cache-dependency-path: go-terrapod/go.sum
+      - name: Vet
+        run: go vet ./...
+        working-directory: go-terrapod
+      - name: Build
+        run: go build ./...
+        working-directory: go-terrapod
+
+  # ── go-terrapod Test ──────────────────────────────────
+  go-terrapod-test:
+    name: go-terrapod Test
+    needs: prepare
+    if: needs.prepare.outputs.images_exist != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go-terrapod/go.mod
+          cache-dependency-path: go-terrapod/go.sum
+      - name: Test
+        run: go test ./... -v -count=1 -timeout 120s
+        working-directory: go-terrapod
+
+  # ── Migrate Lint ──────────────────────────────────────
+  # The terrapod-migrate binary lives in migrate/ with its own go.mod
+  # (the provider doesn't carry go-tfe or the HCL libs). Mirrors the
+  # provider-lint shape so failures look the same to operators.
+  migrate-lint:
+    name: Migrate Lint
+    needs: prepare
+    if: needs.prepare.outputs.images_exist != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: migrate/go.mod
+          cache-dependency-path: migrate/go.sum
+      - name: Vet
+        run: go vet ./...
+        working-directory: migrate
+      - name: Build
+        run: go build ./...
+        working-directory: migrate
+
+  # ── Migrate Test ──────────────────────────────────────
+  migrate-test:
+    name: Migrate Test
+    needs: prepare
+    if: needs.prepare.outputs.images_exist != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: migrate/go.mod
+          cache-dependency-path: migrate/go.sum
+      - name: Test
+        run: go test ./... -v -count=1 -timeout 120s
+        working-directory: migrate
 
   # ── Python Test ────────────────────────────────────────
   python-test:
@@ -621,6 +702,23 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GPG_FINGERPRINT: ${{ steps.gpg.outputs.fingerprint }}
 
+      # Build terrapod-migrate binaries and append them to the release
+      # created by the provider's GoReleaser run. Linux/Windows ship as
+      # per-arch zips; macOS ships as a single Universal 2 binary built
+      # by lipo-merging darwin/amd64 + darwin/arm64. See
+      # migrate/.goreleaser.yml — release.mode=append keeps this step
+      # from trying to create a duplicate GitHub Release for the same tag.
+      - name: Build migrate-tool binaries with GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean
+          workdir: migrate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPG_FINGERPRINT: ${{ steps.gpg.outputs.fingerprint }}
+
       - name: Generate release notes
         id: notes
         run: |
@@ -738,6 +836,10 @@ jobs:
       - frontend-lint
       - provider-lint
       - provider-test
+      - go-terrapod-lint
+      - go-terrapod-test
+      - migrate-lint
+      - migrate-test
       - python-test
       - python-audit
       - npm-audit
@@ -761,6 +863,10 @@ jobs:
             "${{ needs.frontend-lint.result }}"
             "${{ needs.provider-lint.result }}"
             "${{ needs.provider-test.result }}"
+            "${{ needs.go-terrapod-lint.result }}"
+            "${{ needs.go-terrapod-test.result }}"
+            "${{ needs.migrate-lint.result }}"
+            "${{ needs.migrate-test.result }}"
             "${{ needs.python-test.result }}"
             "${{ needs.python-audit.result }}"
             "${{ needs.npm-audit.result }}"
