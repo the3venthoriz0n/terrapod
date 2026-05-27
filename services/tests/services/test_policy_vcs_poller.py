@@ -129,7 +129,7 @@ class TestSyncPolicySet:
     @patch("terrapod.services.policy_vcs_poller._get_provider")
     async def test_skips_when_sha_unchanged(self, mock_get_provider):
         """No work done if branch SHA matches vcs_last_commit_sha."""
-        provider = AsyncMock()
+        provider = MagicMock()
         provider.parse_repo_url.return_value = ("org", "policies")
         provider.get_branch_sha = AsyncMock(return_value="abc123")
         mock_get_provider.return_value = provider
@@ -146,7 +146,7 @@ class TestSyncPolicySet:
     @patch("terrapod.services.policy_vcs_poller._get_provider")
     async def test_sets_error_when_branch_not_found(self, mock_get_provider):
         """vcs_last_error is set when the branch doesn't exist."""
-        provider = AsyncMock()
+        provider = MagicMock()
         provider.parse_repo_url.return_value = ("org", "policies")
         provider.get_branch_sha = AsyncMock(return_value=None)
         mock_get_provider.return_value = provider
@@ -167,7 +167,7 @@ class TestSyncPolicySet:
                 "repo-abc123/policies/new_policy.rego": "package terrapod\ndeny contains msg if { false }",
             }
         )
-        provider = AsyncMock()
+        provider = MagicMock()
         provider.parse_repo_url.return_value = ("org", "policies")
         provider.get_branch_sha = AsyncMock(return_value="def456")
         provider.download_archive = AsyncMock(return_value=archive)
@@ -194,7 +194,7 @@ class TestSyncPolicySet:
                 "repo-abc123/policies/existing.rego": new_rego,
             }
         )
-        provider = AsyncMock()
+        provider = MagicMock()
         provider.parse_repo_url.return_value = ("org", "policies")
         provider.get_branch_sha = AsyncMock(return_value="def456")
         provider.download_archive = AsyncMock(return_value=archive)
@@ -218,7 +218,7 @@ class TestSyncPolicySet:
                 "repo-abc123/policies/kept.rego": "package terrapod\ndeny contains msg if { false }",
             }
         )
-        provider = AsyncMock()
+        provider = MagicMock()
         provider.parse_repo_url.return_value = ("org", "policies")
         provider.get_branch_sha = AsyncMock(return_value="def456")
         provider.download_archive = AsyncMock(return_value=archive)
@@ -237,7 +237,7 @@ class TestSyncPolicySet:
     @patch("terrapod.services.policy_vcs_poller._get_provider")
     async def test_sets_error_on_exception(self, mock_get_provider):
         """Exceptions during sync are caught and stored in vcs_last_error."""
-        provider = AsyncMock()
+        provider = MagicMock()
         provider.parse_repo_url.return_value = ("org", "policies")
         provider.get_branch_sha = AsyncMock(side_effect=RuntimeError("network timeout"))
         mock_get_provider.return_value = provider
