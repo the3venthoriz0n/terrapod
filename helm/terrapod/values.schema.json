@@ -68,6 +68,13 @@
         "enabled": { "type": "boolean" },
         "replicas": { "type": "integer", "minimum": 1 },
         "image": { "$ref": "#/$defs/imageSpec" },
+        "hsts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "value": { "type": "string" }
+          }
+        },
         "startupProbe": { "type": "object" },
         "livenessProbe": { "type": "object" },
         "readinessProbe": { "type": "object" },
@@ -134,6 +141,7 @@
         "name": { "type": "string" },
         "healthPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "apiUrl": { "type": "string" },
+        "publicApiUrl": { "type": "string" },
         "joinToken": { "type": "string" },
         "existingSecret": { "type": "string" },
         "joinTokenKey": { "type": "string" },
@@ -175,6 +183,36 @@
         "tls": { "type": "boolean" },
         "pathType": { "type": "string", "enum": ["Prefix", "Exact", "ImplementationSpecific"] },
         "annotations": { "type": "object" },
+        "extraPaths": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+
+    "webhookIngress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": { "type": "string" },
+        "hostname": { "type": "string" },
+        "tls": { "type": "boolean" },
+        "pathType": { "type": "string", "enum": ["Prefix", "Exact", "ImplementationSpecific"] },
+        "annotations": { "type": "object" },
+        "paths": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+
+    "internalIngress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": { "type": "string" },
+        "hostname": { "type": "string" },
+        "tls": { "type": "boolean" },
+        "existingSecret": { "type": "string" },
+        "pathType": { "type": "string", "enum": ["Prefix", "Exact", "ImplementationSpecific"] },
+        "annotations": { "type": "object" },
+        "paths": { "type": "array", "items": { "type": "string" } },
         "extraPaths": { "type": "array", "items": { "type": "object" } }
       }
     },
@@ -387,6 +425,7 @@
           "enum": ["debug", "info", "warning", "error", "critical"]
         },
         "external_url": { "type": "string" },
+        "public_webhook_url": { "type": "string" },
         "database": {
           "type": "object",
           "additionalProperties": false,
