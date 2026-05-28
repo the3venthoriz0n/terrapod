@@ -12,6 +12,7 @@ import asyncio
 import io
 import os
 import posixpath
+import re
 import tarfile
 import tempfile
 import uuid
@@ -30,6 +31,9 @@ logger = get_logger(__name__)
 
 # Max archive size (256 MB) — defence against pathological repos OOMing the worker.
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
+
+_PACKAGE_RE = re.compile(r"(?m)^\s*package\s+terrapod\s*(#.*)?$")
+_DENY_RULE_RE = re.compile(r"(?m)^\s*deny\s+(contains|:=|=)")
 
 
 def _parse_repo_url(conn: VCSConnection, repo_url: str) -> tuple[str, str] | None:
@@ -165,6 +169,11 @@ async def _sync_policy_set(db: AsyncSession, ps: PolicySet) -> None:
 
         archive = await _download_archive(conn, owner, repo, sha)
         rego_files = await asyncio.to_thread(_extract_rego_files, archive, ps.policy_path)
+        rego_files = {
+            name: rego
+            for name, rego in rego_files.items()
+            if _PACKAGE_RE.search(rego) and _DENY_RULE_RE.search(rego)
+        }
 
         existing = {p.name: p for p in ps.policies}
 
@@ -198,7 +207,7 @@ async def _sync_policy_set(db: AsyncSession, ps: PolicySet) -> None:
         )
 
     except Exception as e:
-        ps.vcs_last_error = str(e)[-500:]
+        ps.vcs_last_error = str(e)[:500]
         logger.warning(
             "Policy VCS sync failed",
             policy_set=ps.name,

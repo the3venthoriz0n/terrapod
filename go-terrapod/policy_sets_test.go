@@ -25,7 +25,7 @@ func newPolicySetFixture(t *testing.T) (*Client, *http.Request) {
 			_, _ = w.Write([]byte(`{"data":{"id":"polset-aaa","type":"policy-sets","attributes":{
 			  "name":"sec-baseline","enforcement-level":"mandatory","enabled":true,
 			  "global-scope":true,"source":"vcs","policy-count":3,
-			  "vcs-connection-id":"vcs-conn-1","vcs-repo-url":"https://github.com/org/policies",
+			  "vcs-connection-id":"vcs-aaa","vcs-repo-url":"https://github.com/org/policies",
 			  "vcs-branch":"main","policy-path":"policies",
 			  "vcs-last-commit-sha":"abc123","vcs-last-synced-at":"2026-05-28T00:00:00Z"
 			}}}`))
@@ -38,7 +38,7 @@ func newPolicySetFixture(t *testing.T) (*Client, *http.Request) {
 			_, _ = w.Write([]byte(`{"data":{"id":"polset-aaa","type":"policy-sets","attributes":{
 			  "name":"sec-baseline","enforcement-level":"mandatory","enabled":true,
 			  "global-scope":false,"source":"vcs","policy-count":3,
-			  "vcs-connection-id":"vcs-conn-1","vcs-repo-url":"https://github.com/org/policies",
+			  "vcs-connection-id":"vcs-aaa","vcs-repo-url":"https://github.com/org/policies",
 			  "vcs-branch":"main","policy-path":"opa/","vcs-last-error":"branch not found"
 			}}}`))
 		case r.Method == http.MethodPatch:
@@ -73,7 +73,7 @@ func TestCreatePolicySet_VCS(t *testing.T) {
 		Enabled:          true,
 		GlobalScope:      true,
 		Source:           "vcs",
-		VCSConnectionID:  "vcs-conn-1",
+		VCSConnectionID:  "vcs-aaa",
 		VCSRepoURL:       "https://github.com/org/policies",
 		VCSBranch:        "main",
 		PolicyPath:       "policies",
@@ -87,7 +87,7 @@ func TestCreatePolicySet_VCS(t *testing.T) {
 	if ps.Source != "vcs" {
 		t.Errorf("Source = %q", ps.Source)
 	}
-	if ps.VCSConnectionID != "vcs-conn-1" {
+	if ps.VCSConnectionID != "vcs-aaa" {
 		t.Errorf("VCSConnectionID = %q", ps.VCSConnectionID)
 	}
 	if ps.VCSRepoURL != "https://github.com/org/policies" {
