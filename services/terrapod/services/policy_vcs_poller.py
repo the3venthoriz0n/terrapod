@@ -13,6 +13,7 @@ import io
 import os
 import posixpath
 import tarfile
+import tempfile
 import uuid
 
 from sqlalchemy import select
@@ -96,23 +97,43 @@ def _extract_rego_files(archive_bytes: bytes, policy_path: str) -> dict[str, str
 
 
 async def _download_archive(conn: VCSConnection, owner: str, repo: str, ref: str) -> bytes:
-    """Download archive via the appropriate provider.
+    """Download archive via streaming with a size cap enforced before memory load.
 
-    Validates size post-download. A full streaming cap requires changes
-    to the provider protocol (accept max_bytes); for now the 256 MB
-    guard catches adversarial repos before extraction. Practical risk is
-    bounded by the provider APIs' own response limits (~100 MB on GitHub,
-    ~250 MB on GitLab).
+    Uses the provider's stream-to-file path (chunked writes to disk, ~1 MB
+    in memory at any time) so an adversarial multi-hundred-MB repo cannot
+    OOM the API replica. After the streamed download completes, the total
+    byte count is checked BEFORE reading into memory. Only archives under
+    the cap are loaded for tarfile extraction.
     """
-    if conn.provider == "gitlab":
-        archive = await gitlab_service.download_archive(conn, owner, repo, ref)
-    else:
-        archive = await github_service.download_repo_archive(conn, owner, repo, ref)
-    if len(archive) > _MAX_ARCHIVE_BYTES:
-        raise ValueError(
-            f"Archive exceeds {_MAX_ARCHIVE_BYTES // (1024 * 1024)} MB limit ({len(archive)} bytes)"
-        )
-    return archive
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        if conn.provider == "gitlab":
+            written = await gitlab_service.download_archive_to_file(
+                conn, owner, repo, ref, tmp_path
+            )
+        else:
+            written = await github_service.download_repo_archive_to_file(
+                conn, owner, repo, ref, tmp_path
+            )
+
+        if written > _MAX_ARCHIVE_BYTES:
+            raise ValueError(
+                f"Archive exceeds {_MAX_ARCHIVE_BYTES // (1024 * 1024)} MB limit ({written} bytes)"
+            )
+
+        return await asyncio.to_thread(_read_file, tmp_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _read_file(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
 
 
 async def _sync_policy_set(db: AsyncSession, ps: PolicySet) -> None:
