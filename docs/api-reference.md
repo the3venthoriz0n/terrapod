@@ -2232,6 +2232,50 @@ POST /api/terrapod/v1/policy-sets
 
 `enforcement-level` is `advisory` (default) or `mandatory`. Scoping is `global-scope: true` (every workspace) or the `allow-labels` / `allow-names` / `deny-labels` / `deny-names` rules (same label model as roles; deny wins). **Required permission:** `admin`.
 
+#### VCS-Sourced Policy Sets
+
+Set `source` to `"vcs"` to create a policy set that syncs `.rego` files from a git repository instead of managing policies inline via the API:
+
+```json
+{
+  "data": {
+    "type": "policy-sets",
+    "attributes": {
+      "name": "security-baseline",
+      "enforcement-level": "mandatory",
+      "source": "vcs",
+      "vcs-connection-id": "vcs-<uuid>",
+      "vcs-repo-url": "https://github.com/org/policies",
+      "vcs-branch": "main",
+      "policy-path": "policies"
+    }
+  }
+}
+```
+
+**VCS-specific attributes:**
+
+| Attribute | Type | Description |
+|---|---|---|
+| `source` | string | `"inline"` (default) or `"vcs"` |
+| `vcs-connection-id` | string | Required when `source=vcs`. References a VCS connection (`vcs-<uuid>` format). |
+| `vcs-repo-url` | string | Required when `source=vcs`. HTTPS clone URL of the repo. |
+| `vcs-branch` | string | Branch to track. Defaults to the repo's default branch if empty. |
+| `policy-path` | string | Directory within the repo containing `.rego` files. Only direct children are loaded (no recursive descent). Empty string means repo root. |
+| `vcs-last-commit-sha` | string | Read-only. SHA of the last successfully synced commit. |
+| `vcs-last-synced-at` | string | Read-only. RFC 3339 timestamp of last successful sync. |
+| `vcs-last-error` | string\|null | Read-only. Error message from the most recent sync attempt, or null. |
+
+When `source=vcs`, inline policy CRUD is rejected with **409 Conflict** — policies are managed exclusively by the linked repository.
+
+### Sync VCS Policy Set
+
+```
+POST /api/terrapod/v1/policy-sets/{id}/actions/sync
+```
+
+Triggers an immediate sync of a VCS-sourced policy set. Returns **202 Accepted** with the current policy set state; the actual sync runs asynchronously. Returns **409 Conflict** if the policy set has `source=inline`. **Required permission:** `admin`.
+
 ### Show / Update / Delete Policy Set
 
 ```
