@@ -61,6 +61,26 @@ type StateOptions struct {
 	S3Region string
 }
 
+// ReadStateFromDir detects the backend from HCL in the given directory
+// and returns the state bytes, lineage, and serial. This is the public
+// entry point for callers that don't need a full Source (e.g. the
+// --workspace direct-migration path).
+func ReadStateFromDir(ctx context.Context, dir string, opts StateOptions) ([]byte, string, int64, error) {
+	backend, err := hcl.DetectBackend(dir)
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("detect backend in %s: %w", dir, err)
+	}
+	raw, err := fetchStateForBackend(ctx, backend, dir, opts)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	lineage, serial, err := parseLineageAndSerial(raw)
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("parse state from %s: %w", dir, err)
+	}
+	return raw, lineage, serial, nil
+}
+
 // StateReader returns a writer.StateReader that resolves
 // "<repo-url>:<dir>" SourceIDs (the shape Emit stamps on each
 // workspace) to the underlying backend's state bytes.
