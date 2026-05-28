@@ -209,7 +209,7 @@ The following are detected and listed but **not** rewritten because the
 substitutions aren't mechanical:
 
 - `provider "tfe" {}` declarations and `resource "tfe_*" {}` / `data
-"tfe_*" {}` blocks — different attribute shapes.
+  "tfe_*" {}` blocks — different attribute shapes.
 
 Module source rewriting is **opt-in** via `--rewrite-modules` on the
 `rewrite` subcommand. Module pins are higher-blast-radius than backend
@@ -225,7 +225,7 @@ consciously. When `--rewrite-modules` is set, the rewriter walks every
   can't fulfil it). `--allow-missing-module-mapping` downgrades to a
   warning.
 - **Git form** (`"git::https://..."`) — looks up the matching `module
-register` record by git URL. Same hard-error-by-default behaviour.
+  register` record by git URL. Same hard-error-by-default behaviour.
 - **Public registry form** (`"hashicorp/aws"`) — ignored, never
   rewritten.
 - **Local path** (`"./modules/vpc"`) — ignored, never rewritten.
