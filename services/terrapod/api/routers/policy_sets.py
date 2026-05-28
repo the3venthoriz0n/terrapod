@@ -240,6 +240,7 @@ async def create_policy_set(
             )
 
     ps = PolicySet(
+        id=generate_uuid7(),
         name=name,
         description=attrs.get("description", "") or "",
         enforcement_level=_validate_enforcement(attrs.get("enforcement-level", "advisory")),
@@ -264,7 +265,7 @@ async def create_policy_set(
         raise HTTPException(
             status_code=409, detail=f"A policy set named '{name}' already exists"
         ) from exc
-    ps = await _get_policy_set(db, str(ps.id))
+    ps = await _get_policy_set(db, f"polset-{ps.id}")
     return JSONResponse(
         content={"data": _policy_set_json(ps, embed_policies=True)}, status_code=201
     )
