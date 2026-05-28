@@ -501,6 +501,9 @@ class RegistryModuleVersion(Base):
     vcs_commit_sha: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     vcs_tag: Mapped[str] = mapped_column(String(255), nullable=False, default="")
 
+    inputs: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    outputs: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=now_utc, nullable=False
     )
