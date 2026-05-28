@@ -18,7 +18,7 @@ import uuid
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import joinedload, selectinload
 
 from terrapod.db.models import Policy, PolicySet, VCSConnection, now_utc
 from terrapod.db.session import get_db_session
@@ -198,7 +198,7 @@ async def _sync_policy_set(db: AsyncSession, ps: PolicySet) -> None:
         )
 
     except Exception as e:
-        ps.vcs_last_error = str(e)[-2000:]
+        ps.vcs_last_error = str(e)[-500:]
         logger.warning(
             "Policy VCS sync failed",
             policy_set=ps.name,
@@ -218,7 +218,7 @@ async def handle_policy_vcs_sync(payload: dict) -> None:
             await db.execute(
                 select(PolicySet)
                 .where(PolicySet.id == ps_id)
-                .options(selectinload(PolicySet.policies))
+                .options(selectinload(PolicySet.policies), joinedload(PolicySet.vcs_connection))
             )
         ).scalar_one_or_none()
         if ps is None or ps.source != "vcs":
