@@ -129,6 +129,36 @@ class TestCreatePolicySetVCS:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
+    async def test_404_vcs_connection_not_found(self, *_mocks):
+        app, db = _make_app()
+        db.commit = AsyncMock()
+        db.add = MagicMock()
+        db.execute = AsyncMock(return_value=_scalar_result(None))
+
+        body = {
+            "data": {
+                "type": "policy-sets",
+                "attributes": {
+                    "name": "sec-baseline",
+                    "enforcement-level": "mandatory",
+                    "source": "vcs",
+                    "vcs-connection-id": f"vcs-{uuid.uuid4()}",
+                    "vcs-repo-url": "https://github.com/org/policies",
+                    "vcs-branch": "main",
+                    "policy-path": "policies",
+                },
+            }
+        }
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.post("/api/terrapod/v1/policy-sets", json=body, headers=_AUTH)
+        assert resp.status_code == 404
+        assert "VCS connection" in resp.json()["detail"]
+
+    @pytest.mark.asyncio
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
     async def test_422_vcs_missing_connection_id(self, *_mocks):
         app, db = _make_app()
 
@@ -170,6 +200,37 @@ class TestCreatePolicySetVCS:
             resp = await c.post("/api/terrapod/v1/policy-sets", json=body, headers=_AUTH)
         assert resp.status_code == 422
         assert "vcs-repo-url" in resp.json()["detail"]
+
+
+# ── Update guards ────────────────────────────────────────────────────
+
+
+class TestUpdatePolicySetVCS:
+    @pytest.mark.asyncio
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    async def test_422_source_immutable(self, *_mocks):
+        app, db = _make_app()
+        ps = _mock_policy_set(source="vcs")
+        db.execute = AsyncMock(return_value=_scalar_result(ps))
+        db.commit = AsyncMock()
+
+        body = {
+            "data": {
+                "type": "policy-sets",
+                "attributes": {"source": "inline"},
+            }
+        }
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.patch(
+                f"/api/terrapod/v1/policy-sets/polset-{ps.id}",
+                json=body,
+                headers=_AUTH,
+            )
+        assert resp.status_code == 422
+        assert "source" in resp.json()["detail"]
 
 
 # ── 409 guards: inline CRUD on VCS-sourced sets ──────────────────────

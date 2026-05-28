@@ -308,6 +308,59 @@ class TestSyncPolicySet:
         assert "exceeds" in ps.vcs_last_error or "limit" in ps.vcs_last_error
 
 
+    @pytest.mark.asyncio
+    @patch(f"{_PATCH_PREFIX}._download_archive", new_callable=AsyncMock)
+    @patch(f"{_PATCH_PREFIX}._get_branch_sha", new_callable=AsyncMock)
+    @patch(f"{_PATCH_PREFIX}._parse_repo_url")
+    async def test_skips_rego_with_wrong_package(self, mock_parse, mock_sha, mock_download):
+        """Files not declaring 'package terrapod' are skipped."""
+        archive = _make_tarball(
+            {
+                "repo-abc123/policies/good.rego": "package terrapod\ndeny contains msg if { false }",
+                "repo-abc123/policies/bad_pkg.rego": "package aws.s3\ndeny contains msg if { false }",
+            }
+        )
+        mock_parse.return_value = ("org", "policies")
+        mock_sha.return_value = "new-sha"
+        mock_download.return_value = archive
+
+        ps = _mock_policy_set(vcs_last_commit_sha="old-sha")
+        db = AsyncMock()
+
+        await _sync_policy_set(db, ps)
+
+        assert db.add.called
+        add_arg = db.add.call_args_list[0][0][0]
+        assert add_arg.name == "good"
+        assert len(db.add.call_args_list) == 1
+
+    @pytest.mark.asyncio
+    @patch(f"{_PATCH_PREFIX}._download_archive", new_callable=AsyncMock)
+    @patch(f"{_PATCH_PREFIX}._get_branch_sha", new_callable=AsyncMock)
+    @patch(f"{_PATCH_PREFIX}._parse_repo_url")
+    async def test_skips_rego_without_deny_rule(self, mock_parse, mock_sha, mock_download):
+        """Files without a deny rule are skipped."""
+        archive = _make_tarball(
+            {
+                "repo-abc123/policies/good.rego": "package terrapod\ndeny contains msg if { false }",
+                "repo-abc123/policies/no_deny.rego": "package terrapod\nallow := true",
+            }
+        )
+        mock_parse.return_value = ("org", "policies")
+        mock_sha.return_value = "new-sha"
+        mock_download.return_value = archive
+
+        ps = _mock_policy_set(vcs_last_commit_sha="old-sha")
+        db = AsyncMock()
+
+        await _sync_policy_set(db, ps)
+
+        assert db.add.called
+        add_arg = db.add.call_args_list[0][0][0]
+        assert add_arg.name == "good"
+        assert len(db.add.call_args_list) == 1
+
+
 # ── policy_vcs_poll_cycle tests ──────────────────────────────────────────
 
 
@@ -333,3 +386,69 @@ class TestPolicyVcsPollCycle:
         payloads = [call.kwargs["payload"] for call in mock_enqueue.call_args_list]
         assert {"policy_set_id": str(ps_id_1)} in payloads
         assert {"policy_set_id": str(ps_id_2)} in payloads
+
+
+# ── handle_policy_vcs_sync tests ───────────────────────────────────────────
+
+
+class TestHandlePolicyVCSSync:
+    @pytest.mark.asyncio
+    @patch(f"{_PATCH_PREFIX}.get_db_session")
+    @patch(f"{_PATCH_PREFIX}._sync_policy_set", new_callable=AsyncMock)
+    async def test_syncs_vcs_policy_set(self, mock_sync, mock_session):
+        from terrapod.services.policy_vcs_poller import handle_policy_vcs_sync
+
+        ps = _mock_policy_set()
+
+        db = AsyncMock()
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = ps
+        db.execute = AsyncMock(return_value=result)
+        db.commit = AsyncMock()
+
+        mock_session.return_value.__aenter__ = AsyncMock(return_value=db)
+        mock_session.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        await handle_policy_vcs_sync({"policy_set_id": str(ps.id)})
+
+        mock_sync.assert_called_once_with(db, ps)
+        db.commit.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch(f"{_PATCH_PREFIX}.get_db_session")
+    @patch(f"{_PATCH_PREFIX}._sync_policy_set", new_callable=AsyncMock)
+    async def test_skips_when_not_found(self, mock_sync, mock_session):
+        from terrapod.services.policy_vcs_poller import handle_policy_vcs_sync
+
+        db = AsyncMock()
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = None
+        db.execute = AsyncMock(return_value=result)
+
+        mock_session.return_value.__aenter__ = AsyncMock(return_value=db)
+        mock_session.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        await handle_policy_vcs_sync({"policy_set_id": str(uuid.uuid4())})
+
+        mock_sync.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch(f"{_PATCH_PREFIX}.get_db_session")
+    @patch(f"{_PATCH_PREFIX}._sync_policy_set", new_callable=AsyncMock)
+    async def test_skips_inline_source(self, mock_sync, mock_session):
+        from terrapod.services.policy_vcs_poller import handle_policy_vcs_sync
+
+        ps = _mock_policy_set()
+        ps.source = "inline"
+
+        db = AsyncMock()
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = ps
+        db.execute = AsyncMock(return_value=result)
+
+        mock_session.return_value.__aenter__ = AsyncMock(return_value=db)
+        mock_session.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        await handle_policy_vcs_sync({"policy_set_id": str(ps.id)})
+
+        mock_sync.assert_not_called()

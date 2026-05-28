@@ -18,6 +18,7 @@ Endpoints (all under /api/terrapod/v1):
         GET    /policy-sets/{id}                    show (policies embedded)
         PATCH  /policy-sets/{id}                    update
         DELETE /policy-sets/{id}                    delete
+        POST   /policy-sets/{id}/actions/sync       trigger VCS sync (source=vcs only)
         POST   /policy-sets/{id}/policies           add a policy (rego validated)
         PATCH  /policies/{id}                       update a policy
         DELETE /policies/{id}                       delete a policy
@@ -51,6 +52,7 @@ from terrapod.db.models import (
     PolicyEvaluation,
     PolicySet,
     Run,
+    VCSConnection,
     Workspace,
     generate_uuid7,
     now_utc,
@@ -234,6 +236,13 @@ async def create_policy_set(
             vcs_connection_id = uuid.UUID(vcs_conn_id_raw.removeprefix("vcs-"))
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="Invalid vcs-connection-id") from exc
+        conn = (
+            await db.execute(
+                select(VCSConnection).where(VCSConnection.id == vcs_connection_id)
+            )
+        ).scalar_one_or_none()
+        if conn is None:
+            raise HTTPException(status_code=404, detail="VCS connection not found")
         if not attrs.get("vcs-repo-url"):
             raise HTTPException(
                 status_code=422, detail="vcs-repo-url is required for VCS policy sets"
@@ -292,6 +301,9 @@ async def update_policy_set(
     """Partial update of a policy set."""
     ps = await _get_policy_set(db, ps_id)
     attrs = body.get("data", {}).get("attributes", {})
+
+    if "source" in attrs:
+        raise HTTPException(status_code=422, detail="source is immutable after creation")
 
     if "name" in attrs:
         new_name = (attrs.get("name") or "").strip()
