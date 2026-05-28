@@ -101,8 +101,10 @@ class TestCreatePolicySetVCS:
     async def test_201_vcs_happy(self, *_mocks):
         app, db = _make_app()
         db.commit = AsyncMock()
-        db.refresh = AsyncMock()
         db.add = MagicMock()
+
+        ps = _mock_policy_set(source="vcs")
+        db.execute = AsyncMock(return_value=_scalar_result(ps))
 
         body = {
             "data": {
