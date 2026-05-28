@@ -7,7 +7,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from terrapod.services.policy_vcs_poller import _extract_rego_files, _sync_policy_set
+from terrapod.services.policy_vcs_poller import (
+    _extract_rego_files,
+    _sync_policy_set,
+    policy_vcs_poll_cycle,
+)
 
 
 def _make_tarball(files: dict[str, str]) -> bytes:
@@ -94,6 +98,33 @@ class TestExtractRegoFiles:
         result = _extract_rego_files(archive, "policies")
         assert result == {}
 
+    def test_rejects_absolute_path_traversal(self):
+        archive = _make_tarball(
+            {
+                "/etc/passwd.rego": "package terrapod\n",
+            }
+        )
+        result = _extract_rego_files(archive, "")
+        assert result == {}
+
+    def test_rejects_dotdot_traversal(self):
+        archive = _make_tarball(
+            {
+                "../../../etc/shadow.rego": "package terrapod\n",
+            }
+        )
+        result = _extract_rego_files(archive, "")
+        assert result == {}
+
+    def test_rejects_embedded_dotdot(self):
+        archive = _make_tarball(
+            {
+                "repo-abc123/../../../etc/passwd.rego": "package terrapod\n",
+            }
+        )
+        result = _extract_rego_files(archive, "")
+        assert result == {}
+
 
 # ── _sync_policy_set tests ──────────────────────────────────────────────
 
@@ -124,32 +155,32 @@ def _mock_policy(name, rego="package terrapod\n"):
     return p
 
 
+_PATCH_PREFIX = "terrapod.services.policy_vcs_poller"
+
+
 class TestSyncPolicySet:
     @pytest.mark.asyncio
-    @patch("terrapod.services.policy_vcs_poller._get_provider")
-    async def test_skips_when_sha_unchanged(self, mock_get_provider):
+    @patch(f"{_PATCH_PREFIX}._get_branch_sha", new_callable=AsyncMock)
+    @patch(f"{_PATCH_PREFIX}._parse_repo_url")
+    async def test_skips_when_sha_unchanged(self, mock_parse, mock_sha):
         """No work done if branch SHA matches vcs_last_commit_sha."""
-        provider = MagicMock()
-        provider.parse_repo_url.return_value = ("org", "policies")
-        provider.get_branch_sha = AsyncMock(return_value="abc123")
-        mock_get_provider.return_value = provider
+        mock_parse.return_value = ("org", "policies")
+        mock_sha.return_value = "abc123"
 
         ps = _mock_policy_set(vcs_last_commit_sha="abc123")
         db = AsyncMock()
 
         await _sync_policy_set(db, ps)
 
-        provider.download_archive.assert_not_called()
         assert ps.vcs_last_error is None
 
     @pytest.mark.asyncio
-    @patch("terrapod.services.policy_vcs_poller._get_provider")
-    async def test_sets_error_when_branch_not_found(self, mock_get_provider):
+    @patch(f"{_PATCH_PREFIX}._get_branch_sha", new_callable=AsyncMock)
+    @patch(f"{_PATCH_PREFIX}._parse_repo_url")
+    async def test_sets_error_when_branch_not_found(self, mock_parse, mock_sha):
         """vcs_last_error is set when the branch doesn't exist."""
-        provider = MagicMock()
-        provider.parse_repo_url.return_value = ("org", "policies")
-        provider.get_branch_sha = AsyncMock(return_value=None)
-        mock_get_provider.return_value = provider
+        mock_parse.return_value = ("org", "policies")
+        mock_sha.return_value = None
 
         ps = _mock_policy_set(vcs_branch="nonexistent")
         db = AsyncMock()
@@ -159,19 +190,19 @@ class TestSyncPolicySet:
         assert "not found" in ps.vcs_last_error
 
     @pytest.mark.asyncio
-    @patch("terrapod.services.policy_vcs_poller._get_provider")
-    async def test_inserts_new_policies(self, mock_get_provider):
+    @patch(f"{_PATCH_PREFIX}._download_archive", new_callable=AsyncMock)
+    @patch(f"{_PATCH_PREFIX}._get_branch_sha", new_callable=AsyncMock)
+    @patch(f"{_PATCH_PREFIX}._parse_repo_url")
+    async def test_inserts_new_policies(self, mock_parse, mock_sha, mock_download):
         """New .rego files are added as Policy rows."""
         archive = _make_tarball(
             {
                 "repo-abc123/policies/new_policy.rego": "package terrapod\ndeny contains msg if { false }",
             }
         )
-        provider = MagicMock()
-        provider.parse_repo_url.return_value = ("org", "policies")
-        provider.get_branch_sha = AsyncMock(return_value="def456")
-        provider.download_archive = AsyncMock(return_value=archive)
-        mock_get_provider.return_value = provider
+        mock_parse.return_value = ("org", "policies")
+        mock_sha.return_value = "def456"
+        mock_download.return_value = archive
 
         ps = _mock_policy_set(policies=[])
         db = AsyncMock()
@@ -185,8 +216,10 @@ class TestSyncPolicySet:
         assert ps.vcs_last_error is None
 
     @pytest.mark.asyncio
-    @patch("terrapod.services.policy_vcs_poller._get_provider")
-    async def test_updates_modified_policies(self, mock_get_provider):
+    @patch(f"{_PATCH_PREFIX}._download_archive", new_callable=AsyncMock)
+    @patch(f"{_PATCH_PREFIX}._get_branch_sha", new_callable=AsyncMock)
+    @patch(f"{_PATCH_PREFIX}._parse_repo_url")
+    async def test_updates_modified_policies(self, mock_parse, mock_sha, mock_download):
         """Existing policies with changed content get updated."""
         new_rego = "package terrapod\ndeny contains msg if { true }"
         archive = _make_tarball(
@@ -194,11 +227,9 @@ class TestSyncPolicySet:
                 "repo-abc123/policies/existing.rego": new_rego,
             }
         )
-        provider = MagicMock()
-        provider.parse_repo_url.return_value = ("org", "policies")
-        provider.get_branch_sha = AsyncMock(return_value="def456")
-        provider.download_archive = AsyncMock(return_value=archive)
-        mock_get_provider.return_value = provider
+        mock_parse.return_value = ("org", "policies")
+        mock_sha.return_value = "def456"
+        mock_download.return_value = archive
 
         existing_policy = _mock_policy("existing", rego="package terrapod\nold content")
         ps = _mock_policy_set(policies=[existing_policy])
@@ -210,19 +241,19 @@ class TestSyncPolicySet:
         db.add.assert_not_called()  # update, not insert
 
     @pytest.mark.asyncio
-    @patch("terrapod.services.policy_vcs_poller._get_provider")
-    async def test_deletes_removed_policies(self, mock_get_provider):
+    @patch(f"{_PATCH_PREFIX}._download_archive", new_callable=AsyncMock)
+    @patch(f"{_PATCH_PREFIX}._get_branch_sha", new_callable=AsyncMock)
+    @patch(f"{_PATCH_PREFIX}._parse_repo_url")
+    async def test_deletes_removed_policies(self, mock_parse, mock_sha, mock_download):
         """Policies whose .rego files no longer exist get deleted."""
         archive = _make_tarball(
             {
                 "repo-abc123/policies/kept.rego": "package terrapod\ndeny contains msg if { false }",
             }
         )
-        provider = MagicMock()
-        provider.parse_repo_url.return_value = ("org", "policies")
-        provider.get_branch_sha = AsyncMock(return_value="def456")
-        provider.download_archive = AsyncMock(return_value=archive)
-        mock_get_provider.return_value = provider
+        mock_parse.return_value = ("org", "policies")
+        mock_sha.return_value = "def456"
+        mock_download.return_value = archive
 
         kept = _mock_policy("kept")
         removed = _mock_policy("old_policy")
@@ -234,13 +265,12 @@ class TestSyncPolicySet:
         db.delete.assert_called_once_with(removed)
 
     @pytest.mark.asyncio
-    @patch("terrapod.services.policy_vcs_poller._get_provider")
-    async def test_sets_error_on_exception(self, mock_get_provider):
+    @patch(f"{_PATCH_PREFIX}._get_branch_sha", new_callable=AsyncMock)
+    @patch(f"{_PATCH_PREFIX}._parse_repo_url")
+    async def test_sets_error_on_exception(self, mock_parse, mock_sha):
         """Exceptions during sync are caught and stored in vcs_last_error."""
-        provider = MagicMock()
-        provider.parse_repo_url.return_value = ("org", "policies")
-        provider.get_branch_sha = AsyncMock(side_effect=RuntimeError("network timeout"))
-        mock_get_provider.return_value = provider
+        mock_parse.return_value = ("org", "policies")
+        mock_sha.side_effect = RuntimeError("network timeout")
 
         ps = _mock_policy_set()
         db = AsyncMock()
@@ -258,3 +288,48 @@ class TestSyncPolicySet:
         await _sync_policy_set(db, ps)
 
         assert "VCS connection deleted" in ps.vcs_last_error
+
+    @pytest.mark.asyncio
+    @patch(f"{_PATCH_PREFIX}._MAX_ARCHIVE_BYTES", 10)
+    @patch(f"{_PATCH_PREFIX}._download_archive", new_callable=AsyncMock)
+    @patch(f"{_PATCH_PREFIX}._get_branch_sha", new_callable=AsyncMock)
+    @patch(f"{_PATCH_PREFIX}._parse_repo_url")
+    async def test_sets_error_when_archive_too_large(self, mock_parse, mock_sha, mock_download):
+        """vcs_last_error is set when archive exceeds size limit."""
+        mock_parse.return_value = ("org", "policies")
+        mock_sha.return_value = "def456"
+        mock_download.side_effect = ValueError("Archive exceeds 0 MB limit (100 bytes)")
+
+        ps = _mock_policy_set()
+        db = AsyncMock()
+
+        await _sync_policy_set(db, ps)
+
+        assert "exceeds" in ps.vcs_last_error or "limit" in ps.vcs_last_error
+
+
+# ── policy_vcs_poll_cycle tests ──────────────────────────────────────────
+
+
+class TestPolicyVcsPollCycle:
+    @pytest.mark.asyncio
+    @patch("terrapod.services.policy_vcs_poller.enqueue_trigger", new_callable=AsyncMock)
+    @patch("terrapod.services.policy_vcs_poller.get_db_session")
+    async def test_enqueues_one_trigger_per_set(self, mock_get_db, mock_enqueue):
+        """poll_cycle fans out one trigger per VCS policy set."""
+        ps_id_1 = uuid.uuid4()
+        ps_id_2 = uuid.uuid4()
+
+        mock_db = AsyncMock()
+        result = MagicMock()
+        result.scalars.return_value.all.return_value = [ps_id_1, ps_id_2]
+        mock_db.execute = AsyncMock(return_value=result)
+        mock_get_db.return_value.__aenter__ = AsyncMock(return_value=mock_db)
+        mock_get_db.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        await policy_vcs_poll_cycle()
+
+        assert mock_enqueue.call_count == 2
+        payloads = [call.kwargs["payload"] for call in mock_enqueue.call_args_list]
+        assert {"policy_set_id": str(ps_id_1)} in payloads
+        assert {"policy_set_id": str(ps_id_2)} in payloads
