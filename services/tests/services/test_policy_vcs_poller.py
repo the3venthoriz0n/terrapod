@@ -307,7 +307,6 @@ class TestSyncPolicySet:
 
         assert "exceeds" in ps.vcs_last_error or "limit" in ps.vcs_last_error
 
-
     @pytest.mark.asyncio
     @patch(f"{_PATCH_PREFIX}._download_archive", new_callable=AsyncMock)
     @patch(f"{_PATCH_PREFIX}._get_branch_sha", new_callable=AsyncMock)

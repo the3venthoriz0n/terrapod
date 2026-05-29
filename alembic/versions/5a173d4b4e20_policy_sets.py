@@ -37,7 +37,9 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("enabled", sa.Boolean(), server_default=sa.true(), nullable=False),
-        sa.Column("global_scope", sa.Boolean(), server_default=sa.false(), nullable=False),
+        sa.Column(
+            "global_scope", sa.Boolean(), server_default=sa.false(), nullable=False
+        ),
         sa.Column("allow_labels", JSONB(), server_default="{}", nullable=False),
         sa.Column("allow_names", JSONB(), server_default="[]", nullable=False),
         sa.Column("deny_labels", JSONB(), server_default="{}", nullable=False),
@@ -113,14 +115,20 @@ def upgrade() -> None:
             server_default=sa.func.now(),
             nullable=False,
         ),
-        sa.UniqueConstraint("run_id", "policy_set_id", name="uq_policy_evaluations_run_set"),
+        sa.UniqueConstraint(
+            "run_id", "policy_set_id", name="uq_policy_evaluations_run_set"
+        ),
     )
     op.create_index("ix_policy_evaluations_run_id", "policy_evaluations", ["run_id"])
-    op.create_index("ix_policy_evaluations_policy_set_id", "policy_evaluations", ["policy_set_id"])
+    op.create_index(
+        "ix_policy_evaluations_policy_set_id", "policy_evaluations", ["policy_set_id"]
+    )
 
 
 def downgrade() -> None:
-    op.drop_index("ix_policy_evaluations_policy_set_id", table_name="policy_evaluations")
+    op.drop_index(
+        "ix_policy_evaluations_policy_set_id", table_name="policy_evaluations"
+    )
     op.drop_index("ix_policy_evaluations_run_id", table_name="policy_evaluations")
     op.drop_table("policy_evaluations")
     op.drop_index("ix_policies_policy_set_id", table_name="policies")
