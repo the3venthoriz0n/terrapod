@@ -180,10 +180,12 @@ async def upload_module_tarball(
     from terrapod.config import settings
 
     if settings.registry.module_interface.enabled:
+        import asyncio
+
         from terrapod.services.module_hcl_parser import extract_module_interface
 
         try:
-            interface = extract_module_interface(data)
+            interface = await asyncio.to_thread(extract_module_interface, data)
             mod_version.inputs = interface["inputs"]
             mod_version.outputs = interface["outputs"]
         except Exception:

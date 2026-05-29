@@ -213,10 +213,12 @@ async def _poll_module(db: AsyncSession, storage, module: RegistryModule) -> Non
 
         interface = None
         if settings.registry.module_interface.enabled:
+            import asyncio
+
             from terrapod.services.module_hcl_parser import extract_module_interface
 
             try:
-                interface = extract_module_interface(archive_bytes)
+                interface = await asyncio.to_thread(extract_module_interface, archive_bytes)
             except Exception:
                 interface = {"inputs": [], "outputs": []}
 
