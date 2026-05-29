@@ -35,6 +35,9 @@ def extract_module_interface(tarball_bytes: bytes) -> dict:
     return {"inputs": inputs, "outputs": outputs}
 
 
+_MAX_TF_FILE_BYTES = 5 * 1024 * 1024  # 5 MB per file
+
+
 def _read_root_tf_files(tarball_bytes: bytes) -> list[str]:
     """Read all .tf files at the root level of the tarball."""
     contents = []
@@ -45,6 +48,13 @@ def _read_root_tf_files(tarball_bytes: bytes) -> list[str]:
             if "/" in member.name:
                 continue
             if not member.name.endswith(".tf"):
+                continue
+            if member.size > _MAX_TF_FILE_BYTES:
+                logger.warning(
+                    "Skipping oversized .tf file",
+                    file=member.name,
+                    size=member.size,
+                )
                 continue
             f = tar.extractfile(member)
             if f is None:
