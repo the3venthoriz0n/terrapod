@@ -48,7 +48,21 @@ from terrapod.services import (
 )
 from terrapod.services.scheduler import enqueue_trigger
 from terrapod.services.vcs_archive_cache import VCSArchiveCache, materialize_archive
-from terrapod.services.vcs_provider import PullRequest
+from terrapod.services.vcs_provider import (
+    PullRequest,
+)
+from terrapod.services.vcs_provider import (
+    download_archive as _provider_download_archive,
+)
+from terrapod.services.vcs_provider import (
+    get_branch_sha as _provider_get_branch_sha,
+)
+from terrapod.services.vcs_provider import (
+    get_default_branch as _provider_get_default_branch,
+)
+from terrapod.services.vcs_provider import (
+    parse_repo_url as _provider_parse_repo_url,
+)
 from terrapod.services.workspace_autodiscovery_service import autodiscover_for_paths
 from terrapod.storage import get_storage
 from terrapod.storage.keys import config_version_key
@@ -61,48 +75,23 @@ logger = get_logger(__name__)
 _KNOWN_VCS_PROVIDERS = frozenset({"github", "gitlab"})
 
 
-# --- Provider dispatch ---
+# --- Provider dispatch (delegates to vcs_provider module) ---
 
 
 def _parse_repo_url(conn: VCSConnection, repo_url: str) -> tuple[str, str] | None:
-    """Parse a repo URL using the appropriate provider parser.
-
-    Unknown providers are logged and return None — the github parser is
-    permissive enough to tokenise a gitlab URL (and vice-versa), so an
-    unknown provider must not silently fall through. Whoever adds a new
-    provider needs to extend this dispatch (and ``_KNOWN_VCS_PROVIDERS``).
-    """
-    if conn.provider == "gitlab":
-        return gitlab_service.parse_repo_url(repo_url)
-    if conn.provider == "github":
-        return github_service.parse_repo_url(repo_url)
-    logger.warning(
-        "Unknown VCS provider, cannot parse repo URL",
-        provider=conn.provider,
-        connection_id=str(conn.id),
-    )
-    return None
+    return _provider_parse_repo_url(conn, repo_url)
 
 
 async def _get_branch_sha(conn: VCSConnection, owner: str, repo: str, branch: str) -> str | None:
-    """Get branch HEAD SHA via the appropriate provider."""
-    if conn.provider == "gitlab":
-        return await gitlab_service.get_branch_sha(conn, owner, repo, branch)
-    return await github_service.get_repo_branch_sha(conn, owner, repo, branch)
+    return await _provider_get_branch_sha(conn, owner, repo, branch)
 
 
 async def _get_default_branch(conn: VCSConnection, owner: str, repo: str) -> str | None:
-    """Get default branch via the appropriate provider."""
-    if conn.provider == "gitlab":
-        return await gitlab_service.get_default_branch(conn, owner, repo)
-    return await github_service.get_repo_default_branch(conn, owner, repo)
+    return await _provider_get_default_branch(conn, owner, repo)
 
 
 async def _download_archive(conn: VCSConnection, owner: str, repo: str, ref: str) -> bytes:
-    """Download archive via the appropriate provider."""
-    if conn.provider == "gitlab":
-        return await gitlab_service.download_archive(conn, owner, repo, ref)
-    return await github_service.download_repo_archive(conn, owner, repo, ref)
+    return await _provider_download_archive(conn, owner, repo, ref)
 
 
 async def _get_changed_files(

@@ -26,6 +26,15 @@ from terrapod.db.session import get_db_session
 from terrapod.logging_config import get_logger
 from terrapod.services import github_service, gitlab_service
 from terrapod.services.scheduler import enqueue_trigger
+from terrapod.services.vcs_provider import (
+    get_branch_sha as _provider_get_branch_sha,
+)
+from terrapod.services.vcs_provider import (
+    get_default_branch as _provider_get_default_branch,
+)
+from terrapod.services.vcs_provider import (
+    parse_repo_url as _provider_parse_repo_url,
+)
 
 logger = get_logger(__name__)
 
@@ -37,24 +46,15 @@ _DENY_RULE_RE = re.compile(r"(?m)^\s*deny\s+(contains|:=|=)")
 
 
 def _parse_repo_url(conn: VCSConnection, repo_url: str) -> tuple[str, str] | None:
-    """Parse a repo URL via the appropriate provider."""
-    if conn.provider == "gitlab":
-        return gitlab_service.parse_repo_url(repo_url)
-    return github_service.parse_repo_url(repo_url)
+    return _provider_parse_repo_url(conn, repo_url)
 
 
 async def _get_default_branch(conn: VCSConnection, owner: str, repo: str) -> str | None:
-    """Get default branch via the appropriate provider."""
-    if conn.provider == "gitlab":
-        return await gitlab_service.get_default_branch(conn, owner, repo)
-    return await github_service.get_repo_default_branch(conn, owner, repo)
+    return await _provider_get_default_branch(conn, owner, repo)
 
 
 async def _get_branch_sha(conn: VCSConnection, owner: str, repo: str, branch: str) -> str | None:
-    """Get branch HEAD SHA via the appropriate provider."""
-    if conn.provider == "gitlab":
-        return await gitlab_service.get_branch_sha(conn, owner, repo, branch)
-    return await github_service.get_repo_branch_sha(conn, owner, repo, branch)
+    return await _provider_get_branch_sha(conn, owner, repo, branch)
 
 
 def _extract_rego_files(archive_bytes: bytes, policy_path: str) -> dict[str, str]:
