@@ -209,12 +209,16 @@ async def _poll_module(db: AsyncSession, storage, module: RegistryModule) -> Non
         # Strip top-level directory wrapper from VCS archive before storing
         archive_bytes = await strip_archive_top_level_dir_async(archive_bytes)
 
-        from terrapod.services.module_hcl_parser import extract_module_interface
+        from terrapod.config import settings
 
-        try:
-            interface = extract_module_interface(archive_bytes)
-        except Exception:
-            interface = {"inputs": [], "outputs": []}
+        interface = None
+        if settings.registry.module_interface.enabled:
+            from terrapod.services.module_hcl_parser import extract_module_interface
+
+            try:
+                interface = extract_module_interface(archive_bytes)
+            except Exception:
+                interface = {"inputs": [], "outputs": []}
 
         # Store tarball (overwrites existing if tag was moved)
         key = module_tarball_key(module.namespace, module.name, module.provider, version_str)
@@ -224,8 +228,9 @@ async def _poll_module(db: AsyncSession, storage, module: RegistryModule) -> Non
             # Tag moved to a different commit — update existing record
             existing.vcs_commit_sha = tag_sha
             existing.vcs_tag = tag_name
-            existing.inputs = interface["inputs"]
-            existing.outputs = interface["outputs"]
+            if interface:
+                existing.inputs = interface["inputs"]
+                existing.outputs = interface["outputs"]
             logger.info(
                 "Module version updated (tag moved)",
                 module_name=module.name,
@@ -242,8 +247,8 @@ async def _poll_module(db: AsyncSession, storage, module: RegistryModule) -> Non
                 upload_status="uploaded",
                 vcs_commit_sha=tag_sha,
                 vcs_tag=tag_name,
-                inputs=interface["inputs"],
-                outputs=interface["outputs"],
+                inputs=interface["inputs"] if interface else None,
+                outputs=interface["outputs"] if interface else None,
             )
             db.add(mod_version)
             existing_versions[version_str] = mod_version

@@ -367,6 +367,11 @@ async def module_interface_endpoint(
     db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
     """Get the inputs/outputs interface for a specific module version."""
+    from terrapod.config import settings
+
+    if not settings.registry.module_interface.enabled:
+        raise HTTPException(status_code=404, detail="Module interface extraction is disabled")
+
     module = await get_module(db, "default", name, provider)
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")

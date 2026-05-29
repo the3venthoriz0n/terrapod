@@ -360,6 +360,12 @@ class BinaryCacheConfig(BaseModel):
     )
 
 
+class ModuleInterfaceConfig(BaseModel):
+    """Module interface extraction (inputs/outputs from HCL)."""
+
+    enabled: bool = Field(default=True)
+
+
 class RegistryConfig(BaseModel):
     """Private registry and caching configuration."""
 
@@ -373,6 +379,7 @@ class RegistryConfig(BaseModel):
     )
     provider_cache: ProviderCacheConfig = Field(default_factory=ProviderCacheConfig)
     binary_cache: BinaryCacheConfig = Field(default_factory=BinaryCacheConfig)
+    module_interface: ModuleInterfaceConfig = Field(default_factory=ModuleInterfaceConfig)
 
 
 # --- VCS Configuration ---

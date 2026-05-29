@@ -177,14 +177,17 @@ async def upload_module_tarball(
 
     mod_version.upload_status = "uploaded"
 
-    from terrapod.services.module_hcl_parser import extract_module_interface
+    from terrapod.config import settings
 
-    try:
-        interface = extract_module_interface(data)
-        mod_version.inputs = interface["inputs"]
-        mod_version.outputs = interface["outputs"]
-    except Exception:
-        logger.warning("Failed to extract module interface on upload", exc_info=True)
+    if settings.registry.module_interface.enabled:
+        from terrapod.services.module_hcl_parser import extract_module_interface
+
+        try:
+            interface = extract_module_interface(data)
+            mod_version.inputs = interface["inputs"]
+            mod_version.outputs = interface["outputs"]
+        except Exception:
+            logger.warning("Failed to extract module interface on upload", exc_info=True)
 
     module.status = "setup_complete"
     await db.flush()
