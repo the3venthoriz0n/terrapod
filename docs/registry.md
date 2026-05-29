@@ -284,8 +284,19 @@ When a module version is published (via upload or VCS tag), Terrapod parses the 
 
 | Block | Fields |
 |---|---|
-| `variable` | name, type, description, default, required, sensitive |
+| `variable` | name, type, type_schema, description, default, required, sensitive |
 | `output` | name, description, sensitive |
+
+`type` is the human-readable HCL type expression (e.g. `map(string)`). `type_schema` is the equivalent JSON Schema object, ready for client-side input validation without a server round-trip:
+
+| HCL type | `type_schema` |
+|---|---|
+| `string` | `{"type": "string"}` |
+| `number` | `{"type": "number"}` |
+| `bool` | `{"type": "boolean"}` |
+| `list(string)` | `{"type": "array", "items": {"type": "string"}}` |
+| `map(string)` | `{"type": "object", "additionalProperties": {"type": "string"}}` |
+| `object({name = string})` | `{"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}` |
 
 **API endpoint:**
 

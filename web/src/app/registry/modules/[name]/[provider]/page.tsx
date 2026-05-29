@@ -167,7 +167,7 @@ export default function ModuleDetailPage() {
 
   // Module interface (inputs/outputs)
   const [interfaceData, setInterfaceData] = useState<{
-    inputs: { name: string; type: string; type_raw: unknown; description: string; default: string | null; required: boolean; sensitive: boolean }[] | null
+    inputs: { name: string; type: string; type_schema: object; description: string; default: string | null; required: boolean; sensitive: boolean }[] | null
     outputs: { name: string; description: string; sensitive: boolean }[] | null
   } | null>(null)
   const [interfaceLoading, setInterfaceLoading] = useState(false)
