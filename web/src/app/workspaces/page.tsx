@@ -395,13 +395,15 @@ function WorkspacesPageInner() {
     if (lastSyncedQueryRef.current === serialized) return
     const timer = setTimeout(() => {
       lastSyncedQueryRef.current = serialized
-      const url = serialized
-        ? `/workspaces?q=${encodeURIComponent(serialized)}`
-        : '/workspaces'
-      router.replace(url, { scroll: false })
+      const params = new URLSearchParams()
+      if (serialized) params.set('q', serialized)
+      const groupSerialized = serializeGroupParam(groupMode)
+      if (groupSerialized) params.set('group', groupSerialized)
+      const qs = params.toString()
+      router.replace(qs ? `/workspaces?${qs}` : '/workspaces', { scroll: false })
     }, 250)
     return () => clearTimeout(timer)
-  }, [parsedFilter, router])
+  }, [parsedFilter, groupMode, router])
 
   const filteredWorkspaces = useMemo(() => {
     if (parsedFilter.terms.length === 0) return workspaces
@@ -455,8 +457,7 @@ function WorkspacesPageInner() {
         setCollapsedGroups(new Set(allGroupPaths))
       }
     }
-  }, [allGroupPaths, groupMode]) // eslint-disable-line react-hooks/exhaustive-deps
-
+  }, [allGroupPaths, groupMode, setCollapsedGroups])
 
   const toggleGroup = useCallback((path: string) => {
     setCollapsedGroups(prev => {
