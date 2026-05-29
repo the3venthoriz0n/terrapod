@@ -356,9 +356,7 @@ async def show_module_endpoint(
     return JSONResponse(content={"data": _module_to_jsonapi(module, perm)})
 
 
-@management_router.get(
-    "/registry-modules/private/default/{name}/{provider}/{version}/interface"
-)
+@management_router.get("/registry-modules/private/default/{name}/{provider}/{version}/interface")
 async def module_interface_endpoint(
     name: str,
     provider: str,
@@ -398,17 +396,19 @@ async def module_interface_endpoint(
     if mod_version is None:
         raise HTTPException(status_code=404, detail="Version not found")
 
-    return JSONResponse(content={
-        "data": {
-            "type": "module-interface",
-            "id": f"modver-{mod_version.id}",
-            "attributes": {
-                "version": mod_version.version,
-                "inputs": mod_version.inputs,
-                "outputs": mod_version.outputs,
-            },
+    return JSONResponse(
+        content={
+            "data": {
+                "type": "module-interface",
+                "id": f"modver-{mod_version.id}",
+                "attributes": {
+                    "version": mod_version.version,
+                    "inputs": mod_version.inputs,
+                    "outputs": mod_version.outputs,
+                },
+            }
         }
-    })
+    )
 
 
 @management_router.delete("/registry-modules/private/default/{name}/{provider}")

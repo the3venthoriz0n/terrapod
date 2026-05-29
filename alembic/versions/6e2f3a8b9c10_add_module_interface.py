@@ -17,7 +17,9 @@ depends_on = None
 
 def upgrade() -> None:
     op.add_column("registry_module_versions", sa.Column("inputs", JSONB, nullable=True))
-    op.add_column("registry_module_versions", sa.Column("outputs", JSONB, nullable=True))
+    op.add_column(
+        "registry_module_versions", sa.Column("outputs", JSONB, nullable=True)
+    )
 
 
 def downgrade() -> None:

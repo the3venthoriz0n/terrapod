@@ -28,7 +28,9 @@ down_revision = "ad9e14fa1469"
 def upgrade() -> None:
     op.create_table(
         "autodiscovery_rules",
-        sa.Column("id", sa.UUID(), nullable=False, server_default=sa.text("gen_random_uuid()")),
+        sa.Column(
+            "id", sa.UUID(), nullable=False, server_default=sa.text("gen_random_uuid()")
+        ),
         # Scoping
         sa.Column("vcs_connection_id", sa.UUID(), nullable=False),
         sa.Column("repo_url", sa.String(2048), nullable=False),
@@ -39,15 +41,27 @@ def upgrade() -> None:
         # Identity
         sa.Column("name", sa.String(255), nullable=False),
         sa.Column("name_template", sa.String(255), nullable=False, server_default=""),
-        sa.Column("enabled", sa.Boolean(), nullable=False, server_default=sa.text("true")),
+        sa.Column(
+            "enabled", sa.Boolean(), nullable=False, server_default=sa.text("true")
+        ),
         # Workspace template
-        sa.Column("execution_mode", sa.String(20), nullable=False, server_default="agent"),
+        sa.Column(
+            "execution_mode", sa.String(20), nullable=False, server_default="agent"
+        ),
         sa.Column("agent_pool_id", sa.UUID(), nullable=True),
-        sa.Column("execution_backend", sa.String(20), nullable=False, server_default="tofu"),
-        sa.Column("terraform_version", sa.String(50), nullable=False, server_default="1.11"),
+        sa.Column(
+            "execution_backend", sa.String(20), nullable=False, server_default="tofu"
+        ),
+        sa.Column(
+            "terraform_version", sa.String(50), nullable=False, server_default="1.11"
+        ),
         sa.Column("resource_cpu", sa.String(20), nullable=False, server_default="1"),
-        sa.Column("resource_memory", sa.String(20), nullable=False, server_default="2Gi"),
-        sa.Column("auto_apply", sa.Boolean(), nullable=False, server_default=sa.text("false")),
+        sa.Column(
+            "resource_memory", sa.String(20), nullable=False, server_default="2Gi"
+        ),
+        sa.Column(
+            "auto_apply", sa.Boolean(), nullable=False, server_default=sa.text("false")
+        ),
         sa.Column("labels", JSONB, nullable=False, server_default="{}"),
         sa.Column("owner_email", sa.String(255), nullable=True),
         # Audit
@@ -64,9 +78,15 @@ def upgrade() -> None:
             server_default=sa.func.now(),
         ),
         sa.PrimaryKeyConstraint("id"),
-        sa.ForeignKeyConstraint(["vcs_connection_id"], ["vcs_connections.id"], ondelete="CASCADE"),
-        sa.ForeignKeyConstraint(["agent_pool_id"], ["agent_pools.id"], ondelete="SET NULL"),
-        sa.UniqueConstraint("vcs_connection_id", "name", name="uq_autodiscovery_rule_name"),
+        sa.ForeignKeyConstraint(
+            ["vcs_connection_id"], ["vcs_connections.id"], ondelete="CASCADE"
+        ),
+        sa.ForeignKeyConstraint(
+            ["agent_pool_id"], ["agent_pools.id"], ondelete="SET NULL"
+        ),
+        sa.UniqueConstraint(
+            "vcs_connection_id", "name", name="uq_autodiscovery_rule_name"
+        ),
     )
     op.create_index(
         "ix_autodiscovery_rules_repo",
@@ -91,7 +111,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_constraint("fk_workspaces_autodiscovery_rule_id", "workspaces", type_="foreignkey")
+    op.drop_constraint(
+        "fk_workspaces_autodiscovery_rule_id", "workspaces", type_="foreignkey"
+    )
     op.drop_column("workspaces", "autodiscovery_rule_id")
     op.drop_index("ix_autodiscovery_rules_repo", table_name="autodiscovery_rules")
     op.drop_table("autodiscovery_rules")

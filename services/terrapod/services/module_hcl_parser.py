@@ -97,14 +97,18 @@ def _extract_variables(parsed: dict) -> list[dict]:
     for var_block in parsed.get("variable", []):
         for var_name, var_config in var_block.items():
             has_default = "default" in var_config
-            variables.append({
-                "name": var_name,
-                "type": _type_to_string(var_config.get("type")),
-                "description": var_config.get("description", ""),
-                "default": _serialize_default(var_config.get("default")) if has_default else None,
-                "required": not has_default,
-                "sensitive": bool(var_config.get("sensitive", False)),
-            })
+            variables.append(
+                {
+                    "name": var_name,
+                    "type": _type_to_string(var_config.get("type")),
+                    "description": var_config.get("description", ""),
+                    "default": _serialize_default(var_config.get("default"))
+                    if has_default
+                    else None,
+                    "required": not has_default,
+                    "sensitive": bool(var_config.get("sensitive", False)),
+                }
+            )
     return variables
 
 
@@ -113,9 +117,11 @@ def _extract_outputs(parsed: dict) -> list[dict]:
     outputs = []
     for out_block in parsed.get("output", []):
         for out_name, out_config in out_block.items():
-            outputs.append({
-                "name": out_name,
-                "description": out_config.get("description", ""),
-                "sensitive": bool(out_config.get("sensitive", False)),
-            })
+            outputs.append(
+                {
+                    "name": out_name,
+                    "description": out_config.get("description", ""),
+                    "sensitive": bool(out_config.get("sensitive", False)),
+                }
+            )
     return outputs

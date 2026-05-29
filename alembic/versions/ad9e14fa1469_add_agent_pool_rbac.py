@@ -18,13 +18,19 @@ down_revision = "cc6a19db3ee3"
 
 def upgrade() -> None:
     # AgentPool additions
-    op.add_column("agent_pools", sa.Column("labels", JSONB, nullable=False, server_default="{}"))
-    op.add_column("agent_pools", sa.Column("owner_email", sa.String(255), nullable=True))
+    op.add_column(
+        "agent_pools", sa.Column("labels", JSONB, nullable=False, server_default="{}")
+    )
+    op.add_column(
+        "agent_pools", sa.Column("owner_email", sa.String(255), nullable=True)
+    )
 
     # Role addition
     op.add_column(
         "roles",
-        sa.Column("pool_permission", sa.String(20), nullable=False, server_default="read"),
+        sa.Column(
+            "pool_permission", sa.String(20), nullable=False, server_default="read"
+        ),
     )
 
     # Backward compat: existing pools get access=everyone so they remain

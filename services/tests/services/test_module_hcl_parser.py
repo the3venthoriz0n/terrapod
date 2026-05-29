@@ -20,15 +20,17 @@ def _make_tarball(files: dict[str, str]) -> bytes:
 
 class TestExtractModuleInterface:
     def test_extracts_basic_variable(self):
-        tarball = _make_tarball({
-            "variables.tf": '''
+        tarball = _make_tarball(
+            {
+                "variables.tf": """
 variable "vpc_cidr" {
   type        = string
   description = "CIDR block for the VPC"
   default     = "10.0.0.0/16"
 }
-''',
-        })
+""",
+            }
+        )
         result = extract_module_interface(tarball)
         assert len(result["inputs"]) == 1
         inp = result["inputs"][0]
@@ -40,14 +42,16 @@ variable "vpc_cidr" {
         assert inp["sensitive"] is False
 
     def test_extracts_required_variable(self):
-        tarball = _make_tarball({
-            "variables.tf": '''
+        tarball = _make_tarball(
+            {
+                "variables.tf": """
 variable "region" {
   type        = string
   description = "AWS region"
 }
-''',
-        })
+""",
+            }
+        )
         result = extract_module_interface(tarball)
         inp = result["inputs"][0]
         assert inp["name"] == "region"
@@ -55,27 +59,31 @@ variable "region" {
         assert inp["default"] is None
 
     def test_extracts_sensitive_variable(self):
-        tarball = _make_tarball({
-            "variables.tf": '''
+        tarball = _make_tarball(
+            {
+                "variables.tf": """
 variable "db_password" {
   type      = string
   sensitive = true
 }
-''',
-        })
+""",
+            }
+        )
         result = extract_module_interface(tarball)
         inp = result["inputs"][0]
         assert inp["sensitive"] is True
 
     def test_extracts_output(self):
-        tarball = _make_tarball({
-            "outputs.tf": '''
+        tarball = _make_tarball(
+            {
+                "outputs.tf": """
 output "vpc_id" {
   value       = module.vpc.id
   description = "ID of the created VPC"
 }
-''',
-        })
+""",
+            }
+        )
         result = extract_module_interface(tarball)
         assert len(result["outputs"]) == 1
         out = result["outputs"][0]
@@ -84,44 +92,50 @@ output "vpc_id" {
         assert out["sensitive"] is False
 
     def test_extracts_sensitive_output(self):
-        tarball = _make_tarball({
-            "outputs.tf": '''
+        tarball = _make_tarball(
+            {
+                "outputs.tf": """
 output "secret" {
   value     = var.secret
   sensitive = true
 }
-''',
-        })
+""",
+            }
+        )
         result = extract_module_interface(tarball)
         assert result["outputs"][0]["sensitive"] is True
 
     def test_multiple_files(self):
-        tarball = _make_tarball({
-            "variables.tf": '''
+        tarball = _make_tarball(
+            {
+                "variables.tf": """
 variable "name" {
   type = string
 }
-''',
-            "outputs.tf": '''
+""",
+                "outputs.tf": """
 output "id" {
   value = aws_instance.main.id
 }
-''',
-            "main.tf": '''
+""",
+                "main.tf": """
 resource "aws_instance" "main" {
   ami = "ami-123"
 }
-''',
-        })
+""",
+            }
+        )
         result = extract_module_interface(tarball)
         assert len(result["inputs"]) == 1
         assert len(result["outputs"]) == 1
 
     def test_ignores_nested_tf_files(self):
-        tarball = _make_tarball({
-            "variables.tf": 'variable "top" { type = string }',
-            "modules/sub/variables.tf": 'variable "nested" { type = string }',
-        })
+        tarball = _make_tarball(
+            {
+                "variables.tf": 'variable "top" { type = string }',
+                "modules/sub/variables.tf": 'variable "nested" { type = string }',
+            }
+        )
         result = extract_module_interface(tarball)
         assert len(result["inputs"]) == 1
         assert result["inputs"][0]["name"] == "top"
@@ -137,15 +151,17 @@ resource "aws_instance" "main" {
         assert result == {"inputs": [], "outputs": []}
 
     def test_complex_type(self):
-        tarball = _make_tarball({
-            "variables.tf": '''
+        tarball = _make_tarball(
+            {
+                "variables.tf": """
 variable "tags" {
   type        = map(string)
   description = "Resource tags"
   default     = {}
 }
-''',
-        })
+""",
+            }
+        )
         result = extract_module_interface(tarball)
         inp = result["inputs"][0]
         assert inp["name"] == "tags"
