@@ -168,7 +168,7 @@ func DetectBackend(dir string) (*Backend, error) {
 	// state-reader doesn't need a "no backend means local" branch.
 	return &Backend{
 		Kind:       BackendLocal,
-		Settings:   map[string]string{"path": filepath.Join(dir, "terraform.tfstate")},
+		Settings:   map[string]string{"path": "terraform.tfstate"},
 		SourceFile: "",
 	}, nil
 }
