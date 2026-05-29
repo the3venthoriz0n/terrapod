@@ -272,9 +272,7 @@ class TestVCSPolicySet409Guards:
         app, db = _make_app()
 
         # First call returns the policy, second returns the policy set
-        db.execute = AsyncMock(
-            side_effect=[_scalar_result(policy), _scalar_result(ps)]
-        )
+        db.execute = AsyncMock(side_effect=[_scalar_result(policy), _scalar_result(ps)])
 
         body = {
             "data": {
@@ -301,9 +299,7 @@ class TestVCSPolicySet409Guards:
         policy = _mock_policy(policy_set_id=ps.id)
         app, db = _make_app()
 
-        db.execute = AsyncMock(
-            side_effect=[_scalar_result(policy), _scalar_result(ps)]
-        )
+        db.execute = AsyncMock(side_effect=[_scalar_result(policy), _scalar_result(ps)])
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
             resp = await c.delete(

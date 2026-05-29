@@ -24,5 +24,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.add_column(
         "agent_pools",
-        sa.Column("service_account_name", sa.String(63), nullable=False, server_default=""),
+        sa.Column(
+            "service_account_name", sa.String(63), nullable=False, server_default=""
+        ),
     )

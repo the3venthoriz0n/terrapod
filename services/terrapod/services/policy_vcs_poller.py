@@ -244,8 +244,7 @@ async def policy_vcs_poll_cycle() -> None:
     """
     async with get_db_session() as db:
         result = await db.execute(
-            select(PolicySet.id)
-            .where(PolicySet.source == "vcs", PolicySet.enabled.is_(True))
+            select(PolicySet.id).where(PolicySet.source == "vcs", PolicySet.enabled.is_(True))
         )
         ps_ids = result.scalars().all()
 

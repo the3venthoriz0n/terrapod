@@ -13,8 +13,12 @@ from alembic import op  # noqa: E402
 
 
 def upgrade() -> None:
-    op.execute("UPDATE workspaces SET execution_mode = 'agent' WHERE execution_mode = 'remote'")
+    op.execute(
+        "UPDATE workspaces SET execution_mode = 'agent' WHERE execution_mode = 'remote'"
+    )
 
 
 def downgrade() -> None:
-    op.execute("UPDATE workspaces SET execution_mode = 'remote' WHERE execution_mode = 'agent'")
+    op.execute(
+        "UPDATE workspaces SET execution_mode = 'remote' WHERE execution_mode = 'agent'"
+    )

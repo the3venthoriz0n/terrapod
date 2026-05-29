@@ -237,9 +237,7 @@ async def create_policy_set(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="Invalid vcs-connection-id") from exc
         conn = (
-            await db.execute(
-                select(VCSConnection).where(VCSConnection.id == vcs_connection_id)
-            )
+            await db.execute(select(VCSConnection).where(VCSConnection.id == vcs_connection_id))
         ).scalar_one_or_none()
         if conn is None:
             raise HTTPException(status_code=404, detail="VCS connection not found")
