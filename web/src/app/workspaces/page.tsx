@@ -1,6 +1,6 @@
 'use client'
 
-import { Suspense, useEffect, useRef, useState, useCallback, useMemo } from 'react'
+import { Fragment, Suspense, useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import NavBar from '@/components/nav-bar'
@@ -24,6 +24,14 @@ import {
   toggleStatusTerm,
 } from '@/lib/workspace-filter'
 import { WORKSPACE_STATUSES, resolveStatus } from '@/lib/workspace-status'
+import {
+  GroupMode,
+  WorkspaceGroup,
+  buildWorkspaceTree,
+  countWorkspaces,
+  parseGroupParam,
+  serializeGroupParam,
+} from '@/lib/workspace-grouping'
 
 interface LatestRun {
   id: string
@@ -59,12 +67,162 @@ interface Workspace {
     'lifecycle-reason': string
     'latest-run': LatestRun | null
     'created-at': string
+    'working-directory'?: string
+    'vcs-repo-url'?: string
     labels?: Record<string, string> | null
   }
 }
 
 // Wrapped in <Suspense> at the bottom — `useSearchParams()` triggers Next.js's
 // CSR bailout, and without a boundary the whole page fails to build statically.
+function WorkspaceGroupRows({
+  groups,
+  collapsedGroups,
+  toggleGroup,
+  pathPrefix,
+  resolveStatus,
+  parsedFilter,
+  setFilterInput,
+  badgeColors,
+  depth = 0,
+}: {
+  groups: WorkspaceGroup[]
+  collapsedGroups: Set<string>
+  toggleGroup: (path: string) => void
+  pathPrefix: string
+  resolveStatus: (ws: any) => any
+  parsedFilter: any
+  setFilterInput: (v: string) => void
+  badgeColors: Record<string, string>
+  depth?: number
+}) {
+  return (
+    <>
+      {groups.map(group => {
+        const fullPath = pathPrefix ? `${pathPrefix}/${group.key}` : group.key
+        const isCollapsed = collapsedGroups.has(fullPath)
+        const count = countWorkspaces(group)
+
+        return (
+          <Fragment key={fullPath}>
+            {/* Group header row */}
+            <tr
+              className="hover:bg-slate-700/20 cursor-pointer transition-colors"
+              onClick={() => toggleGroup(fullPath)}
+            >
+              <td className="px-4 py-2" colSpan={6}>
+                <div className="flex items-center gap-2" style={{ paddingLeft: `${depth * 16}px` }}>
+                  <svg
+                    className={`w-3 h-3 text-slate-500 transition-transform ${isCollapsed ? '' : 'rotate-90'}`}
+                    fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                  >
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                  </svg>
+                  <span className="text-sm text-slate-400">{group.label}/</span>
+                  <span className="text-xs text-slate-600 bg-slate-800 px-1.5 py-0.5 rounded-full">{count}</span>
+                </div>
+              </td>
+            </tr>
+
+            {/* Workspace rows */}
+            {!isCollapsed && group.workspaces.map(item => {
+              const ws = item.workspace as any
+              const { def, runId } = resolveStatus(ws)
+              const dir = ws.attributes['working-directory'] || ''
+              const lastSegment = dir ? dir.split('/').pop() || dir : ''
+              const displayName = lastSegment || item.name
+              return (
+                <tr key={item.id} className="hover:bg-slate-700/20 transition-colors border-t border-slate-700/30">
+                  <td className="px-4 py-3">
+                    <div className="flex flex-col gap-1.5" style={{ paddingLeft: `${(depth + 1) * 16}px` }}>
+                      <Link
+                        href={`/workspaces/${item.id}`}
+                        className="text-sm font-medium text-brand-400 hover:text-brand-300"
+                      >
+                        {displayName}
+                      </Link>
+                      {ws.attributes.labels && Object.keys(ws.attributes.labels).length > 0 && (
+                        <div className="flex flex-wrap gap-1">
+                          {Object.entries(ws.attributes.labels as Record<string, string>).map(([k, v]) => {
+                            const active = hasLabelTerm(parsedFilter, k, v)
+                            return (
+                              <button
+                                key={`${k}=${v}`}
+                                type="button"
+                                onClick={() => setFilterInput(serializeFilter(toggleLabelTerm(parsedFilter, k, v)))}
+                                className={
+                                  'inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-mono transition-colors ' +
+                                  (active
+                                    ? 'bg-brand-700/60 text-brand-100 hover:bg-brand-700'
+                                    : 'bg-slate-700/40 text-slate-400 hover:bg-slate-700/80 hover:text-slate-200')
+                                }
+                              >
+                                <span className="text-slate-500">{k}:</span>
+                                <span className="ml-0.5">{v}</span>
+                              </button>
+                            )
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  </td>
+                  <td className="px-4 py-3 hidden sm:table-cell">
+                    <span className="text-xs text-slate-400">{ws.attributes['execution-mode']}</span>
+                  </td>
+                  <td className="px-4 py-3 hidden md:table-cell">
+                    <span className="text-xs text-slate-400">{ws.attributes['agent-pool-name'] || '—'}</span>
+                  </td>
+                  <td className="px-4 py-3 hidden lg:table-cell">
+                    <span className="text-xs text-slate-400">{ws.attributes['resource-cpu']} CPU / {ws.attributes['resource-memory']}</span>
+                  </td>
+                  <td className="px-4 py-3 hidden lg:table-cell">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {!def ? (
+                        <span className="text-xs text-slate-500">&mdash;</span>
+                      ) : runId ? (
+                        <Link
+                          href={`/workspaces/${ws.id}/runs/${runId}`}
+                          className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium whitespace-nowrap hover:opacity-80 transition-opacity ${badgeColors[def.color]}`}
+                        >
+                          {def.label}
+                        </Link>
+                      ) : (
+                        <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium whitespace-nowrap ${badgeColors[def.color]}`}>
+                          {def.label}
+                        </span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="px-4 py-3 hidden xl:table-cell">
+                    <span className="text-xs text-slate-500">
+                      {ws.attributes['created-at'] ? new Date(ws.attributes['created-at']).toLocaleDateString() : ''}
+                    </span>
+                  </td>
+                </tr>
+              )
+            })}
+
+            {/* Child groups */}
+            {!isCollapsed && group.children.length > 0 && (
+              <WorkspaceGroupRows
+                groups={group.children}
+                collapsedGroups={collapsedGroups}
+                toggleGroup={toggleGroup}
+                pathPrefix={fullPath}
+                resolveStatus={resolveStatus}
+                parsedFilter={parsedFilter}
+                setFilterInput={setFilterInput}
+                badgeColors={badgeColors}
+                depth={depth + 1}
+              />
+            )}
+          </Fragment>
+        )
+      })}
+    </>
+  )
+}
+
 function WorkspacesPageInner() {
   const router = useRouter()
   const searchParams = useSearchParams()
@@ -78,6 +236,62 @@ function WorkspacesPageInner() {
   // label key set. Mirrored to the URL via ?q=… so refresh + share work.
   const [filterInput, setFilterInput] = useState(searchParams.get('q') || '')
   const parsedFilter = useMemo(() => parseFilterQuery(filterInput), [filterInput])
+
+  // Grouping mode — URL param takes priority, localStorage as fallback
+  const groupMode = useMemo<GroupMode>(() => {
+    const fromUrl = searchParams.get('group')
+    if (fromUrl) return parseGroupParam(fromUrl)
+    if (typeof window !== 'undefined') {
+      return parseGroupParam(localStorage.getItem('terrapod:workspace-group'))
+    }
+    return 'none'
+  }, [searchParams])
+
+  const setGroupMode = useCallback((mode: GroupMode) => {
+    const serialized = serializeGroupParam(mode)
+    if (typeof window !== 'undefined') {
+      if (serialized) localStorage.setItem('terrapod:workspace-group', serialized)
+      else localStorage.removeItem('terrapod:workspace-group')
+    }
+    const params = new URLSearchParams(searchParams.toString())
+    if (serialized) {
+      params.set('group', serialized)
+    } else {
+      params.delete('group')
+    }
+    const q = params.get('q')
+    const group = params.get('group')
+    let url = '/workspaces'
+    const parts: string[] = []
+    if (q) parts.push(`q=${encodeURIComponent(q)}`)
+    if (group) parts.push(`group=${encodeURIComponent(group)}`)
+    if (parts.length > 0) url += '?' + parts.join('&')
+    router.replace(url, { scroll: false })
+  }, [searchParams, router])
+
+  // Group by dropdown
+  const [groupMenuOpen, setGroupMenuOpen] = useState(false)
+  const groupMenuRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!groupMenuOpen) return
+    const onClick = (e: MouseEvent) => {
+      if (groupMenuRef.current && !groupMenuRef.current.contains(e.target as Node)) {
+        setGroupMenuOpen(false)
+      }
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setGroupMenuOpen(false)
+    }
+    document.addEventListener('mousedown', onClick)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onClick)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [groupMenuOpen])
+
+  // Collapsed groups state (moved after workspaceTree below)
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
 
   // Status dropdown state. Closes on outside-click and Escape — same pattern
   // used for the run-actions menu so the page feels consistent.
@@ -170,6 +384,58 @@ function WorkspacesPageInner() {
       return matchWorkspace(ws, parsedFilter, resolveStatus(ws).def?.filter ?? undefined)
     })
   }, [workspaces, parsedFilter])
+
+  const workspaceTree = useMemo(
+    () => buildWorkspaceTree(filteredWorkspaces, groupMode),
+    [filteredWorkspaces, groupMode]
+  )
+
+  // All group paths for collapse/expand logic
+  const allGroupPaths = useMemo(() => {
+    const paths = new Set<string>()
+    const collect = (groups: WorkspaceGroup[], prefix: string) => {
+      for (const g of groups) {
+        const p = prefix ? `${prefix}/${g.key}` : g.key
+        paths.add(p)
+        collect(g.children, p)
+      }
+    }
+    collect(workspaceTree, '')
+    return paths
+  }, [workspaceTree])
+
+  // Start collapsed by default when grouping mode changes
+  const lastGroupModeRef = useRef(groupMode)
+  useEffect(() => {
+    if (groupMode !== lastGroupModeRef.current) {
+      lastGroupModeRef.current = groupMode
+      if (groupMode !== 'none') {
+        setCollapsedGroups(new Set(allGroupPaths))
+      } else {
+        setCollapsedGroups(new Set())
+      }
+    }
+  }, [groupMode, allGroupPaths])
+
+  // Initialize collapsed on first render if grouped (only once)
+  const initializedRef = useRef(false)
+  useEffect(() => {
+    if (!initializedRef.current && groupMode !== 'none' && allGroupPaths.size > 0) {
+      initializedRef.current = true
+      setCollapsedGroups(new Set(allGroupPaths))
+    }
+  }, [allGroupPaths, groupMode, collapsedGroups.size])
+
+  const effectiveCollapsed = collapsedGroups
+
+  const toggleGroup = useCallback((path: string) => {
+    setCollapsedGroups(prev => {
+      const next = new Set(prev)
+      if (next.has(path)) next.delete(path)
+      else next.add(path)
+      return next
+    })
+  }, [])
 
   // Create form
   const [showCreate, setShowCreate] = useState(false)
@@ -760,6 +1026,51 @@ function WorkspacesPageInner() {
                     )
                   })()}
                 </div>
+                {/* Group by dropdown */}
+                <div className="relative" ref={groupMenuRef}>
+                  <button
+                    type="button"
+                    aria-haspopup="menu"
+                    aria-expanded={groupMenuOpen}
+                    onClick={() => setGroupMenuOpen(o => !o)}
+                    className={
+                      'inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium border transition-colors ' +
+                      (groupMode !== 'none'
+                        ? 'bg-slate-700/60 text-slate-100 border-slate-600'
+                        : 'bg-slate-800/50 text-slate-300 border-slate-700/50 hover:bg-slate-700/60')
+                    }
+                  >
+                    <span>Group</span>
+                    {groupMode !== 'none' && (
+                      <span className="inline-flex items-center justify-center min-w-5 px-1.5 rounded-full text-[10px] font-semibold bg-brand-600 text-white">
+                        1
+                      </span>
+                    )}
+                    <svg className={'w-3 h-3 transition-transform ' + (groupMenuOpen ? 'rotate-180' : '')} viewBox="0 0 12 12" fill="currentColor" aria-hidden>
+                      <path d="M3 4.5l3 3 3-3" stroke="currentColor" strokeWidth="1.5" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  </button>
+                  {groupMenuOpen && (
+                    <div role="menu" className="absolute right-0 z-10 mt-1 w-52 rounded-lg bg-slate-800 border border-slate-700 shadow-xl py-1 max-h-96 overflow-y-auto">
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => { setGroupMode('none'); setGroupMenuOpen(false) }}
+                        className={'w-full flex items-center px-3 py-1.5 text-sm transition-colors ' + (groupMode === 'none' ? 'text-brand-400 bg-slate-700/30' : 'text-slate-300 hover:bg-slate-700/40')}
+                      >
+                        None (flat list)
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => { setGroupMode('path'); setGroupMenuOpen(false) }}
+                        className={'w-full flex items-center px-3 py-1.5 text-sm transition-colors ' + (groupMode === 'path' ? 'text-brand-400 bg-slate-700/30' : 'text-slate-300 hover:bg-slate-700/40')}
+                      >
+                        Path
+                      </button>
+                    </div>
+                  )}
+                </div>
                 {parsedFilter.terms.length > 0 && (
                   <button
                     type="button"
@@ -809,6 +1120,48 @@ function WorkspacesPageInner() {
           <EmptyState message="No workspaces yet. Create one to get started." />
         ) : filteredWorkspaces.length === 0 ? (
           <EmptyState message="No workspaces match this filter." />
+        ) : groupMode !== 'none' && workspaceTree.length > 0 ? (
+          <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 overflow-hidden">
+            <div className="flex items-center justify-end px-4 py-2 border-b border-slate-700/50">
+              <button
+                type="button"
+                onClick={() => {
+                  if (effectiveCollapsed.size === 0) {
+                    setCollapsedGroups(new Set(allGroupPaths))
+                  } else {
+                    setCollapsedGroups(new Set())
+                  }
+                }}
+                className="text-xs text-slate-400 hover:text-slate-200 transition-colors"
+              >
+                {effectiveCollapsed.size === 0 ? 'Collapse all' : 'Expand all'}
+              </button>
+            </div>
+            <table className="w-full">
+              <thead>
+                <tr className="border-b border-slate-700/50">
+                  <th className="text-left px-4 py-3 text-slate-400 font-medium text-sm">Name</th>
+                  <th className="text-left px-4 py-3 text-slate-400 font-medium text-sm hidden sm:table-cell">Mode</th>
+                  <th className="text-left px-4 py-3 text-slate-400 font-medium text-sm hidden md:table-cell">Pool</th>
+                  <th className="text-left px-4 py-3 text-slate-400 font-medium text-sm hidden lg:table-cell">Resources</th>
+                  <th className="text-left px-4 py-3 text-slate-400 font-medium text-sm hidden lg:table-cell">Status</th>
+                  <th className="text-left px-4 py-3 text-slate-400 font-medium text-sm hidden xl:table-cell">Created</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-700/30">
+                <WorkspaceGroupRows
+                  groups={workspaceTree}
+                  collapsedGroups={effectiveCollapsed}
+                  toggleGroup={toggleGroup}
+                  pathPrefix=""
+                  resolveStatus={resolveStatus}
+                  parsedFilter={parsedFilter}
+                  setFilterInput={setFilterInput}
+                  badgeColors={badgeColors}
+                />
+              </tbody>
+            </table>
+          </div>
         ) : (
           <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 overflow-hidden">
             <table className="w-full">
