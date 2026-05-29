@@ -46,8 +46,9 @@ export function buildWorkspaceTree<T extends { id: string; attributes: { name: s
 function repoBasename(url: string): string {
   if (!url) return ''
   const cleaned = url.replace(/\.git$/, '')
-  const lastSlash = cleaned.lastIndexOf('/')
-  return lastSlash >= 0 ? cleaned.slice(lastSlash + 1) : cleaned
+  // Handle both HTTPS (last /) and SSH (last :) URL forms
+  const lastSep = Math.max(cleaned.lastIndexOf('/'), cleaned.lastIndexOf(':'))
+  return lastSep >= 0 ? cleaned.slice(lastSep + 1) : cleaned
 }
 
 function buildPathTree<T extends { id: string; attributes: { name: string; 'working-directory'?: string; 'vcs-repo-url'?: string } }>(
@@ -70,13 +71,13 @@ function buildPathTree<T extends { id: string; attributes: { name: string; 'work
     const repoGroup: WorkspaceGroup = { key: repo, label: repo, workspaces: [], children: [] }
 
     for (const ws of repoWs) {
-      const dir = ws.attributes['working-directory'] || ''
+      const dir = (ws.attributes['working-directory'] || '').replace(/^\/+/, '')
       if (!dir) {
         repoGroup.workspaces.push({ id: ws.id, name: ws.attributes.name, workspace: ws })
         continue
       }
 
-      const segments = dir.split('/')
+      const segments = dir.split('/').filter(Boolean)
       let current = repoGroup.children
 
       for (let i = 0; i < segments.length; i++) {
@@ -104,13 +105,13 @@ function buildPathTree<T extends { id: string; attributes: { name: string; 'work
     const localGroup: WorkspaceGroup = { key: '__local__', label: 'Local', workspaces: [], children: [] }
 
     for (const ws of localWorkspaces) {
-      const dir = ws.attributes['working-directory'] || ''
+      const dir = (ws.attributes['working-directory'] || '').replace(/^\/+/, '')
       if (!dir) {
         localGroup.workspaces.push({ id: ws.id, name: ws.attributes.name, workspace: ws })
         continue
       }
 
-      const segments = dir.split('/')
+      const segments = dir.split('/').filter(Boolean)
       let current = localGroup.children
 
       for (let i = 0; i < segments.length; i++) {
@@ -139,8 +140,6 @@ function buildPathTree<T extends { id: string; attributes: { name: string; 'work
 
 function sortGroups(groups: WorkspaceGroup[]): WorkspaceGroup[] {
   groups.sort((a, b) => {
-    if (a.key === '__root__') return 1
-    if (b.key === '__root__') return -1
     return a.label.localeCompare(b.label)
   })
   for (const g of groups) {

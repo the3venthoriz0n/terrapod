@@ -14,6 +14,7 @@ import { apiFetch } from '@/lib/api'
 import { useSortable } from '@/lib/use-sortable'
 import { useWorkspaceListEvents } from '@/lib/use-workspace-list-events'
 import {
+  type ParsedFilter,
   hasLabelTerm,
   hasStatusTerm,
   matchWorkspace,
@@ -90,8 +91,8 @@ function WorkspaceGroupRows({
   collapsedGroups: Set<string>
   toggleGroup: (path: string) => void
   pathPrefix: string
-  resolveStatus: (ws: any) => any
-  parsedFilter: any
+  resolveStatus: (ws: Workspace) => { def: { label: string; color: string; pillClass?: string; filter?: string } | null; runId: string | null }
+  parsedFilter: ParsedFilter
   setFilterInput: (v: string) => void
   badgeColors: Record<string, string>
   depth?: number
@@ -107,8 +108,12 @@ function WorkspaceGroupRows({
           <Fragment key={fullPath}>
             {/* Group header row */}
             <tr
+              tabIndex={0}
+              role="button"
+              aria-expanded={!isCollapsed}
               className="hover:bg-slate-700/20 cursor-pointer transition-colors"
               onClick={() => toggleGroup(fullPath)}
+              onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleGroup(fullPath) } }}
             >
               <td className="px-4 py-2" colSpan={6}>
                 <div className="flex items-center gap-2" style={{ paddingLeft: `${depth * 16}px` }}>
@@ -126,9 +131,11 @@ function WorkspaceGroupRows({
 
             {/* Workspace rows */}
             {!isCollapsed && group.workspaces.map(item => {
-              const ws = item.workspace as any
+              const ws = item.workspace as Workspace
               const { def, runId } = resolveStatus(ws)
               const dir = ws.attributes['working-directory'] || ''
+              // Show last path segment since tree already shows parent folders;
+              // fall back to workspace name for root-level workspaces without a directory.
               const lastSegment = dir ? dir.split('/').pop() || dir : ''
               const displayName = lastSegment || item.name
               return (
@@ -191,6 +198,16 @@ function WorkspaceGroupRows({
                           {def.label}
                         </span>
                       )}
+                      {ws.attributes['lifecycle-state'] === 'pending_deletion' && (
+                        <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium whitespace-nowrap ${badgeColors.amber}`}>
+                          Pending deletion
+                        </span>
+                      )}
+                      {ws.attributes['lifecycle-state'] === 'archived' && (
+                        <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium whitespace-nowrap ${badgeColors.slate}`}>
+                          Archived
+                        </span>
+                      )}
                     </div>
                   </td>
                   <td className="px-4 py-3 hidden xl:table-cell">
@@ -237,37 +254,31 @@ function WorkspacesPageInner() {
   const [filterInput, setFilterInput] = useState(searchParams.get('q') || '')
   const parsedFilter = useMemo(() => parseFilterQuery(filterInput), [filterInput])
 
-  // Grouping mode — URL param takes priority, localStorage as fallback
-  const groupMode = useMemo<GroupMode>(() => {
+  // Grouping mode — URL param takes priority, localStorage as fallback.
+  // Initialized once via useState (matches filterInput pattern above).
+  const [groupMode, setGroupModeState] = useState<GroupMode>(() => {
     const fromUrl = searchParams.get('group')
     if (fromUrl) return parseGroupParam(fromUrl)
     if (typeof window !== 'undefined') {
       return parseGroupParam(localStorage.getItem('terrapod:workspace-group'))
     }
     return 'none'
-  }, [searchParams])
+  })
 
   const setGroupMode = useCallback((mode: GroupMode) => {
+    setGroupModeState(mode)
     const serialized = serializeGroupParam(mode)
     if (typeof window !== 'undefined') {
       if (serialized) localStorage.setItem('terrapod:workspace-group', serialized)
       else localStorage.removeItem('terrapod:workspace-group')
     }
-    const params = new URLSearchParams(searchParams.toString())
-    if (serialized) {
-      params.set('group', serialized)
-    } else {
-      params.delete('group')
-    }
-    const q = params.get('q')
-    const group = params.get('group')
-    let url = '/workspaces'
-    const parts: string[] = []
-    if (q) parts.push(`q=${encodeURIComponent(q)}`)
-    if (group) parts.push(`group=${encodeURIComponent(group)}`)
-    if (parts.length > 0) url += '?' + parts.join('&')
-    router.replace(url, { scroll: false })
-  }, [searchParams, router])
+    const q = serializeFilter(parsedFilter)
+    const params = new URLSearchParams()
+    if (q) params.set('q', q)
+    if (serialized) params.set('group', serialized)
+    const qs = params.toString()
+    router.replace(qs ? `/workspaces?${qs}` : '/workspaces', { scroll: false })
+  }, [parsedFilter, router])
 
   // Group by dropdown
   const [groupMenuOpen, setGroupMenuOpen] = useState(false)
@@ -290,8 +301,25 @@ function WorkspacesPageInner() {
     }
   }, [groupMenuOpen])
 
-  // Collapsed groups state (moved after workspaceTree below)
-  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
+  // Collapsed groups state — persisted in localStorage
+  const [collapsedGroups, setCollapsedGroupsRaw] = useState<Set<string>>(() => {
+    if (typeof window !== 'undefined') {
+      const stored = localStorage.getItem('terrapod:workspace-collapsed')
+      if (stored) {
+        try { return new Set(JSON.parse(stored)) } catch { /* ignore */ }
+      }
+    }
+    return new Set()
+  })
+  const setCollapsedGroups = useCallback((update: Set<string> | ((prev: Set<string>) => Set<string>)) => {
+    setCollapsedGroupsRaw(prev => {
+      const next = typeof update === 'function' ? update(prev) : update
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('terrapod:workspace-collapsed', JSON.stringify([...next]))
+      }
+      return next
+    })
+  }, [])
 
   // Status dropdown state. Closes on outside-click and Escape — same pattern
   // used for the run-actions menu so the page feels consistent.
@@ -417,16 +445,18 @@ function WorkspacesPageInner() {
     }
   }, [groupMode, allGroupPaths])
 
-  // Initialize collapsed on first render if grouped (only once)
+  // Initialize collapsed on first render if grouped and no saved state exists
   const initializedRef = useRef(false)
   useEffect(() => {
     if (!initializedRef.current && groupMode !== 'none' && allGroupPaths.size > 0) {
       initializedRef.current = true
-      setCollapsedGroups(new Set(allGroupPaths))
+      const hasSavedState = typeof window !== 'undefined' && localStorage.getItem('terrapod:workspace-collapsed')
+      if (!hasSavedState) {
+        setCollapsedGroups(new Set(allGroupPaths))
+      }
     }
-  }, [allGroupPaths, groupMode, collapsedGroups.size])
+  }, [allGroupPaths, groupMode]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const effectiveCollapsed = collapsedGroups
 
   const toggleGroup = useCallback((path: string) => {
     setCollapsedGroups(prev => {
@@ -1054,7 +1084,8 @@ function WorkspacesPageInner() {
                     <div role="menu" className="absolute right-0 z-10 mt-1 w-52 rounded-lg bg-slate-800 border border-slate-700 shadow-xl py-1 max-h-96 overflow-y-auto">
                       <button
                         type="button"
-                        role="menuitem"
+                        role="menuitemradio"
+                        aria-checked={groupMode === 'none'}
                         onClick={() => { setGroupMode('none'); setGroupMenuOpen(false) }}
                         className={'w-full flex items-center px-3 py-1.5 text-sm transition-colors ' + (groupMode === 'none' ? 'text-brand-400 bg-slate-700/30' : 'text-slate-300 hover:bg-slate-700/40')}
                       >
@@ -1062,7 +1093,8 @@ function WorkspacesPageInner() {
                       </button>
                       <button
                         type="button"
-                        role="menuitem"
+                        role="menuitemradio"
+                        aria-checked={groupMode === 'path'}
                         onClick={() => { setGroupMode('path'); setGroupMenuOpen(false) }}
                         className={'w-full flex items-center px-3 py-1.5 text-sm transition-colors ' + (groupMode === 'path' ? 'text-brand-400 bg-slate-700/30' : 'text-slate-300 hover:bg-slate-700/40')}
                       >
@@ -1126,7 +1158,7 @@ function WorkspacesPageInner() {
               <button
                 type="button"
                 onClick={() => {
-                  if (effectiveCollapsed.size === 0) {
+                  if (collapsedGroups.size === 0) {
                     setCollapsedGroups(new Set(allGroupPaths))
                   } else {
                     setCollapsedGroups(new Set())
@@ -1134,7 +1166,7 @@ function WorkspacesPageInner() {
                 }}
                 className="text-xs text-slate-400 hover:text-slate-200 transition-colors"
               >
-                {effectiveCollapsed.size === 0 ? 'Collapse all' : 'Expand all'}
+                {collapsedGroups.size === 0 ? 'Collapse all' : 'Expand all'}
               </button>
             </div>
             <table className="w-full">
@@ -1151,7 +1183,7 @@ function WorkspacesPageInner() {
               <tbody className="divide-y divide-slate-700/30">
                 <WorkspaceGroupRows
                   groups={workspaceTree}
-                  collapsedGroups={effectiveCollapsed}
+                  collapsedGroups={collapsedGroups}
                   toggleGroup={toggleGroup}
                   pathPrefix=""
                   resolveStatus={resolveStatus}
