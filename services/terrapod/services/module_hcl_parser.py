@@ -97,10 +97,12 @@ def _extract_variables(parsed: dict) -> list[dict]:
     for var_block in parsed.get("variable", []):
         for var_name, var_config in var_block.items():
             has_default = "default" in var_config
+            type_val = var_config.get("type")
             variables.append(
                 {
                     "name": var_name,
-                    "type": _type_to_string(var_config.get("type")),
+                    "type": _type_to_string(type_val),
+                    "type_raw": type_val,
                     "description": var_config.get("description", ""),
                     "default": _serialize_default(var_config.get("default"))
                     if has_default
