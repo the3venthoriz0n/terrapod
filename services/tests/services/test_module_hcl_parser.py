@@ -36,7 +36,7 @@ variable "vpc_cidr" {
         inp = result["inputs"][0]
         assert inp["name"] == "vpc_cidr"
         assert inp["type"] == "string"
-        assert inp["type_raw"] == "string"
+        assert inp["type_schema"] == {"type": "string"}
         assert inp["description"] == "CIDR block for the VPC"
         assert inp["default"] == "10.0.0.0/16"
         assert inp["required"] is False
@@ -167,26 +167,25 @@ variable "tags" {
         inp = result["inputs"][0]
         assert inp["name"] == "tags"
         assert inp["required"] is False
-        assert inp["type_raw"] is not None
-        assert isinstance(inp["type_raw"], list)
+        assert inp["type"] == "map(string)"
+        assert inp["type_schema"] == {"type": "object", "additionalProperties": {"type": "string"}}
 
-    def test_type_raw_preserves_structure(self):
+    def test_type_schema_for_list(self):
         tarball = _make_tarball(
             {
                 "variables.tf": """
 variable "simple" {
   type = string
 }
-variable "complex" {
-  type = list(string)
+variable "items" {
+  type = list(number)
 }
 """,
             }
         )
         result = extract_module_interface(tarball)
         simple = next(i for i in result["inputs"] if i["name"] == "simple")
-        complex_var = next(i for i in result["inputs"] if i["name"] == "complex")
-        assert simple["type_raw"] == "string"
-        assert simple["type"] == "string"
-        assert isinstance(complex_var["type_raw"], list)
-        assert complex_var["type"] != complex_var["type_raw"]
+        items = next(i for i in result["inputs"] if i["name"] == "items")
+        assert simple["type_schema"] == {"type": "string"}
+        assert items["type_schema"] == {"type": "array", "items": {"type": "number"}}
+        assert items["type"] == "list(number)"
