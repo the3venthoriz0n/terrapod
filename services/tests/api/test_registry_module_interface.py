@@ -67,13 +67,24 @@ class TestModuleInterfaceEndpoint:
         app, db = _make_app()
         module = _mock_module()
         version = _mock_version(
-            inputs=[{"name": "cidr", "type": "string", "description": "", "default": None, "required": True, "sensitive": False}],
+            inputs=[
+                {
+                    "name": "cidr",
+                    "type": "string",
+                    "description": "",
+                    "default": None,
+                    "required": True,
+                    "sensitive": False,
+                }
+            ],
             outputs=[{"name": "id", "description": "The VPC ID", "sensitive": False}],
         )
         db.execute = AsyncMock(side_effect=[_scalar_result(module), _scalar_result(version)])
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
-            resp = await c.get("/api/terrapod/v1/registry-modules/private/default/vpc/aws/1.0.0/interface")
+            resp = await c.get(
+                "/api/terrapod/v1/registry-modules/private/default/vpc/aws/1.0.0/interface"
+            )
         assert resp.status_code == 200
         data = resp.json()["data"]
         assert data["attributes"]["inputs"][0]["name"] == "cidr"
@@ -88,7 +99,9 @@ class TestModuleInterfaceEndpoint:
         db.execute = AsyncMock(return_value=_scalar_result(None))
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
-            resp = await c.get("/api/terrapod/v1/registry-modules/private/default/nope/aws/1.0.0/interface")
+            resp = await c.get(
+                "/api/terrapod/v1/registry-modules/private/default/nope/aws/1.0.0/interface"
+            )
         assert resp.status_code == 404
 
     @pytest.mark.asyncio
@@ -101,5 +114,7 @@ class TestModuleInterfaceEndpoint:
         db.execute = AsyncMock(side_effect=[_scalar_result(module), _scalar_result(None)])
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
-            resp = await c.get("/api/terrapod/v1/registry-modules/private/default/vpc/aws/9.9.9/interface")
+            resp = await c.get(
+                "/api/terrapod/v1/registry-modules/private/default/vpc/aws/9.9.9/interface"
+            )
         assert resp.status_code == 404

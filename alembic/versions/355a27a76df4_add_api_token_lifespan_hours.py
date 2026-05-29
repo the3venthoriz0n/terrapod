@@ -13,7 +13,9 @@ down_revision = "1f15ac58564c"
 
 
 def upgrade() -> None:
-    op.add_column("api_tokens", sa.Column("lifespan_hours", sa.Integer(), nullable=True))
+    op.add_column(
+        "api_tokens", sa.Column("lifespan_hours", sa.Integer(), nullable=True)
+    )
 
 
 def downgrade() -> None:

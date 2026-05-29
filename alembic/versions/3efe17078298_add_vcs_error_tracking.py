@@ -19,7 +19,9 @@ def upgrade() -> None:
         "workspaces",
         sa.Column("vcs_last_polled_at", sa.DateTime(timezone=True), nullable=True),
     )
-    op.add_column("workspaces", sa.Column("vcs_last_error", sa.String(500), nullable=True))
+    op.add_column(
+        "workspaces", sa.Column("vcs_last_error", sa.String(500), nullable=True)
+    )
     op.add_column(
         "workspaces",
         sa.Column("vcs_last_error_at", sa.DateTime(timezone=True), nullable=True),

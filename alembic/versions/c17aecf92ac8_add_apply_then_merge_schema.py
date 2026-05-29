@@ -87,9 +87,13 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.text("now()"),
         ),
-        sa.UniqueConstraint("vcs_connection_id", "repo", "pr_number", name="uq_pr_session"),
+        sa.UniqueConstraint(
+            "vcs_connection_id", "repo", "pr_number", name="uq_pr_session"
+        ),
     )
-    op.create_index("ix_pr_sessions_open", "pr_sessions", ["vcs_connection_id", "state"])
+    op.create_index(
+        "ix_pr_sessions_open", "pr_sessions", ["vcs_connection_id", "state"]
+    )
 
 
 def downgrade() -> None:
