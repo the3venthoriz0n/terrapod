@@ -134,8 +134,6 @@ function WorkspaceGroupRows({
               const ws = item.workspace as Workspace
               const { def, runId } = resolveStatus(ws)
               const dir = ws.attributes['working-directory'] || ''
-              // Show last path segment since tree already shows parent folders;
-              // fall back to workspace name for root-level workspaces without a directory.
               const lastSegment = dir ? dir.split('/').pop() || dir : ''
               const displayName = lastSegment || item.name
               return (
@@ -434,15 +432,17 @@ function WorkspacesPageInner() {
     return paths
   }, [workspaceTree])
 
-  // Start collapsed by default when grouping mode changes
+  // Restore saved collapsed state when switching back to grouped mode
   const lastGroupModeRef = useRef(groupMode)
   useEffect(() => {
     if (groupMode !== lastGroupModeRef.current) {
       lastGroupModeRef.current = groupMode
       if (groupMode !== 'none') {
+        const stored = localStorage.getItem('terrapod:workspace-collapsed')
+        if (stored) {
+          try { setCollapsedGroups(new Set(JSON.parse(stored))); return } catch { /* fall through */ }
+        }
         setCollapsedGroups(new Set(allGroupPaths))
-      } else {
-        setCollapsedGroups(new Set())
       }
     }
   }, [groupMode, allGroupPaths])
@@ -457,7 +457,7 @@ function WorkspacesPageInner() {
         setCollapsedGroups(new Set(allGroupPaths))
       }
     }
-  }, [allGroupPaths, groupMode, setCollapsedGroups])
+  }, [allGroupPaths, groupMode])
 
   const toggleGroup = useCallback((path: string) => {
     setCollapsedGroups(prev => {
