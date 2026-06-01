@@ -2,12 +2,19 @@
 
 Defines the VCSProvider protocol that GitHub and GitLab implementations
 conform to. The poller works against this interface, not specific providers.
+
+Also provides dispatch helpers (parse_repo_url, get_branch_sha, etc.) that
+route to the correct provider based on conn.provider. All pollers should
+use these rather than duplicating if/elif chains.
 """
 
 from dataclasses import dataclass
 from typing import Protocol
 
 from terrapod.db.models import VCSConnection
+from terrapod.logging_config import get_logger
+
+_logger = get_logger(__name__)
 
 
 class PullRequest:
@@ -265,3 +272,53 @@ class VCSProvider(Protocol):
         gate, alongside the provider's `is_mergeable` summary.
         """
         ...
+
+
+# ── Provider dispatch helpers ──────────────────────────────────────────────
+#
+# Centralized dispatch so pollers don't duplicate if/elif chains.
+# Adding a new provider requires extending these functions (and the
+# Protocol above).
+
+
+def parse_repo_url(conn: VCSConnection, repo_url: str) -> tuple[str, str] | None:
+    """Parse a repo URL using the appropriate provider parser."""
+    from terrapod.services import github_service, gitlab_service
+
+    if conn.provider == "gitlab":
+        return gitlab_service.parse_repo_url(repo_url)
+    if conn.provider == "github":
+        return github_service.parse_repo_url(repo_url)
+    _logger.warning(
+        "Unknown VCS provider, cannot parse repo URL",
+        provider=conn.provider,
+        connection_id=str(conn.id),
+    )
+    return None
+
+
+async def get_branch_sha(conn: VCSConnection, owner: str, repo: str, branch: str) -> str | None:
+    """Get branch HEAD SHA via the appropriate provider."""
+    from terrapod.services import github_service, gitlab_service
+
+    if conn.provider == "gitlab":
+        return await gitlab_service.get_branch_sha(conn, owner, repo, branch)
+    return await github_service.get_repo_branch_sha(conn, owner, repo, branch)
+
+
+async def get_default_branch(conn: VCSConnection, owner: str, repo: str) -> str | None:
+    """Get the repository's default branch name."""
+    from terrapod.services import github_service, gitlab_service
+
+    if conn.provider == "gitlab":
+        return await gitlab_service.get_default_branch(conn, owner, repo)
+    return await github_service.get_repo_default_branch(conn, owner, repo)
+
+
+async def download_archive(conn: VCSConnection, owner: str, repo: str, ref: str) -> bytes:
+    """Download repository tarball at a given ref."""
+    from terrapod.services import github_service, gitlab_service
+
+    if conn.provider == "gitlab":
+        return await gitlab_service.download_archive(conn, owner, repo, ref)
+    return await github_service.download_repo_archive(conn, owner, repo, ref)

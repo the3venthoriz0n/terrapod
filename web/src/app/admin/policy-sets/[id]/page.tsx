@@ -27,6 +27,13 @@ interface PolicySet {
     'allow-names': string[]
     'deny-labels': Record<string, string | string[]>
     'deny-names': string[]
+    source: 'inline' | 'vcs'
+    'vcs-repo-url': string | null
+    'vcs-branch': string | null
+    'policy-path': string | null
+    'vcs-last-commit-sha': string | null
+    'vcs-last-synced-at': string | null
+    'vcs-last-error': string | null
     'created-by': string
   }
   relationships?: { policies?: { data: Policy[] } }
@@ -73,6 +80,10 @@ export default function PolicySetDetailPage({ params }: { params: Promise<{ id: 
   const [denyNames, setDenyNames] = useState('')
   const [allowLabels, setAllowLabels] = useState('')
   const [denyLabels, setDenyLabels] = useState('')
+  // VCS config edit fields
+  const [vcsRepoUrl, setVcsRepoUrl] = useState('')
+  const [vcsBranch, setVcsBranch] = useState('')
+  const [policyPath, setPolicyPath] = useState('')
 
   // New policy form
   const [showAddPolicy, setShowAddPolicy] = useState(false)
@@ -99,6 +110,9 @@ export default function PolicySetDetailPage({ params }: { params: Promise<{ id: 
       setDenyNames((a['deny-names'] || []).join('\n'))
       setAllowLabels(labelsToText(a['allow-labels'] || {}))
       setDenyLabels(labelsToText(a['deny-labels'] || {}))
+      setVcsRepoUrl(a['vcs-repo-url'] || '')
+      setVcsBranch(a['vcs-branch'] || '')
+      setPolicyPath(a['policy-path'] || '')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load policy set')
     } finally {
@@ -132,6 +146,11 @@ export default function PolicySetDetailPage({ params }: { params: Promise<{ id: 
               'deny-names': linesToList(denyNames),
               'allow-labels': parseLabels(allowLabels),
               'deny-labels': parseLabels(denyLabels),
+              ...(ps?.attributes.source === 'vcs' ? {
+                'vcs-repo-url': vcsRepoUrl,
+                'vcs-branch': vcsBranch,
+                'policy-path': policyPath,
+              } : {}),
             },
           },
         }),
@@ -260,18 +279,82 @@ export default function PolicySetDetailPage({ params }: { params: Promise<{ id: 
               </div>
             </div>
           )}
+          {ps.attributes.source === 'vcs' && (
+            <div className="border-t border-slate-700/50 pt-4">
+              <h3 className="text-xs font-semibold text-slate-400 uppercase mb-3">VCS Configuration</h3>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div>
+                  <label className="block text-sm font-medium text-slate-300 mb-1">Repository URL</label>
+                  <input type="text" value={vcsRepoUrl} onChange={(e) => setVcsRepoUrl(e.target.value)}
+                    placeholder="https://github.com/org/policies"
+                    className="w-full px-3 py-2 border border-slate-600 rounded-lg bg-slate-700 text-slate-100 focus:outline-none focus:ring-2 focus:ring-brand-500" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-slate-300 mb-1">Branch</label>
+                  <input type="text" value={vcsBranch} onChange={(e) => setVcsBranch(e.target.value)}
+                    placeholder="main (default)"
+                    className="w-full px-3 py-2 border border-slate-600 rounded-lg bg-slate-700 text-slate-100 focus:outline-none focus:ring-2 focus:ring-brand-500" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-slate-300 mb-1">Policy Path</label>
+                  <input type="text" value={policyPath} onChange={(e) => setPolicyPath(e.target.value)}
+                    placeholder="policies/"
+                    className="w-full px-3 py-2 border border-slate-600 rounded-lg bg-slate-700 text-slate-100 focus:outline-none focus:ring-2 focus:ring-brand-500" />
+                </div>
+              </div>
+            </div>
+          )}
           <button type="submit" disabled={saving}
             className="px-4 py-2 rounded-lg text-sm font-medium bg-brand-600 hover:bg-brand-500 disabled:bg-brand-800 text-white transition-colors">
             {saving ? 'Saving...' : 'Save Settings'}
           </button>
         </form>
 
+        {ps.attributes.source === 'vcs' && (
+          <div className="rounded-md bg-blue-900/30 border border-blue-700/50 p-4 mb-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-blue-200">
+                  Policies synced from <span className="font-mono text-blue-300">{ps.attributes['vcs-repo-url']}</span>
+                  {ps.attributes['vcs-branch'] && <> ({ps.attributes['vcs-branch']})</>}
+                  {ps.attributes['policy-path'] && <> at <span className="font-mono">{ps.attributes['policy-path']}/</span></>}
+                </p>
+                {ps.attributes['vcs-last-synced-at'] && (
+                  <p className="text-xs text-blue-400 mt-1">
+                    Last synced {new Date(ps.attributes['vcs-last-synced-at']).toLocaleString()}
+                    {ps.attributes['vcs-last-commit-sha'] && <> (commit {ps.attributes['vcs-last-commit-sha'].slice(0, 8)})</>}
+                  </p>
+                )}
+                {ps.attributes['vcs-last-error'] && (
+                  <p className="text-xs text-red-400 mt-1">Sync error: {ps.attributes['vcs-last-error']}</p>
+                )}
+              </div>
+              <button
+                onClick={async () => {
+                  try {
+                    const res = await apiFetch(`/api/terrapod/v1/policy-sets/${ps.id}/actions/sync`, { method: 'POST' })
+                    if (res.ok) load()
+                  } catch {}
+                }}
+                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-blue-700 hover:bg-blue-600 text-white transition-colors"
+              >
+                Sync Now
+              </button>
+            </div>
+          </div>
+        )}
+
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-sm font-semibold text-slate-200">Policies ({policies.length})</h2>
-          <button onClick={() => setShowAddPolicy(!showAddPolicy)}
-            className="px-3 py-1.5 rounded-lg text-sm font-medium bg-brand-600 hover:bg-brand-500 text-white transition-colors">
-            {showAddPolicy ? 'Cancel' : 'Add Policy'}
-          </button>
+          {ps.attributes.source !== 'vcs' && (
+            <button onClick={() => setShowAddPolicy(!showAddPolicy)}
+              className="px-3 py-1.5 rounded-lg text-sm font-medium bg-brand-600 hover:bg-brand-500 text-white transition-colors">
+              {showAddPolicy ? 'Cancel' : 'Add Policy'}
+            </button>
+          )}
+          {ps.attributes.source === 'vcs' && (
+            <span className="text-xs text-slate-500">Managed by repository — push changes via PR</span>
+          )}
         </div>
 
         {showAddPolicy && (
