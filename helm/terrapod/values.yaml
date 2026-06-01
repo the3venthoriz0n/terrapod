@@ -227,6 +227,8 @@ api:
         # in dev/staging to try upcoming releases like terraform 1.15-rc or
         # tofu 1.12-beta before they GA.
         allow_prerelease: none
+      module_interface:
+        enabled: true
 
     # GPG signing key for provider registry
     # ASCII-armored GPG private key. If set, used to sign all provider SHA256SUMS.

@@ -165,6 +165,16 @@ export default function ModuleDetailPage() {
   const [vcsTagPattern, setVcsTagPattern] = useState('v*')
   const [savingVcs, setSavingVcs] = useState(false)
 
+  // Module interface (inputs/outputs)
+  const [interfaceData, setInterfaceData] = useState<{
+    inputs: { name: string; type: string; type_schema: object; description: string; default: string | null; required: boolean; sensitive: boolean }[] | null
+    outputs: { name: string; description: string; sensitive: boolean }[] | null
+  } | null>(null)
+  const [interfaceLoading, setInterfaceLoading] = useState(false)
+  const [interfaceExpanded, setInterfaceExpanded] = useState(false)
+  const [interfaceVersion, setInterfaceVersion] = useState('')
+  const [versionsExpanded, setVersionsExpanded] = useState(false)
+
   // Metadata editing (labels/owner)
   const [editingMeta, setEditingMeta] = useState(false)
   const [editLabels, setEditLabels] = useState<Record<string, string>>({})
@@ -217,6 +227,14 @@ export default function ModuleDetailPage() {
         setVcsRepoUrl(attrs['vcs-repo-url'] || '')
         setVcsBranch(attrs['vcs-branch'] || '')
         setVcsTagPattern(attrs['vcs-tag-pattern'] || 'v*')
+
+        // Load interface for latest uploaded version
+        const versions = (attrs['version-statuses'] || []) as VersionStatus[]
+        const latestUploaded = versions.find((v: VersionStatus) => v.status === 'uploaded')
+        if (latestUploaded && latestUploaded.version !== interfaceVersion) {
+          setInterfaceVersion(latestUploaded.version)
+          loadInterface(latestUploaded.version)
+        }
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load module')
@@ -248,6 +266,26 @@ export default function ModuleDetailPage() {
       }
     } catch {
       // Non-critical
+    }
+  }
+
+  async function loadInterface(ver: string) {
+    if (!ver) return
+    setInterfaceLoading(true)
+    try {
+      const res = await apiFetch(
+        `/api/terrapod/v1/registry-modules/private/default/${name}/${provider}/${ver}/interface`
+      )
+      if (res.ok) {
+        const data = await res.json()
+        setInterfaceData(data.data.attributes)
+      } else {
+        setInterfaceData(null)
+      }
+    } catch {
+      setInterfaceData(null)
+    } finally {
+      setInterfaceLoading(false)
     }
   }
 
@@ -834,71 +872,218 @@ export default function ModuleDetailPage() {
               )}
             </div>
 
-            <h2 className="text-lg font-semibold text-slate-200 mb-3">Versions</h2>
-            {(module.attributes['version-statuses'] || []).length === 0 ? (
-              <EmptyState message={
-                isVcsSource
-                  ? `No versions yet. Push a semver tag matching "${module.attributes['vcs-tag-pattern'] || 'v*'}" to the connected repository to publish a version.`
-                  : 'No versions yet. Upload a module or connect VCS to get started.'
-              } />
-            ) : (
-              <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 overflow-hidden">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b border-slate-700/50">
-                      <th className="text-left px-4 py-3 text-slate-400 font-medium">Version</th>
-                      <th className="text-left px-4 py-3 text-slate-400 font-medium">Status</th>
-                      {isVcsSource && (
-                        <th className="text-left px-4 py-3 text-slate-400 font-medium">Source</th>
+            {/* Inputs & Outputs */}
+            <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 overflow-hidden mb-6">
+              <button
+                onClick={() => setInterfaceExpanded(!interfaceExpanded)}
+                className="w-full flex items-center justify-between px-5 py-4 text-left"
+              >
+                <div className="flex items-center gap-3">
+                  <h3 className="text-sm font-semibold text-slate-200">Inputs & Outputs</h3>
+                  {interfaceData && (
+                    <span className="text-xs text-slate-500">
+                      {interfaceData.inputs?.length ?? 0} inputs, {interfaceData.outputs?.length ?? 0} outputs
+                    </span>
+                  )}
+                </div>
+                <svg
+                  className={`w-4 h-4 text-slate-400 transition-transform ${interfaceExpanded ? 'rotate-180' : ''}`}
+                  fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                >
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                </svg>
+              </button>
+
+              {interfaceExpanded && (
+                <div className="px-5 pb-5 space-y-4 border-t border-slate-700/50 pt-4">
+                  {/* Version selector */}
+                  <div className="flex items-center gap-2">
+                    <label className="text-xs text-slate-500">Version:</label>
+                    <select
+                      value={interfaceVersion}
+                      onChange={(e) => { setInterfaceVersion(e.target.value); loadInterface(e.target.value) }}
+                      className="px-2 py-1 text-xs border border-slate-600 rounded bg-slate-700 text-slate-100 focus:outline-none focus:ring-1 focus:ring-brand-500"
+                    >
+                      {(module?.attributes['version-statuses'] || [])
+                        .filter((v: VersionStatus) => v.status === 'uploaded')
+                        .map((v: VersionStatus) => (
+                          <option key={v.version} value={v.version}>{v.version}</option>
+                        ))}
+                    </select>
+                  </div>
+
+                  {interfaceLoading ? (
+                    <LoadingSpinner />
+                  ) : !interfaceData || (interfaceData.inputs === null && interfaceData.outputs === null) ? (
+                    <p className="text-sm text-slate-500">No interface data available for this version.</p>
+                  ) : (
+                    <>
+                      {/* Inputs table */}
+                      {interfaceData.inputs && interfaceData.inputs.length > 0 && (
+                        <div>
+                          <h4 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Inputs</h4>
+                          <div className="overflow-x-auto">
+                            <table className="w-full text-sm">
+                              <thead>
+                                <tr className="text-xs text-slate-500 border-b border-slate-700/50">
+                                  <th className="text-left py-2 pr-4">Name</th>
+                                  <th className="text-left py-2 pr-4">Type</th>
+                                  <th className="text-left py-2 pr-4">Description</th>
+                                  <th className="text-left py-2 pr-4">Default</th>
+                                  <th className="text-left py-2">Required</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {interfaceData.inputs.map((inp) => (
+                                  <tr key={inp.name} className="border-b border-slate-700/30">
+                                    <td className="py-2 pr-4 font-mono text-xs text-slate-200">{inp.name}</td>
+                                    <td className="py-2 pr-4 font-mono text-xs text-slate-400">{inp.type}</td>
+                                    <td className="py-2 pr-4 text-slate-300">{inp.description}</td>
+                                    <td className="py-2 pr-4 font-mono text-xs text-slate-400">{inp.default ?? '—'}</td>
+                                    <td className="py-2">
+                                      {inp.required ? (
+                                        <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-amber-900/50 text-amber-300">required</span>
+                                      ) : (
+                                        <span className="text-xs text-slate-500">optional</span>
+                                      )}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
                       )}
-                      <th className="text-right px-4 py-3 text-slate-400 font-medium">Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {module.attributes['version-statuses'].map((v) => (
-                      <tr key={v.version} className="border-b border-slate-700/30 last:border-0">
-                        <td className="px-4 py-3 text-slate-200 font-mono">{v.version}</td>
-                        <td className="px-4 py-3">
-                          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
-                            v.status === 'uploaded'
-                              ? 'bg-green-900/50 text-green-300'
-                              : 'bg-amber-900/50 text-amber-300'
-                          }`}>
-                            {v.status}
-                          </span>
-                        </td>
-                        {isVcsSource && (
-                          <td className="px-4 py-3">
-                            {v['vcs-tag'] ? (
-                              <span className="text-slate-300 text-xs">
-                                <span className="font-mono">{v['vcs-tag']}</span>
-                                {v['vcs-commit-sha'] && (
-                                  <span className="text-slate-500 ml-1.5" title={v['vcs-commit-sha']}>
-                                    ({v['vcs-commit-sha'].slice(0, 7)})
-                                  </span>
-                                )}
+
+                      {/* Outputs table */}
+                      {interfaceData.outputs && interfaceData.outputs.length > 0 && (
+                        <div>
+                          <h4 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Outputs</h4>
+                          <div className="overflow-x-auto">
+                            <table className="w-full text-sm">
+                              <thead>
+                                <tr className="text-xs text-slate-500 border-b border-slate-700/50">
+                                  <th className="text-left py-2 pr-4">Name</th>
+                                  <th className="text-left py-2 pr-4">Description</th>
+                                  <th className="text-left py-2">Sensitive</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {interfaceData.outputs.map((out) => (
+                                  <tr key={out.name} className="border-b border-slate-700/30">
+                                    <td className="py-2 pr-4 font-mono text-xs text-slate-200">{out.name}</td>
+                                    <td className="py-2 pr-4 text-slate-300">{out.description}</td>
+                                    <td className="py-2">
+                                      {out.sensitive && (
+                                        <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-red-900/50 text-red-300">sensitive</span>
+                                      )}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+
+                      {interfaceData.inputs?.length === 0 && interfaceData.outputs?.length === 0 && (
+                        <p className="text-sm text-slate-500">This module version declares no inputs or outputs.</p>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Versions */}
+            <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 overflow-hidden">
+              <button
+                onClick={() => setVersionsExpanded(!versionsExpanded)}
+                className="w-full flex items-center justify-between px-5 py-4 text-left"
+              >
+                <div className="flex items-center gap-3">
+                  <h3 className="text-sm font-semibold text-slate-200">Versions</h3>
+                  <span className="text-xs text-slate-500">
+                    {(module.attributes['version-statuses'] || []).length} version(s)
+                  </span>
+                </div>
+                <svg
+                  className={`w-4 h-4 text-slate-400 transition-transform ${versionsExpanded ? 'rotate-180' : ''}`}
+                  fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                >
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                </svg>
+              </button>
+
+              {versionsExpanded && (
+                <div className="border-t border-slate-700/50">
+                  {(module.attributes['version-statuses'] || []).length === 0 ? (
+                    <div className="p-5">
+                      <EmptyState message={
+                        isVcsSource
+                          ? `No versions yet. Push a semver tag matching "${module.attributes['vcs-tag-pattern'] || 'v*'}" to the connected repository to publish a version.`
+                          : 'No versions yet. Upload a module or connect VCS to get started.'
+                      } />
+                    </div>
+                  ) : (
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="border-b border-slate-700/50">
+                          <th className="text-left px-4 py-3 text-slate-400 font-medium">Version</th>
+                          <th className="text-left px-4 py-3 text-slate-400 font-medium">Status</th>
+                          {isVcsSource && (
+                            <th className="text-left px-4 py-3 text-slate-400 font-medium">Source</th>
+                          )}
+                          <th className="text-right px-4 py-3 text-slate-400 font-medium">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {module.attributes['version-statuses'].map((v) => (
+                          <tr key={v.version} className="border-b border-slate-700/30 last:border-0">
+                            <td className="px-4 py-3 text-slate-200 font-mono">{v.version}</td>
+                            <td className="px-4 py-3">
+                              <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
+                                v.status === 'uploaded'
+                                  ? 'bg-green-900/50 text-green-300'
+                                  : 'bg-amber-900/50 text-amber-300'
+                              }`}>
+                                {v.status}
                               </span>
-                            ) : (
-                              <span className="text-slate-500 text-xs">manual upload</span>
+                            </td>
+                            {isVcsSource && (
+                              <td className="px-4 py-3">
+                                {v['vcs-tag'] ? (
+                                  <span className="text-slate-300 text-xs">
+                                    <span className="font-mono">{v['vcs-tag']}</span>
+                                    {v['vcs-commit-sha'] && (
+                                      <span className="text-slate-500 ml-1.5" title={v['vcs-commit-sha']}>
+                                        ({v['vcs-commit-sha'].slice(0, 7)})
+                                      </span>
+                                    )}
+                                  </span>
+                                ) : (
+                                  <span className="text-slate-500 text-xs">manual upload</span>
+                                )}
+                              </td>
                             )}
-                          </td>
-                        )}
-                        {modPerms['can-destroy'] && (
-                          <td className="px-4 py-3 text-right">
-                            <button
-                              onClick={() => setDeleteTarget(v.version)}
-                              className="text-xs text-red-400 hover:text-red-300 transition-colors"
-                            >
-                              Delete
-                            </button>
-                          </td>
-                        )}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
+                            {modPerms['can-destroy'] && (
+                              <td className="px-4 py-3 text-right">
+                                <button
+                                  onClick={() => setDeleteTarget(v.version)}
+                                  className="text-xs text-red-400 hover:text-red-300 transition-colors"
+                                >
+                                  Delete
+                                </button>
+                              </td>
+                            )}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              )}
+            </div>
           </>
         ) : null}
 

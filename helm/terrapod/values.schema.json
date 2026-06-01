@@ -593,6 +593,13 @@
                   "enum": ["none", "rc", "beta", "alpha", "dev"]
                 }
               }
+            },
+            "module_interface": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" }
+              }
             }
           }
         },

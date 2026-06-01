@@ -41,7 +41,9 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("created_by", sa.Text(), nullable=False),
-        sa.UniqueConstraint("module_id", "workspace_id", name="uq_module_workspace_links"),
+        sa.UniqueConstraint(
+            "module_id", "workspace_id", name="uq_module_workspace_links"
+        ),
     )
     op.create_index(
         "ix_module_workspace_links_module_id",

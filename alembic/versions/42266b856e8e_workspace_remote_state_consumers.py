@@ -63,6 +63,10 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index("ix_wrsc_producer_workspace_id", table_name="workspace_remote_state_consumers")
-    op.drop_index("ix_wrsc_consumer_workspace_id", table_name="workspace_remote_state_consumers")
+    op.drop_index(
+        "ix_wrsc_producer_workspace_id", table_name="workspace_remote_state_consumers"
+    )
+    op.drop_index(
+        "ix_wrsc_consumer_workspace_id", table_name="workspace_remote_state_consumers"
+    )
     op.drop_table("workspace_remote_state_consumers")

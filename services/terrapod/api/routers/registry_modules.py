@@ -34,7 +34,7 @@ from sqlalchemy.orm import selectinload
 
 from terrapod.api.dependencies import AuthenticatedUser, get_current_user, require_non_runner
 from terrapod.api.labels import validate_labels
-from terrapod.db.models import ModuleWorkspaceLink, Workspace
+from terrapod.db.models import ModuleWorkspaceLink, RegistryModuleVersion, Workspace
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
 from terrapod.services.registry_module_service import (
@@ -354,6 +354,61 @@ async def show_module_endpoint(
         raise HTTPException(status_code=404, detail="Module not found")
 
     return JSONResponse(content={"data": _module_to_jsonapi(module, perm)})
+
+
+@management_router.get("/registry-modules/private/default/{name}/{provider}/{version}/interface")
+async def module_interface_endpoint(
+    name: str,
+    provider: str,
+    version: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """Get the inputs/outputs interface for a specific module version."""
+    from terrapod.config import settings
+
+    if not settings.registry.module_interface.enabled:
+        raise HTTPException(status_code=404, detail="Module interface extraction is disabled")
+
+    module = await get_module(db, "default", name, provider)
+    if module is None:
+        raise HTTPException(status_code=404, detail="Module not found")
+
+    perm = await resolve_registry_permission(
+        db,
+        user.email,
+        user.roles,
+        module.name,
+        module.labels or {},
+        module.owner_email,
+        auth_method=user.auth_method,
+    )
+    if not has_registry_permission(perm, "read"):
+        raise HTTPException(status_code=404, detail="Module not found")
+
+    result = await db.execute(
+        select(RegistryModuleVersion).where(
+            RegistryModuleVersion.module_id == module.id,
+            RegistryModuleVersion.version == version,
+        )
+    )
+    mod_version = result.scalars().first()
+    if mod_version is None:
+        raise HTTPException(status_code=404, detail="Version not found")
+
+    return JSONResponse(
+        content={
+            "data": {
+                "type": "module-interface",
+                "id": f"modver-{mod_version.id}",
+                "attributes": {
+                    "version": mod_version.version,
+                    "inputs": mod_version.inputs,
+                    "outputs": mod_version.outputs,
+                },
+            }
+        }
+    )
 
 
 @management_router.delete("/registry-modules/private/default/{name}/{provider}")

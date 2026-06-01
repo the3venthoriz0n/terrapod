@@ -18,7 +18,9 @@ depends_on = None
 def upgrade() -> None:
     op.add_column(
         "workspaces",
-        sa.Column("var_files", ARRAY(sa.String(500)), nullable=False, server_default="{}"),
+        sa.Column(
+            "var_files", ARRAY(sa.String(500)), nullable=False, server_default="{}"
+        ),
     )
 
 
