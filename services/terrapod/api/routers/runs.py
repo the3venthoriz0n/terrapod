@@ -120,6 +120,14 @@ def _run_json(
                 "terraform-version": run.terraform_version,
                 "resource-cpu": run.resource_cpu,
                 "resource-memory": run.resource_memory,
+                # Runner resource profile + OOM detection (#430). All
+                # nullable / empty-string for runs that pre-date the
+                # feature (or where the runner died before capturing).
+                "peak-memory-bytes": run.peak_memory_bytes,
+                "peak-cpu-usec": run.peak_cpu_usec,
+                "runner-exit-code": run.runner_exit_code,
+                "runner-exit-reason": run.runner_exit_reason or "",
+                "runner-exit-status": run.runner_exit_status or "",
                 "error-message": run.error_message,
                 "target-addrs": run.target_addrs or [],
                 "replace-addrs": run.replace_addrs or [],
@@ -1382,6 +1390,38 @@ async def report_job_status(
     from terrapod.redis.client import set_job_status
 
     await set_job_status(str(run.id), phase, job_status)
+
+    # When the listener reports a failed Job, it MAY also send the container
+    # exit code + K8s termination reason from the terminated pod (#430). Map
+    # K8s reasons to the typed `runner_exit_status` bucket here — single
+    # mapping point so the reconciler + UI + AI gate all agree.
+    exit_code = body.get("exit_code")
+    reason = body.get("reason", "")
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        run.runner_exit_code = exit_code
+    if isinstance(reason, str) and reason:
+        run.runner_exit_reason = reason[:50]  # column is VARCHAR(50)
+
+    # Compute the typed status from whatever signals we have.
+    # - K8s `OOMKilled` reason is the authoritative OOM signal.
+    # - Exit 137 without an explicit reason (pod GC'd before we observed)
+    #   is "killed" — could be OOM, could be eviction, can't be sure.
+    # - Other non-zero exits are "error".
+    # - Exit 0 is "clean" (runner script exited cleanly, plan flow finished).
+    # Only set runner_exit_status when we have a definitive signal — leaving
+    # it "" means "pre-feature run / status unknown" and the UI shows no
+    # banner.
+    if reason == "OOMKilled":
+        run.runner_exit_status = "oom"
+    elif isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        if exit_code == 137:
+            run.runner_exit_status = "killed"
+        elif exit_code != 0:
+            run.runner_exit_status = "error"
+        else:
+            run.runner_exit_status = "clean"
+
+    await db.commit()
 
     return JSONResponse(content={"status": "ok"})
 
