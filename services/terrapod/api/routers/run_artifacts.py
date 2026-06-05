@@ -31,6 +31,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from terrapod.api.dependencies import AuthenticatedUser, get_current_user, require_runner_for_run
+from terrapod.config import settings
 from terrapod.db.models import Run, StateVersion, Workspace
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
@@ -56,6 +57,38 @@ async def _get_run(run_id: str, db: AsyncSession) -> Run:
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
     return run
+
+
+async def _publish_log_updated(workspace_id: str, run_id: str, phase: str) -> None:
+    """Notify the UI that a fresh log artifact landed in storage.
+
+    The runner's EXIT trap uploads the authoritative final log to storage
+    AFTER it POSTs plan-result / apply-result and the run has already
+    transitioned to a terminal state. Without this notification the UI
+    sits on the last Redis-snapshot it fetched mid-flight: `_serve_log`
+    correctly omits ETX on the Redis path so polling stays open, but the
+    UI only triggers a re-fetch when a `log_updated` event arrives. The
+    mid-flight listener `upload_log_stream` emits one per chunk; without
+    a corresponding emit here, the trailing bytes from the EXIT trap are
+    invisible until the user hits Refresh.
+    """
+    try:
+        from terrapod.redis.client import RUN_EVENTS_PREFIX, publish_event
+
+        payload = json.dumps(
+            {
+                "event": "log_updated",
+                "run_id": run_id,
+                "workspace_id": workspace_id,
+                "phase": phase,
+            }
+        )
+        await publish_event(f"{RUN_EVENTS_PREFIX}{workspace_id}", payload)
+    except Exception:
+        # Match upload_log_stream: SSE publishing failures must never break
+        # an in-flight artifact upload. Worst case we fall back to the old
+        # behaviour (UI waits until next event or manual refresh).
+        logger.debug("Failed to publish log_updated after artifact upload")
 
 
 # ── Downloads (302 redirect to presigned GET URL) ────────────────────────
@@ -166,6 +199,7 @@ async def upload_plan_log(
     storage = get_storage()
     key = plan_log_key(str(run.workspace_id), str(run.id))
     await storage.put(key, body)
+    await _publish_log_updated(str(run.workspace_id), str(run.id), "plan")
     return Response(status_code=204)
 
 
@@ -253,6 +287,30 @@ async def upload_plan_json_output(
             body_bytes=len(body),
         )
     await db.commit()
+
+    # AI plan summariser (#401) — enqueue the `plan_summary` kind now
+    # that the JSON is actually in storage. Previously this fired from
+    # run_service.transition_run on the planned transition, which
+    # raced the runner: transition_run runs on the plan-result POST,
+    # which the runner sends BEFORE uploading plan-json-output. The
+    # summariser would then hit "Object not found" half the time and
+    # write status='errored'. Firing here closes the race — by the
+    # time the trigger is enqueued the storage put + db commit have
+    # both succeeded. Failure-analysis kind still fires from
+    # transition_run on errored runs (no JSON involved).
+    if settings.ai_summary.enabled:
+        try:
+            from terrapod.services.scheduler import enqueue_trigger
+
+            await enqueue_trigger(
+                "ai_plan_summary",
+                {"run_id": str(run.id), "kind": "plan_summary"},
+                dedup_key=f"aisum:{run.id}:plan_summary",
+                dedup_ttl=300,
+            )
+        except Exception as e:
+            logger.debug("Failed to enqueue ai_plan_summary after upload", error=str(e))
+
     return Response(status_code=204)
 
 
@@ -271,6 +329,7 @@ async def upload_apply_log(
     storage = get_storage()
     key = apply_log_key(str(run.workspace_id), str(run.id))
     await storage.put(key, body)
+    await _publish_log_updated(str(run.workspace_id), str(run.id), "apply")
     return Response(status_code=204)
 
 
@@ -372,6 +431,84 @@ async def upload_state(
     from terrapod.redis.client import publish_workspace_event
 
     await publish_workspace_event(str(run.workspace_id), "state_version_created")
+
+    return Response(status_code=204)
+
+
+@router.post("/runs/{run_id}/resource-profile")
+async def record_resource_profile(
+    run_id: str,
+    request: Request,
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Record the runner Job's resource-usage peak (#430).
+
+    Called by the runner entrypoint at exit (via the EXIT trap, so it
+    fires on every normal exit path — clean success, plan errored,
+    OPA failed, SIGTERM during apply, etc.).
+
+    Captures:
+        peak_memory_bytes — /sys/fs/cgroup/memory.peak (cgroup v2)
+        peak_cpu_usec     — cumulative usage_usec from /sys/fs/cgroup/cpu.stat
+        exit_code         — the runner script's actual exit code (0 = clean)
+
+    Body shape (JSON):
+        { "peak_memory_bytes": <int>, "peak_cpu_usec": <int>, "exit_code": <int> }
+
+    For OOMKill / external SIGKILL the runner's trap doesn't fire — those
+    cases are filled in by the listener's job-status report (run_reconciler
+    reads the K8s container terminated state and writes runner_exit_reason
+    + runner_exit_status separately). Both paths converge on the same DB
+    columns; whichever signal arrives wins. The runner_exit_status field
+    is *only* set by the reconciler (never by the runner directly) so the
+    typed bucketing stays in one place.
+
+    Runner-token auth, scoped to this run_id.
+    """
+    require_runner_for_run(user, run_id)
+    run = await _get_run(run_id, db)
+
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"invalid JSON body: {e}") from e
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="body must be a JSON object")
+
+    # All three fields optional — the runner sends what it could read.
+    # Negative / non-int values are rejected to keep the DB schema sane.
+    def _opt_nonneg_int(name: str) -> int | None:
+        v = body.get(name)
+        if v is None:
+            return None
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name} must be a non-negative integer, got {v!r}",
+            )
+        return v
+
+    peak_memory_bytes = _opt_nonneg_int("peak_memory_bytes")
+    peak_cpu_usec = _opt_nonneg_int("peak_cpu_usec")
+    exit_code = _opt_nonneg_int("exit_code")
+
+    if peak_memory_bytes is not None:
+        run.peak_memory_bytes = peak_memory_bytes
+    if peak_cpu_usec is not None:
+        run.peak_cpu_usec = peak_cpu_usec
+    if exit_code is not None:
+        run.runner_exit_code = exit_code
+
+    await db.commit()
+
+    logger.info(
+        "runner_resource_profile_recorded",
+        run_id=run_id,
+        peak_memory_bytes=peak_memory_bytes,
+        peak_cpu_usec=peak_cpu_usec,
+        exit_code=exit_code,
+    )
 
     return Response(status_code=204)
 

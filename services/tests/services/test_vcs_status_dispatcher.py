@@ -1,10 +1,12 @@
 """Tests for VCS commit-status resolution — has-changes descriptions."""
 
+import asyncio
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from terrapod.db.models import VCSConnection
 from terrapod.services.vcs_status_dispatcher import (
     _build_comment_body,
     _resolve_status,
@@ -159,3 +161,326 @@ class TestEnqueueVcsStatus:
             await _enqueue_vcs_status(run, "planned")
 
         mock_enq.assert_not_awaited()
+
+
+class TestSupersededRunComment:
+    """The shared per-PR comment must only be written by the latest run for
+    that (workspace, PR) tuple. Otherwise a stale run's transition (typically
+    the supersede-cancel that fires when a force-push creates a fresh run)
+    can clobber the fresh run's comment with old status."""
+
+    @staticmethod
+    def _build_session(latest_run_id):
+        """Mock async DB session for handle_vcs_commit_status.
+
+        `latest_run_id` is whatever the "latest run for this (ws, PR)" query
+        should return.
+        """
+        session = MagicMock()
+        session.get = AsyncMock()
+        session.execute = AsyncMock()
+
+        # session.execute() result for the latest-run query — .scalar_one_or_none()
+        latest_result = MagicMock()
+        latest_result.scalar_one_or_none = MagicMock(return_value=latest_run_id)
+        session.execute.return_value = latest_result
+        return session
+
+    @pytest.mark.asyncio
+    async def test_superseded_run_skips_comment_but_posts_status(self):
+        """Old run (not the latest for this PR) → commit status fires, comment is skipped."""
+        from terrapod.services.vcs_status_dispatcher import handle_vcs_commit_status
+
+        old_run_id = uuid.uuid4()
+        new_run_id = uuid.uuid4()
+        ws_id = uuid.uuid4()
+        conn_id = uuid.uuid4()
+
+        old_run = MagicMock()
+        old_run.id = old_run_id
+        old_run.workspace_id = ws_id
+        old_run.vcs_commit_sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        old_run.vcs_pull_request_number = 26
+        old_run.plan_only = True
+        old_run.has_changes = None
+
+        ws = MagicMock()
+        ws.id = ws_id
+        ws.name = "terrapod-config"
+        ws.vcs_connection_id = conn_id
+        ws.vcs_repo_url = "https://github.com/markupai/terrapod-config"
+
+        conn = MagicMock()
+        conn.provider = "github"
+        conn.status = "active"
+
+        session = self._build_session(latest_run_id=new_run_id)
+
+        async def _get(model, _id):
+            from terrapod.db.models import Run, VCSConnection, Workspace
+
+            if model is Run:
+                return old_run
+            if model is Workspace:
+                return ws
+            if model is VCSConnection:
+                return conn
+            return None
+
+        session.get.side_effect = _get
+
+        class _Ctx:
+            async def __aenter__(self):
+                return session
+
+            async def __aexit__(self, *a):
+                return False
+
+        with (
+            patch(
+                "terrapod.services.vcs_status_dispatcher.get_db_session",
+                lambda: _Ctx(),
+            ),
+            patch(
+                "terrapod.services.vcs_status_dispatcher.github_service.parse_repo_url",
+                return_value=("markupai", "terrapod-config"),
+            ),
+            patch(
+                "terrapod.services.vcs_status_dispatcher.github_service.create_commit_status",
+                new=AsyncMock(),
+            ) as mock_status,
+            patch(
+                "terrapod.services.vcs_status_dispatcher.github_service.create_pr_comment",
+                new=AsyncMock(),
+            ) as mock_create_comment,
+            patch(
+                "terrapod.services.vcs_status_dispatcher.github_service.update_pr_comment",
+                new=AsyncMock(),
+            ) as mock_update_comment,
+        ):
+            await handle_vcs_commit_status(
+                {
+                    "run_id": str(old_run_id),
+                    "workspace_id": str(ws_id),
+                    "target_status": "canceled",
+                    "has_changes": None,
+                }
+            )
+
+        # Per-SHA commit status must still fire — GitHub only surfaces the
+        # head SHA's checks, so a stale-SHA status is harmless and useful.
+        mock_status.assert_awaited_once()
+        # …but the shared PR comment must NOT be touched for a superseded run.
+        mock_create_comment.assert_not_awaited()
+        mock_update_comment.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_latest_run_writes_comment_normally(self):
+        """Sanity: when the dispatched run IS the latest for the PR, the
+        comment write proceeds (the new guard only short-circuits stale runs)."""
+        from terrapod.services.vcs_status_dispatcher import handle_vcs_commit_status
+
+        run_id = uuid.uuid4()
+        ws_id = uuid.uuid4()
+        conn_id = uuid.uuid4()
+
+        run = MagicMock()
+        run.id = run_id
+        run.workspace_id = ws_id
+        run.vcs_commit_sha = "cafebabecafebabecafebabecafebabecafebabe"
+        run.vcs_pull_request_number = 26
+        run.plan_only = True
+        run.has_changes = True
+
+        ws = MagicMock()
+        ws.id = ws_id
+        ws.name = "terrapod-config"
+        ws.vcs_connection_id = conn_id
+        ws.vcs_repo_url = "https://github.com/markupai/terrapod-config"
+
+        conn = MagicMock()
+        conn.provider = "github"
+        conn.status = "active"
+
+        session = self._build_session(latest_run_id=run_id)  # itself is latest
+
+        # The handler also runs the PlanSummary lookup via session.execute().
+        # Reuse a side_effect so the FIRST execute() returns the latest-run
+        # result and the SECOND returns "no ready summary".
+        latest_result = MagicMock()
+        latest_result.scalar_one_or_none = MagicMock(return_value=run_id)
+        summary_result = MagicMock()
+        summary_result.scalar_one_or_none = MagicMock(return_value=None)
+        session.execute.side_effect = [latest_result, summary_result]
+
+        async def _get(model, _id):
+            from terrapod.db.models import Run, VCSConnection, Workspace
+
+            if model is Run:
+                return run
+            if model is Workspace:
+                return ws
+            if model is VCSConnection:
+                return conn
+            return None
+
+        session.get.side_effect = _get
+
+        class _Ctx:
+            async def __aenter__(self):
+                return session
+
+            async def __aexit__(self, *a):
+                return False
+
+        # _find_or_create_comment uses Redis; stub it out wholesale rather
+        # than mock-Redis here — the unit under test is the
+        # superseded-skip guard, not the comment-cache plumbing.
+        with (
+            patch(
+                "terrapod.services.vcs_status_dispatcher.get_db_session",
+                lambda: _Ctx(),
+            ),
+            patch(
+                "terrapod.services.vcs_status_dispatcher.github_service.parse_repo_url",
+                return_value=("markupai", "terrapod-config"),
+            ),
+            patch(
+                "terrapod.services.vcs_status_dispatcher.github_service.create_commit_status",
+                new=AsyncMock(),
+            ),
+            patch(
+                "terrapod.services.vcs_status_dispatcher._find_or_create_comment",
+                new=AsyncMock(),
+            ) as mock_comment,
+        ):
+            await handle_vcs_commit_status(
+                {
+                    "run_id": str(run_id),
+                    "workspace_id": str(ws_id),
+                    "target_status": "planned",
+                    "has_changes": True,
+                }
+            )
+
+        mock_comment.assert_awaited_once()
+
+
+# ── _find_or_create_comment — race-on-first-status regression ─────────
+
+
+class _FakeRedis:
+    """Minimal in-memory async Redis stand-in for the comment dispatcher.
+
+    Supports the operations `_find_or_create_comment` exercises:
+      - `set(key, value, nx=bool, ex=int)` with the SETNX semantics the
+        lock relies on (returns False when nx=True and key exists)
+      - `get(key)`
+      - `delete(key)`
+      - `eval(script, numkeys, key, arg)` — the only script in play is
+        the CAS-release; emulate it directly rather than parsing Lua.
+    """
+
+    def __init__(self):
+        self._store: dict[str, str] = {}
+
+    async def set(self, key, value, *, nx=False, ex=None):
+        # Real redis-py awaits a TCP round-trip; yield to model that —
+        # otherwise asyncio.gather runs each coroutine to completion in
+        # one slice and the test can't actually exercise contention.
+        await asyncio.sleep(0)
+        if nx and key in self._store:
+            return False
+        self._store[key] = str(value)
+        return True
+
+    async def get(self, key):
+        await asyncio.sleep(0)
+        return self._store.get(key)
+
+    async def delete(self, key):
+        await asyncio.sleep(0)
+        self._store.pop(key, None)
+        return 1
+
+    async def eval(self, script, numkeys, key, arg):
+        # The only script we ever pass is the lock-release CAS:
+        # `if get(K)==ARG then del(K) else 0`. Emulate that contract;
+        # don't try to actually run the Lua.
+        await asyncio.sleep(0)
+        if self._store.get(key) == arg:
+            self._store.pop(key, None)
+            return 1
+        return 0
+
+
+class TestFindOrCreateCommentRaceFix:
+    """Two concurrent dispatchers for the same PR (e.g. queued → planning
+    flipping fast enough that both `vcs_commit_status` triggers run on
+    different scheduler replicas at the same moment) must produce exactly
+    ONE created comment. The (workspace_id, pr_number) Redis mutex
+    serialises the find-or-create flow so the second caller sees the
+    cached ID and updates, rather than racing through cache-miss +
+    list-miss + create. Regression for the duplicate-comment screenshot
+    on terrapod-config PR #31.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_first_status_creates_only_one_comment(self):
+        from terrapod.services import vcs_status_dispatcher as dispatcher
+
+        conn = MagicMock(spec=VCSConnection)
+        conn.provider = "github"
+        ws_id = "11111111-1111-1111-1111-111111111111"
+        owner, repo, pr_number = "markupai", "terrapod-config", 31
+
+        fake_redis = _FakeRedis()
+
+        # Empty repo: nothing in cache, no existing comments.
+        list_comments = AsyncMock(return_value=[])
+        # Each create returns a distinct id so we can prove only one fired.
+        create_calls: list[int] = []
+
+        async def _create(*args, **kwargs):
+            new_id = 1000 + len(create_calls)
+            create_calls.append(new_id)
+            return new_id
+
+        update_calls: list[int] = []
+
+        # Signature must match github_service.update_pr_comment exactly —
+        # the dispatcher invokes it as (conn, owner, repo, comment_id, body).
+        # A mismatched signature would raise TypeError, which the existing
+        # cache-stale except catches and silently falls through to the
+        # list+create path — so a wrong mock would mask the lock working.
+        async def _update(conn, owner, repo, comment_id, body):
+            update_calls.append(comment_id)
+
+        with (
+            patch(
+                "terrapod.redis.client.get_redis_client",
+                return_value=fake_redis,
+            ),
+            patch.object(dispatcher.github_service, "list_pr_comments", new=list_comments),
+            patch.object(dispatcher.github_service, "create_pr_comment", new=_create),
+            patch.object(dispatcher.github_service, "update_pr_comment", new=_update),
+        ):
+            # Two distinct status-flip bodies firing concurrently.
+            await asyncio.gather(
+                dispatcher._find_or_create_comment(
+                    conn, owner, repo, pr_number, ws_id, "body for queued"
+                ),
+                dispatcher._find_or_create_comment(
+                    conn, owner, repo, pr_number, ws_id, "body for planning"
+                ),
+            )
+
+        # The whole point: exactly one comment created, the other became an update.
+        assert len(create_calls) == 1, (
+            f"expected exactly 1 create, got {len(create_calls)}: {create_calls}"
+        )
+        assert len(update_calls) == 1, (
+            f"expected exactly 1 update on the cached id, got {update_calls}"
+        )
+        # And the update targeted the freshly-created comment, not a phantom one.
+        assert update_calls[0] == create_calls[0]

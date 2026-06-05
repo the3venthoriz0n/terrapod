@@ -28,8 +28,12 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     op.add_column("runs", sa.Column("resource_additions", sa.Integer(), nullable=True))
     op.add_column("runs", sa.Column("resource_changes", sa.Integer(), nullable=True))
-    op.add_column("runs", sa.Column("resource_destructions", sa.Integer(), nullable=True))
-    op.add_column("runs", sa.Column("resource_replacements", sa.Integer(), nullable=True))
+    op.add_column(
+        "runs", sa.Column("resource_destructions", sa.Integer(), nullable=True)
+    )
+    op.add_column(
+        "runs", sa.Column("resource_replacements", sa.Integer(), nullable=True)
+    )
     op.add_column("runs", sa.Column("resource_imports", sa.Integer(), nullable=True))
 
 

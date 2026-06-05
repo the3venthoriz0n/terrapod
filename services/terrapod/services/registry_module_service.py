@@ -176,6 +176,21 @@ async def upload_module_tarball(
     await storage.put(key, data, "application/gzip")
 
     mod_version.upload_status = "uploaded"
+
+    from terrapod.config import settings
+
+    if settings.registry.module_interface.enabled:
+        import asyncio
+
+        from terrapod.services.module_hcl_parser import extract_module_interface
+
+        try:
+            interface = await asyncio.to_thread(extract_module_interface, data)
+            mod_version.inputs = interface["inputs"]
+            mod_version.outputs = interface["outputs"]
+        except Exception:
+            logger.warning("Failed to extract module interface on upload", exc_info=True)
+
     module.status = "setup_complete"
     await db.flush()
 

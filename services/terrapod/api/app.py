@@ -97,6 +97,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             description="Poll VCS providers for new module version tags",
         )
 
+        # Policy set VCS syncing
+        from terrapod.services.policy_vcs_poller import (
+            handle_policy_vcs_sync,
+            policy_vcs_poll_cycle,
+        )
+
+        register_periodic_task(
+            "policy_vcs_poll",
+            interval_seconds=settings.vcs.poll_interval_seconds,
+            handler=policy_vcs_poll_cycle,
+            description="Sync VCS-connected policy sets from git repos",
+        )
+        register_trigger_handler(
+            "policy_vcs_sync",
+            handler=handle_policy_vcs_sync,
+            description="Triggered immediate sync for a VCS policy set",
+        )
+
         # Module impact analysis: speculative plans for module PRs
         from terrapod.services.module_impact_service import (
             handle_module_impact_immediate_poll,
@@ -188,6 +206,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             interval_seconds=settings.drift_detection.poll_interval_seconds,
             handler=drift_check_cycle,
             description="Check workspaces for infrastructure drift",
+        )
+
+    # AI plan summariser (#401). Always registered when feature is enabled
+    # — runs that don't qualify (workspace disabled, budget exhausted) are
+    # handled inside the handler so the trigger queue is uniform.
+    if settings.ai_summary.enabled:
+        from terrapod.services.summariser import handle_ai_plan_summary
+
+        register_trigger_handler(
+            "ai_plan_summary",
+            handler=handle_ai_plan_summary,
+            description="Summarise plan changes or analyse plan failures via LLM",
         )
 
     # Run reconciler (drives run state transitions based on Job outcomes)

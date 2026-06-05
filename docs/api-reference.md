@@ -338,6 +338,20 @@ Workspaces support the following drift detection attributes (settable on create 
 | `drift-detection-enabled` | boolean | `true` (VCS) / `false` (non-VCS) | Enable or disable automatic drift detection. Auto-enabled when a VCS connection is set |
 | `drift-detection-interval-seconds` | integer | `86400` | How often to run drift detection checks (minimum: 3600 seconds / 1 hour) |
 
+### AI Plan Summary Attributes
+
+Workspaces carry two attributes that govern the optional AI plan-summary feature (settable on create and update). When the feature is globally disabled at the deployment level (`api.config.ai_summary.enabled: false`), these fields are stored but inert — no calls are made. See [docs/ai-plan-summary.md](ai-plan-summary.md) for the full operator guide.
+
+| Attribute | Type | Default | Description |
+|---|---|---|---|
+| `ai-summary-mode` | string | `"default"` | Per-workspace override. One of `"default"` (follow the global toggle), `"enabled"` (always summarise this workspace's plans), or `"disabled"` (never summarise this workspace — overrides global). |
+| `ai-summary-context` | string | `""` | Free text up to 4000 characters appended to the model's prompt as workspace-specific facts (e.g. "Fronts the vault for service X — destroying the KMS key causes a global outage."). Additive to the deployment-wide `fleet_context`. |
+
+422 errors:
+- `ai-summary-mode` outside the enum
+- `ai-summary-context` longer than 4000 characters
+- `ai-summary-context` not a string
+
 The following read-only attributes are included in workspace responses when drift detection is enabled:
 
 | Attribute | Type | Description |
@@ -606,6 +620,29 @@ Run objects include the following drift detection attributes in responses:
 
 Drift detection runs are always plan-only and are not counted in the workspace's normal run queue.
 
+### Run Response Attributes (Resource Profile / OOM)
+
+Run objects include peak resource usage + an abnormal-exit signal so the UI (and external clients) can surface memory pressure without operators having to grep pod logs. All five attributes are `null` / `""` for runs that pre-date the feature or never started a Job.
+
+| Attribute | Type | Source | Description |
+|---|---|---|---|
+| `resource-cpu` | string | Workspace setting (snapshot) | CPU request applied to the Job (K8s quantity, e.g. `"1"`, `"500m"`). Limit is `2×` this |
+| `resource-memory` | string | Workspace setting (snapshot) | Memory request applied to the Job (K8s quantity, e.g. `"2Gi"`). Limit is `2×` this |
+| `peak-memory-bytes` | integer or null | Runner (cgroup v2) | Peak resident memory observed during the run — `/sys/fs/cgroup/memory.peak` |
+| `peak-cpu-usec` | integer or null | Runner (cgroup v2) | Cumulative CPU time consumed by the run, microseconds — `usage_usec` from `/sys/fs/cgroup/cpu.stat`. **Captured but not surfaced in the UI** — see note below |
+| `runner-exit-code` | integer or null | Runner | Runner script's exit code captured at exit. `null` if the trap didn't fire (e.g. SIGKILL) |
+| `runner-exit-reason` | string | Listener (K8s) | Raw K8s `container.state.terminated.reason` (e.g. `"OOMKilled"`, `"Error"`, `"Completed"`). `""` if not observed |
+| `runner-exit-status` | string | Reconciler (typed bucket) | Stable typed value: `""` (unknown / not yet observed), `"clean"`, `"oom"`, `"killed"`, `"error"`. The UI keys on this; reason is shown for context |
+
+Two independent capture paths feed these fields:
+
+- **Runner path** — `POST /api/terrapod/v1/runs/{run_id}/resource-profile` from the runner's EXIT trap with `peak_memory_bytes` / `peak_cpu_usec` / `exit_code`. Fires for any catchable exit (success, plan errored, OPA failed, SIGTERM during apply).
+- **Listener path** — when a Job fails, the listener reads `container.state.terminated.{reason, exit_code}` and POSTs them on the job-status report. The reconciler maps them to `runner_exit_status`.
+
+OOM (`exit 137 + reason "OOMKilled"`) is uncatchable, so the runner path never fires on OOM — the listener path is the only signal. Both paths converge on the same five DB columns; whichever signal arrives wins. `runner-exit-status` is set **only** by the reconciler (single source of truth for typed bucketing) and is what drives the UI's OOM badge + the typed error message ("Runner OOM-killed (peak memory N.NN Gi). Workspace resource_memory is …. Increase resource_memory + retry.").
+
+See [runners.md — Memory Pressure & OOM Visibility](runners.md#memory-pressure--oom-visibility-430) for the operator-facing tuning workflow.
+
 ### Show Run
 
 ```
@@ -700,6 +737,72 @@ GET /api/v2/plans/{plan_id}/json-output
 Returns the structured JSON representation of the plan, as produced by `terraform show -json tfplan`. Useful for downstream tooling that wants to consume the resource changes without parsing the human-readable log. Responds **302** to a presigned object-storage URL.
 
 The endpoint is mounted at `/api/v2/` because `go-tfe` and Terraform's `cloud` block expect it there. Returns **404** if the runner never uploaded the JSON output (older runs, runs that errored before the plan completed).
+
+### Plan Summary
+
+```
+GET /api/v2/plans/{plan_id}/summary
+```
+
+Returns the AI-generated plan summary (or failure analysis on errored plans) when the optional `ai_summary` feature is enabled and a summary has been produced for the run. See [docs/ai-plan-summary.md](ai-plan-summary.md) for the operator-side setup.
+
+**Required permission:** `read` on the workspace.
+
+`plan_id` accepts either `plan-{uuid}` (the canonical form, matching what's returned in the `plans` relationship of a Run) or a bare run UUID.
+
+**Responses:**
+- **200 OK** — the workspace has a summary row for this run. See response shape below.
+- **404 Not Found** — no summary row exists. Either the feature is globally disabled, the workspace opted out (`ai-summary-mode: disabled`), or the summariser hasn't run yet. The UI treats 404 as "no AI surface" and renders nothing.
+
+**Response shape:**
+
+```json
+{
+  "data": {
+    "id": "plan-summary-<uuid>",
+    "type": "plan-summaries",
+    "attributes": {
+      "kind": "plan_summary",
+      "status": "ready",
+      "description": "Adds a single root-level output named `marker` ...",
+      "risk-level": "low",
+      "risk-factors": [
+        {
+          "severity": "low",
+          "title": "Output-only addition",
+          "detail": "The plan only introduces the `marker` output ...",
+          "resource_address": "output.marker"
+        }
+      ],
+      "model": "bedrock/us.anthropic.claude-opus-4-8",
+      "input-tokens": 1335,
+      "output-tokens": 171,
+      "error-message": "",
+      "created-at": "2026-06-01T12:00:00Z",
+      "updated-at": "2026-06-01T12:00:30Z"
+    },
+    "relationships": {
+      "plan": { "data": { "id": "plan-<uuid>", "type": "plans" } },
+      "run":  { "data": { "id": "run-<uuid>",  "type": "runs"  } }
+    }
+  }
+}
+```
+
+**Attribute reference:**
+
+| Attribute | Type | Description |
+|---|---|---|
+| `kind` | string | `"plan_summary"` (successful plan → change description + risk assessment) or `"failure_analysis"` (plan-phase errored → root-cause + suggested fixes). |
+| `status` | string | `"pending"` (handler running), `"ready"` (model returned a parseable response), `"skipped"` (workspace disabled or daily budget hit — see `error-message`), or `"errored"` (model call failed — see `error-message`). |
+| `description` | string | Markdown body. For `kind=plan_summary`, ~600 words describing the proposed changes. For `kind=failure_analysis`, root-cause explanation. |
+| `risk-level` | string | One of `"low"`, `"medium"`, `"high"`, `"critical"`. Reflects blast radius + reversibility, not novelty. |
+| `risk-factors` | array of object | Each item carries `severity` (same enum as `risk-level`), `title` (max 120 chars), `detail` (max 600 chars), and optional `resource_address` (terraform address). For `kind=failure_analysis` these are suggested fixes ordered most-likely-to-resolve first. |
+| `model` | string | LiteLLM model string used for this summary (e.g. `bedrock/us.anthropic.claude-opus-4-8`). |
+| `input-tokens` / `output-tokens` | integer | Telemetry counts reported by the upstream provider. |
+| `error-message` | string | Populated only for `status=errored` or `status=skipped`. Empty for `ready`. |
+
+**Real-time updates:** when a summary lands, the per-workspace SSE channel (`GET /api/terrapod/v1/workspaces/{id}/runs/events`) emits a `plan_summary_ready` event with `{run_id, workspace_id}`. The UI re-fetches the summary on receipt. For VCS-driven runs, the per-workspace PR/MR status comment is also edited in place to include the summary content.
 
 ### Apply Details
 
@@ -1908,6 +2011,35 @@ Content-Type: application/octet-stream
 
 Upload new state after apply. Returns 204 on success.
 
+### Record Resource Profile
+
+```
+POST /api/terrapod/v1/runs/{run_id}/resource-profile
+Content-Type: application/json
+```
+
+Called by the runner entrypoint at exit (EXIT trap, fires on every catchable termination — clean success, plan errored, OPA failed, SIGTERM during apply). Captures cgroup-v2 peak memory + cumulative CPU + the runner script's exit code.
+
+Body (all fields optional — the runner sends whatever it could read):
+
+```json
+{
+  "peak_memory_bytes": 1500000000,
+  "peak_cpu_usec": 42000000,
+  "exit_code": 0
+}
+```
+
+- `peak_memory_bytes` — from `/sys/fs/cgroup/memory.peak`
+- `peak_cpu_usec` — `usage_usec` from `/sys/fs/cgroup/cpu.stat`
+- `exit_code` — script's actual exit status
+
+Negative values, non-integers, or booleans return `400`. Missing fields are not clobbered (existing values preserved).
+
+Note: **SIGKILL is uncatchable**, so this endpoint never fires on OOM-killed runs. Those are covered by the listener's K8s-terminated-state report on the job-status path; `runner-exit-status` ends up `"oom"` either way. See [Run Response Attributes (Resource Profile / OOM)](#run-response-attributes-resource-profile--oom) for the full signal flow.
+
+Returns 204 on success.
+
 ---
 
 ## Binary Cache
@@ -2231,6 +2363,50 @@ POST /api/terrapod/v1/policy-sets
 ```
 
 `enforcement-level` is `advisory` (default) or `mandatory`. Scoping is `global-scope: true` (every workspace) or the `allow-labels` / `allow-names` / `deny-labels` / `deny-names` rules (same label model as roles; deny wins). **Required permission:** `admin`.
+
+#### VCS-Sourced Policy Sets
+
+Set `source` to `"vcs"` to create a policy set that syncs `.rego` files from a git repository instead of managing policies inline via the API:
+
+```json
+{
+  "data": {
+    "type": "policy-sets",
+    "attributes": {
+      "name": "security-baseline",
+      "enforcement-level": "mandatory",
+      "source": "vcs",
+      "vcs-connection-id": "vcs-<uuid>",
+      "vcs-repo-url": "https://github.com/org/policies",
+      "vcs-branch": "main",
+      "policy-path": "policies"
+    }
+  }
+}
+```
+
+**VCS-specific attributes:**
+
+| Attribute | Type | Description |
+|---|---|---|
+| `source` | string | `"inline"` (default) or `"vcs"` |
+| `vcs-connection-id` | string | Required when `source=vcs`. References a VCS connection (`vcs-<uuid>` format). |
+| `vcs-repo-url` | string | Required when `source=vcs`. HTTPS clone URL of the repo. |
+| `vcs-branch` | string | Branch to track. Defaults to the repo's default branch if empty. |
+| `policy-path` | string | Directory within the repo containing `.rego` files. Only direct children are loaded (no recursive descent). Empty string means repo root. |
+| `vcs-last-commit-sha` | string | Read-only. SHA of the last successfully synced commit. |
+| `vcs-last-synced-at` | string | Read-only. RFC 3339 timestamp of last successful sync. |
+| `vcs-last-error` | string\|null | Read-only. Error message from the most recent sync attempt, or null. |
+
+When `source=vcs`, inline policy CRUD is rejected with **409 Conflict** — policies are managed exclusively by the linked repository.
+
+### Sync VCS Policy Set
+
+```
+POST /api/terrapod/v1/policy-sets/{id}/actions/sync
+```
+
+Triggers an immediate sync of a VCS-sourced policy set. Returns **202 Accepted** with the current policy set state; the actual sync runs asynchronously. Returns **409 Conflict** if the policy set has `source=inline`. **Required permission:** `admin`.
 
 ### Show / Update / Delete Policy Set
 

@@ -18,6 +18,7 @@ Endpoints (all under /api/terrapod/v1):
         GET    /policy-sets/{id}                    show (policies embedded)
         PATCH  /policy-sets/{id}                    update
         DELETE /policy-sets/{id}                    delete
+        POST   /policy-sets/{id}/actions/sync       trigger VCS sync (source=vcs only)
         POST   /policy-sets/{id}/policies           add a policy (rego validated)
         PATCH  /policies/{id}                       update a policy
         DELETE /policies/{id}                       delete a policy
@@ -51,6 +52,7 @@ from terrapod.db.models import (
     PolicyEvaluation,
     PolicySet,
     Run,
+    VCSConnection,
     Workspace,
     generate_uuid7,
     now_utc,
@@ -114,6 +116,14 @@ def _policy_set_json(ps: PolicySet, *, embed_policies: bool = False) -> dict:
         "allow-names": ps.allow_names or [],
         "deny-labels": ps.deny_labels or {},
         "deny-names": ps.deny_names or [],
+        "source": ps.source,
+        "vcs-connection-id": f"vcs-{ps.vcs_connection_id}" if ps.vcs_connection_id else None,
+        "vcs-repo-url": ps.vcs_repo_url or None,
+        "vcs-branch": ps.vcs_branch or None,
+        "policy-path": ps.policy_path or None,
+        "vcs-last-commit-sha": ps.vcs_last_commit_sha or None,
+        "vcs-last-synced-at": _rfc3339(ps.vcs_last_synced_at) if ps.vcs_last_synced_at else None,
+        "vcs-last-error": ps.vcs_last_error,
         "policy-count": len(ps.policies),
         "created-by": ps.created_by or "",
         "created-at": _rfc3339(ps.created_at),
@@ -211,7 +221,33 @@ async def create_policy_set(
     if not name:
         raise HTTPException(status_code=422, detail="name is required")
 
+    source = attrs.get("source", "inline")
+    if source not in ("inline", "vcs"):
+        raise HTTPException(status_code=422, detail="source must be 'inline' or 'vcs'")
+
+    vcs_connection_id = None
+    if source == "vcs":
+        vcs_conn_id_raw = attrs.get("vcs-connection-id", "")
+        if not vcs_conn_id_raw:
+            raise HTTPException(
+                status_code=422, detail="vcs-connection-id is required for VCS policy sets"
+            )
+        try:
+            vcs_connection_id = uuid.UUID(vcs_conn_id_raw.removeprefix("vcs-"))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Invalid vcs-connection-id") from exc
+        conn = (
+            await db.execute(select(VCSConnection).where(VCSConnection.id == vcs_connection_id))
+        ).scalar_one_or_none()
+        if conn is None:
+            raise HTTPException(status_code=404, detail="VCS connection not found")
+        if not attrs.get("vcs-repo-url"):
+            raise HTTPException(
+                status_code=422, detail="vcs-repo-url is required for VCS policy sets"
+            )
+
     ps = PolicySet(
+        id=generate_uuid7(),
         name=name,
         description=attrs.get("description", "") or "",
         enforcement_level=_validate_enforcement(attrs.get("enforcement-level", "advisory")),
@@ -221,6 +257,11 @@ async def create_policy_set(
         allow_names=attrs.get("allow-names", []) or [],
         deny_labels=attrs.get("deny-labels", {}) or {},
         deny_names=attrs.get("deny-names", []) or [],
+        source=source,
+        vcs_connection_id=vcs_connection_id,
+        vcs_repo_url=attrs.get("vcs-repo-url", "") if source == "vcs" else "",
+        vcs_branch=attrs.get("vcs-branch", "") if source == "vcs" else "",
+        policy_path=attrs.get("policy-path", "") if source == "vcs" else "",
         created_by=user.email,
     )
     db.add(ps)
@@ -231,7 +272,7 @@ async def create_policy_set(
         raise HTTPException(
             status_code=409, detail=f"A policy set named '{name}' already exists"
         ) from exc
-    ps = await _get_policy_set(db, str(ps.id))
+    ps = await _get_policy_set(db, f"polset-{ps.id}")
     return JSONResponse(
         content={"data": _policy_set_json(ps, embed_policies=True)}, status_code=201
     )
@@ -259,6 +300,9 @@ async def update_policy_set(
     ps = await _get_policy_set(db, ps_id)
     attrs = body.get("data", {}).get("attributes", {})
 
+    if "source" in attrs:
+        raise HTTPException(status_code=422, detail="source is immutable after creation")
+
     if "name" in attrs:
         new_name = (attrs.get("name") or "").strip()
         if not new_name:
@@ -280,6 +324,15 @@ async def update_policy_set(
         ps.deny_labels = attrs.get("deny-labels", {}) or {}
     if "deny-names" in attrs:
         ps.deny_names = attrs.get("deny-names", []) or []
+
+    # VCS config fields (only applicable when source=vcs)
+    if ps.source == "vcs":
+        if "vcs-repo-url" in attrs:
+            ps.vcs_repo_url = attrs["vcs-repo-url"] or ""
+        if "vcs-branch" in attrs:
+            ps.vcs_branch = attrs["vcs-branch"] or ""
+        if "policy-path" in attrs:
+            ps.policy_path = attrs["policy-path"] or ""
 
     try:
         await db.commit()
@@ -304,6 +357,34 @@ async def delete_policy_set(
     await db.delete(ps)
     await db.commit()
     return JSONResponse(content=None, status_code=204)
+
+
+# ── VCS Sync Action ──────────────────────────────────────────────────
+
+
+@router.post("/policy-sets/{ps_id}/actions/sync", status_code=202)
+async def trigger_sync_policy_set(
+    ps_id: str = Path(...),
+    user: AuthenticatedUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """Enqueue an immediate sync of a VCS-sourced policy set. Returns 202 Accepted."""
+    ps = await _get_policy_set(db, ps_id)
+    if ps.source != "vcs":
+        raise HTTPException(status_code=409, detail="Only VCS-sourced policy sets can be synced")
+
+    from terrapod.services.scheduler import enqueue_trigger
+
+    await enqueue_trigger(
+        "policy_vcs_sync",
+        payload={"policy_set_id": str(ps.id)},
+        dedup_key=f"policy_vcs_sync:{ps.id}",
+        dedup_ttl=30,
+    )
+    return JSONResponse(
+        content={"data": _policy_set_json(ps, embed_policies=True)},
+        status_code=202,
+    )
 
 
 # ── Policy CRUD ───────────────────────────────────────────────────────
@@ -351,6 +432,11 @@ async def add_policy(
 ) -> JSONResponse:
     """Add a policy to a set. The Rego is validated with `opa check`."""
     ps = await _get_policy_set(db, ps_id)
+    if ps.source == "vcs":
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot add inline policies to a VCS-sourced policy set — policies are managed by the linked repository",
+        )
     attrs = body.get("data", {}).get("attributes", {})
     name = (attrs.get("name") or "").strip()
     if not name:
@@ -397,6 +483,12 @@ async def update_policy(
 ) -> JSONResponse:
     """Partial update of a policy. A changed Rego is re-validated."""
     policy = await _get_policy(db, policy_id)
+    ps = await _get_policy_set(db, f"polset-{policy.policy_set_id}")
+    if ps.source == "vcs":
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot edit policies on a VCS-sourced policy set — push changes to the repository",
+        )
     attrs = body.get("data", {}).get("attributes", {})
 
     if "name" in attrs:
@@ -430,6 +522,12 @@ async def delete_policy(
 ) -> JSONResponse:
     """Delete a single policy."""
     policy = await _get_policy(db, policy_id)
+    ps = await _get_policy_set(db, f"polset-{policy.policy_set_id}")
+    if ps.source == "vcs":
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete policies from a VCS-sourced policy set — remove the file from the repository",
+        )
     await db.delete(policy)
     await db.commit()
     return JSONResponse(content=None, status_code=204)

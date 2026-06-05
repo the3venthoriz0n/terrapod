@@ -252,10 +252,41 @@ jobs:
         # application that uses the library, not by the library. No fix
         # version is published. Suppress until a fix lands or the dispute
         # is resolved upstream.
+        #
+        # The remaining four ignores are all transitively gated by
+        # litellm 1.83.x. Patched releases (1.83.11+) pin Python
+        # <3.14 and our API image is on 3.14. Re-checked 2026-06-04:
+        # latest 1.87.0 still requires_python = <3.14. Until litellm
+        # restores 3.14 compatibility, ALL FOUR of the below have to
+        # stay.  See services/pyproject.toml for the matching
+        # dependency-side comment.
+        #
+        # CVE-2026-40217 (litellm <1.83.11): proxy-mode sandbox
+        # escape in POST /guardrails/test_custom_code. Terrapod uses
+        # litellm as a library via acompletion(), never starts the
+        # proxy server — endpoint unreachable.
+        #
+        # CVE-2026-28684 (python-dotenv <1.2.2): symlink follow in
+        # set_key()/unset_key(). Terrapod only READS env vars
+        # (load_dotenv / os.environ); never calls the affected write
+        # APIs. Cannot bump independently — litellm 1.83.7+ pins
+        # python-dotenv==1.0.1 exactly, so forcing >=1.2.2 here
+        # pushes the resolver back to litellm 1.83.0 (strictly worse
+        # — three more proxy CVEs).
+        #
+        # CVE-2026-34993 + CVE-2026-47265 (aiohttp <3.14.0): RCE via
+        # CookieJar.load() on untrusted input; cross-origin leak of
+        # cookies set via the `cookies` request param. litellm
+        # 1.83.x pins aiohttp==3.13.5; not reachable from how we
+        # call litellm.
         run: |
           pip install pip-audit
           pip-audit -r services/requirements.txt --strict --desc \
-            --ignore-vuln PYSEC-2025-183
+            --ignore-vuln PYSEC-2025-183 \
+            --ignore-vuln CVE-2026-40217 \
+            --ignore-vuln CVE-2026-28684 \
+            --ignore-vuln CVE-2026-34993 \
+            --ignore-vuln CVE-2026-47265
 
   # ── Dependency Audit (npm) ────────────────────────────
   npm-audit:
@@ -510,7 +541,7 @@ jobs:
 
       - name: Download image artifacts (PR)
         if: needs.prepare.outputs.is_pr == 'true'
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: image-*-amd64
           path: /tmp/images
@@ -616,7 +647,7 @@ jobs:
 
       - name: Download image artifact (PR)
         if: needs.prepare.outputs.is_pr == 'true'
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: image-${{ matrix.image }}-amd64
           path: /tmp
@@ -702,8 +733,31 @@ jobs:
             "$REGISTRY/${{ matrix.image }}:sha-${sha_short}-arm64"
 
   # ── Release ────────────────────────────────────────────
-  release:
-    name: Release
+  # The release stage is five jobs — a tiny pre-create that owns the
+  # Release object and four branches that all upload into it in
+  # parallel:
+  #
+  #   release-create   — pre-creates an empty GitHub Release for the tag
+  #                      with a placeholder title. Owning Release
+  #                      creation here means provider AND migrate can
+  #                      both run in append mode at the same time
+  #                      instead of provider gating migrate (#435 had
+  #                      provider create the Release → migrate append).
+  #   release-images   — image retag + Helm push + SBOM generation.
+  #                      Saves chart + SBOMs + checksums as a workflow
+  #                      artifact for release-finalize to upload.
+  #   release-provider — GoReleaser provider, append mode.
+  #   release-migrate  — GoReleaser migrate, append mode.
+  #   release-finalize — joins all four; sets real title + release notes
+  #                      and uploads the workflow artifact from
+  #                      release-images.
+  #
+  # Both goreleaser invocations also pass `--parallelism 6` so each
+  # process saturates the runner's cores when crunching its own
+  # platform matrix.
+
+  release-create:
+    name: Release — Create empty GitHub Release
     needs: [prepare, create-manifests]
     if: |
       always()
@@ -713,11 +767,41 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Create empty Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${{ needs.prepare.outputs.version }}"
+
+          # Idempotent: if the Release already exists (e.g. this job
+          # is being re-run), skip. release-finalize will set the
+          # real title/notes; we just need the Release object so the
+          # append-mode goreleaser runs have somewhere to upload to.
+          if gh release view "$version" >/dev/null 2>&1; then
+            echo "Release $version already exists; skipping create"
+            exit 0
+          fi
+          gh release create "$version" \
+            --title "$version (in progress)" \
+            --notes "Release in progress — assets are being attached by parallel CI jobs."
+
+  release-images:
+    name: Release — Images, Helm, SBOMs
+    needs: [prepare, create-manifests]
+    if: |
+      always()
+      && needs.prepare.outputs.is_tag == 'true'
+      && needs.prepare.result == 'success'
+      && (needs.create-manifests.result == 'success' || needs.create-manifests.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
       packages: write
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
 
       - name: Install Helm
         uses: azure/setup-helm@v5
@@ -756,6 +840,47 @@ jobs:
           .github/scripts/with-retry.sh "helm push" -- \
             helm push "dist/terrapod-${chart_version}.tgz" "oci://$REGISTRY"
 
+      - name: Generate SBOMs
+        run: |
+          version="${{ needs.prepare.outputs.version }}"
+
+          # Install syft
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
+          for image in terrapod-api terrapod-web terrapod-runner terrapod-listener terrapod-migrations; do
+            echo "Generating SBOM for $image:$version"
+            syft "$REGISTRY/$image:$version" -o spdx-json="dist/sbom-${image}.spdx.json"
+          done
+
+      - name: Generate checksums
+        run: |
+          (cd dist && sha256sum -- *.tgz *.spdx.json > checksums.txt)
+
+      - name: Upload artifact for release-finalize
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-images-assets
+          path: dist/
+          retention-days: 1
+
+  release-provider:
+    name: Release — Provider (GoReleaser)
+    # Both goreleaser jobs depend only on release-create — they no
+    # longer gate on each other. provider/.goreleaser.yml is
+    # release.mode=append.
+    needs: [prepare, release-create]
+    if: |
+      always()
+      && needs.prepare.outputs.is_tag == 'true'
+      && needs.release-create.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - uses: actions/setup-go@v6
         with:
           go-version-file: provider/go.mod
@@ -773,31 +898,84 @@ jobs:
         with:
           distribution: goreleaser
           version: latest
-          args: release --clean
+          # --parallelism saturates the runner's 4 vCPUs across the
+          # 8-platform build matrix (slightly oversubscribed because
+          # part of each build is I/O — module download, GPG signing).
+          args: release --clean --parallelism 6
           workdir: provider
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GPG_FINGERPRINT: ${{ steps.gpg.outputs.fingerprint }}
 
-      # Build terrapod-migrate binaries and append them to the release
-      # created by the provider's GoReleaser run. Linux/Windows ship as
-      # per-arch zips; macOS ships as a single Universal 2 binary built
-      # by lipo-merging darwin/amd64 + darwin/arm64. See
-      # migrate/.goreleaser.yml — release.mode=append keeps this step
-      # from trying to create a duplicate GitHub Release for the same tag.
+  release-migrate:
+    name: Release — Migrate tool (GoReleaser)
+    # Parallel with release-provider — both append to the Release that
+    # release-create made.
+    needs: [prepare, release-create]
+    if: |
+      always()
+      && needs.prepare.outputs.is_tag == 'true'
+      && needs.release-create.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: migrate/go.mod
+          cache-dependency-path: migrate/go.sum
+
+      - name: Import GPG signing key
+        id: gpg
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          fingerprint=$(gpg --with-colons --import-options show-only --import <<< "${{ secrets.GPG_PRIVATE_KEY }}" | awk -F: '/^fpr:/{print $10; exit}')
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+
+      # Linux/Windows ship as per-arch zips; macOS ships as a single
+      # Universal 2 binary built by lipo-merging darwin/amd64 +
+      # darwin/arm64. See migrate/.goreleaser.yml.
       - name: Build migrate-tool binaries with GoReleaser
         uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
           version: latest
-          args: release --clean
+          # See note on release-provider — same parallelism rationale.
+          args: release --clean --parallelism 6
           workdir: migrate
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GPG_FINGERPRINT: ${{ steps.gpg.outputs.fingerprint }}
 
+  release-finalize:
+    name: Release — Finalize (notes + chart + SBOMs)
+    needs: [prepare, release-create, release-images, release-provider, release-migrate]
+    if: |
+      always()
+      && needs.prepare.outputs.is_tag == 'true'
+      && needs.release-create.result == 'success'
+      && needs.release-images.result == 'success'
+      && needs.release-provider.result == 'success'
+      && needs.release-migrate.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download release-images artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-images-assets
+          path: dist/
+
       - name: Generate release notes
-        id: notes
         run: |
           version="${{ needs.prepare.outputs.version }}"
 
@@ -841,27 +1019,12 @@ jobs:
           # Write to file to preserve newlines
           echo "$notes" > /tmp/release-notes.md
 
-      - name: Generate SBOMs
-        run: |
-          version="${{ needs.prepare.outputs.version }}"
-
-          # Install syft
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
-
-          for image in terrapod-api terrapod-web terrapod-runner terrapod-listener terrapod-migrations; do
-            echo "Generating SBOM for $image:$version"
-            syft "$REGISTRY/$image:$version" -o spdx-json="dist/sbom-${image}.spdx.json"
-          done
-
-      - name: Upload release assets
+      - name: Edit Release title/notes + upload chart, SBOMs, checksums
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           version="${{ needs.prepare.outputs.version }}"
           chart_version="${version#v}"
-
-          # Generate checksums
-          (cd dist && sha256sum -- *.tgz *.spdx.json > checksums.txt)
 
           # GoReleaser already created the release with provider binaries.
           # Update title/notes and upload remaining assets.
@@ -882,11 +1045,11 @@ jobs:
   # ── Cleanup Tag on Failure ─────────────────────────────
   cleanup-tag:
     name: Cleanup Tag
-    needs: [prepare, build-images, scan-images, create-manifests, release]
+    needs: [prepare, build-images, scan-images, create-manifests, release-create, release-images, release-provider, release-migrate, release-finalize]
     if: |
       always()
       && needs.prepare.outputs.is_tag == 'true'
-      && (needs.build-images.result == 'failure' || needs.scan-images.result == 'failure' || needs.create-manifests.result == 'failure' || needs.release.result == 'failure')
+      && (needs.build-images.result == 'failure' || needs.scan-images.result == 'failure' || needs.create-manifests.result == 'failure' || needs.release-create.result == 'failure' || needs.release-images.result == 'failure' || needs.release-provider.result == 'failure' || needs.release-migrate.result == 'failure' || needs.release-finalize.result == 'failure')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -929,7 +1092,11 @@ jobs:
       - scan-images
       - e2e-test
       - create-manifests
-      - release
+      - release-create
+      - release-images
+      - release-provider
+      - release-migrate
+      - release-finalize
     runs-on: ubuntu-latest
     steps:
       - name: Check results
@@ -956,7 +1123,11 @@ jobs:
             "${{ needs.scan-images.result }}"
             "${{ needs.e2e-test.result }}"
             "${{ needs.create-manifests.result }}"
-            "${{ needs.release.result }}"
+            "${{ needs.release-create.result }}"
+            "${{ needs.release-images.result }}"
+            "${{ needs.release-provider.result }}"
+            "${{ needs.release-migrate.result }}"
+            "${{ needs.release-finalize.result }}"
           )
 
           for r in "${results[@]}"; do

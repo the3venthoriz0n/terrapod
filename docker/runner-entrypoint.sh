@@ -133,9 +133,56 @@ upload_log() {
     return 0
 }
 
+# --- Runner resource profile (#430) ---
+# Captures peak memory + cumulative CPU usage from cgroup v2 + the
+# script's exit code, POSTed at exit to /runs/{id}/resource-profile.
+# OOM-killed exits don't fire this trap (SIGKILL is uncatchable), so
+# those cases are picked up by the listener reading K8s pod terminated
+# state — both paths converge on the same DB columns.
+#
+# Best-effort: if cgroup files don't exist (dev environment without
+# cgroups v2) or the POST fails, the runner exits silently rather
+# than disturbing the run's real exit code.
+upload_resource_profile() {
+    if [ -z "$TP_API_URL" ] || [ -z "$TP_RUN_ID" ]; then
+        return 0
+    fi
+
+    _peak_mem=""
+    _peak_cpu=""
+    if [ -r /sys/fs/cgroup/memory.peak ]; then
+        _peak_mem=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo "")
+    fi
+    if [ -r /sys/fs/cgroup/cpu.stat ]; then
+        _peak_cpu=$(awk '/^usage_usec / { print $2 }' /sys/fs/cgroup/cpu.stat 2>/dev/null || echo "")
+    fi
+
+    # Build the JSON body. Only include fields we actually read — the
+    # API accepts any subset and treats missing fields as "unknown".
+    _body="{\"exit_code\": $1"
+    if [ -n "$_peak_mem" ]; then
+        _body="${_body}, \"peak_memory_bytes\": ${_peak_mem}"
+    fi
+    if [ -n "$_peak_cpu" ]; then
+        _body="${_body}, \"peak_cpu_usec\": ${_peak_cpu}"
+    fi
+    _body="${_body}}"
+
+    # 5s timeout — runner is exiting; we don't want to hang on a
+    # struggling API. Single attempt, no retry — best-effort.
+    curl -sSf --max-time 5 -X POST \
+         -H "$AUTH_HEADER" \
+         -H "Content-Type: application/json" \
+         -d "$_body" \
+         "${TP_API_URL}/api/terrapod/v1/runs/${TP_RUN_ID}/resource-profile" \
+         >/dev/null 2>&1 || true
+    return 0
+}
+
 on_exit() {
     _rc=$?
     upload_log || true
+    upload_resource_profile "$_rc" || true
     exit "$_rc"
 }
 trap on_exit EXIT
@@ -660,6 +707,18 @@ host "$TP_PUBLIC_HOST" {
   services = {
     "modules.v1"   = "${TP_API_URL}/api/v2/registry/modules/"
     "providers.v1" = "${TP_API_URL}/api/v2/registry/providers/"
+    # tfe.v2 + tfe.v2.1 + tfe.v2.2 are required so that
+    # `data "terraform_remote_state" { backend = "remote" }` resolves
+    # the API base URL through this redirect instead of giving up
+    # with "Host <X> does not provide a tfe service". The cloud-block
+    # state path doesn't go through service discovery so the cloud
+    # block keeps working without these, but every other consumer of
+    # the discovery doc (terraform_remote_state, future TFE V2 RPCs)
+    # does and needs them. All three minor versions point at the same
+    # /api/v2/ base — matches what the public discovery doc serves.
+    "tfe.v2"       = "${TP_API_URL}/api/v2/"
+    "tfe.v2.1"     = "${TP_API_URL}/api/v2/"
+    "tfe.v2.2"     = "${TP_API_URL}/api/v2/"
   }
 }
 TFEOF
@@ -796,6 +855,43 @@ if [ "$TP_CONFIGURED_BACKEND" != "local" ]; then
     exit 1
 fi
 log "[entrypoint] Backend verified: local"
+
+# --- Plan phase: extend .terraform.lock.hcl with the OTHER Linux arch ---
+# `init` only records `h1:` checksums for the arch it just ran on. If
+# the apply phase ends up on a different arch (mixed-arch nodepool,
+# spot reschedule across phases, multi-day wait between plan and
+# apply) the reused single-arch lock fails the apply-side `init`
+# with "doesn't match any of the checksums previously recorded in
+# the dependency lock file" after ~16 seconds. `providers lock`
+# downloads the requested-arch archives and appends their checksums
+# to the existing entries — exactly the canonical "extend my lock
+# with another platform's hashes" tool terraform/tofu give us.
+#
+# Bounded by amd64 + arm64 because that's what runner Jobs ever land
+# on. Importantly we only run it for the OTHER arch — `init` above
+# already downloaded the current arch and updated the lock with its
+# `h1:`, and `providers lock` would re-download regardless of whether
+# the archive is already on disk (h1 is computed over the unzipped
+# contents, sourced from the network mirror not the local cache). So
+# duplicating the current arch here doubles the lock-extension
+# download volume per plan for no functional gain.
+#
+# Best-effort: a provider that doesn't publish the other arch (rare —
+# `local`, `archive`, niche third-party) will fail this and the
+# warning surfaces it. We carry on with whatever did succeed.
+case "$(uname -m)" in
+    aarch64) OTHER_PLATFORM="linux_amd64" ;;
+    x86_64)  OTHER_PLATFORM="linux_arm64" ;;
+    *)       OTHER_PLATFORM="" ;;
+esac
+
+if [ "$TP_PHASE" = "plan" ] && [ -f .terraform.lock.hcl ] && [ -n "$OTHER_PLATFORM" ]; then
+    log "[entrypoint] Extending .terraform.lock.hcl with $OTHER_PLATFORM checksums (current arch already locked by init)..."
+    if ! "$TP_BIN" providers lock \
+            -platform="$OTHER_PLATFORM" 2>&1 | sed 's/^/[providers-lock] /'; then
+        log "[entrypoint] Warning: providers lock failed; an apply on a different arch may fail tofu init"
+    fi
+fi
 
 # --- Plan phase: upload the lock file produced (or augmented) by init ---
 # Apply phase will download this so its init resolves to the same

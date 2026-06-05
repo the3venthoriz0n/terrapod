@@ -5,16 +5,58 @@ Receives {run_id, workspace_id, target_status} payloads and posts
 commit statuses and PR/MR comments back to the VCS provider.
 """
 
+import asyncio
 import uuid
 from datetime import UTC, datetime
 
+from sqlalchemy import select
+
 from terrapod.config import settings
-from terrapod.db.models import Run, VCSConnection, Workspace
+from terrapod.db.models import PlanSummary, Run, VCSConnection, Workspace
 from terrapod.db.session import get_db_session
 from terrapod.logging_config import get_logger
 from terrapod.services import github_service, gitlab_service
 
 logger = get_logger(__name__)
+
+# Redis lua script for atomic lock release: only delete if we still own
+# it. Token comparison guards against deleting another worker's lock if
+# our TTL had already expired and they re-acquired in the gap.
+_LOCK_RELEASE_LUA = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+    "return redis.call('del', KEYS[1]) else return 0 end"
+)
+_COMMENT_LOCK_PREFIX = "tp:vcs_comment_lock:"
+_COMMENT_LOCK_TTL = 10  # seconds — generous bound on a single create/update round-trip
+_COMMENT_LOCK_MAX_ATTEMPTS = 20  # × 0.1s = ~2s total wait
+_COMMENT_LOCK_INTERVAL = 0.1
+
+
+async def _acquire_comment_lock(redis, key: str) -> str | None:
+    """Bounded-retry SETNX lock. Returns the lock token on success, or
+    None if we couldn't acquire within the deadline.
+
+    The lock is keyed on (workspace_id, pr_number) — NOT on (run_id,
+    target_status). Two distinct triggers for the same PR (e.g. a
+    queued → planning flip producing two dedup-distinct enqueues)
+    contend on the same lock, so the find-or-create flow serialises
+    and only one comment is created on the first ever status post.
+    """
+    token = uuid.uuid4().hex
+    for _ in range(_COMMENT_LOCK_MAX_ATTEMPTS):
+        if await redis.set(key, token, nx=True, ex=_COMMENT_LOCK_TTL):
+            return token
+        await asyncio.sleep(_COMMENT_LOCK_INTERVAL)
+    return None
+
+
+async def _release_comment_lock(redis, key: str, token: str) -> None:
+    """Atomic release — only delete if the lock still carries our token."""
+    try:
+        await redis.eval(_LOCK_RELEASE_LUA, 1, key, token)
+    except Exception as e:
+        logger.debug("Failed to release PR comment lock", error=str(e))
+
 
 # Run status → (github_state, gitlab_state, description)
 _STATUS_MAP: dict[str, tuple[str, str, str]] = {
@@ -82,29 +124,83 @@ def _build_comment_body(
     plan_only: bool,
     has_changes: bool | None,
     run_url: str,
+    ai_summary: "PlanSummary | None" = None,
 ) -> str:
     """Build the markdown body for a PR/MR comment.
 
     `has_changes` is consumed by ``_resolve_status`` to form the status
     description ("Has changes" / "No changes"); we don't append a second
     has-changes line, which used to be redundant with the description.
+
+    When ``ai_summary`` is provided and its status is "ready", a
+    collapsible ``<details>`` block is appended with the LLM-generated
+    description + risk pill + risk-factor list (#401). Other statuses
+    (pending / skipped / errored) are skipped — the comment shouldn't
+    advertise empty or error rows to PR readers.
     """
     github_state, _, description = _resolve_status(run_status, plan_only, has_changes)
     emoji = _STATUS_EMOJI.get(run_status, ":grey_question:")
 
     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    return "\n".join(
-        [
-            f"<!-- terrapod:ws:{workspace_id} -->",
-            f"### Terrapod — {workspace_name}",
-            "",
-            f"**Status:** {emoji} {description}",
-            f"**Run:** [{run_id}]({run_url})",
-            "",
-            f"*Updated {now}*",
-        ]
-    )
+    parts = [
+        f"<!-- terrapod:ws:{workspace_id} -->",
+        f"### Terrapod — {workspace_name}",
+        "",
+        f"**Status:** {emoji} {description}",
+        f"**Run:** [{run_id}]({run_url})",
+    ]
+    if ai_summary is not None and ai_summary.status == "ready":
+        parts.append("")
+        parts.append(_render_ai_summary_section(ai_summary))
+    parts.append("")
+    parts.append(f"*Updated {now}*")
+    return "\n".join(parts)
+
+
+def _render_ai_summary_section(s: "PlanSummary") -> str:
+    """Render one PlanSummary as a collapsible PR-comment section (#401).
+
+    Both GitHub and GitLab support raw HTML inside Markdown comments;
+    `<details>` keeps verbose summaries out of the default view so PRs
+    spanning many workspaces stay scannable. The summary header carries
+    the risk pill so a reviewer can triage without expanding.
+    """
+    kind_label = "Failure analysis" if s.kind == "failure_analysis" else "AI summary"
+    risk_emoji = {
+        "low": "🟢",
+        "medium": "🟡",
+        "high": "🟠",
+        "critical": "🔴",
+    }.get(s.risk_level, "⚪")
+    lines = [
+        f"<details><summary>🤖 {kind_label} &mdash; "
+        f"{risk_emoji} risk: <strong>{s.risk_level or 'unknown'}</strong></summary>",
+        "",
+        s.description.strip(),
+    ]
+    if s.risk_factors:
+        rf_heading = "**Suggested fixes:**" if s.kind == "failure_analysis" else "**Risk factors:**"
+        lines.extend(["", rf_heading, ""])
+        for rf in s.risk_factors:
+            sev = (rf.get("severity") or "").lower() if isinstance(rf, dict) else ""
+            sev_emoji = {
+                "low": "🟢",
+                "medium": "🟡",
+                "high": "🟠",
+                "critical": "🔴",
+            }.get(sev, "⚪")
+            title = rf.get("title", "") if isinstance(rf, dict) else ""
+            detail = (rf.get("detail", "") or "").strip() if isinstance(rf, dict) else ""
+            addr = rf.get("resource_address", "") if isinstance(rf, dict) else ""
+            head = f"- {sev_emoji} **{title}**"
+            if addr:
+                head += f" — `{addr}`"
+            lines.append(head)
+            if detail:
+                lines.append(f"  {detail}")
+    lines.extend(["", "</details>"])
+    return "\n".join(lines)
 
 
 def _comment_marker(workspace_id: str) -> str:
@@ -122,6 +218,15 @@ async def _find_or_create_comment(
     """Find an existing comment by marker, update it, or create a new one.
 
     Uses Redis cache for comment ID, falls back to listing comments.
+
+    Serialised across replicas via a (workspace_id, pr_number)-keyed
+    Redis mutex — without it, two triggers for the same PR (queued →
+    planning produces two dedup-distinct enqueues) race through the
+    cache-miss + list-miss + create branches and end up POSTing two
+    distinct comments. Once the first lands, subsequent updates use
+    the cached ID and edit the surviving comment, but the duplicate
+    sticks around forever. The lock confines the TOCTOU window to a
+    single worker on a single PR at a time.
     """
     from terrapod.redis.client import get_redis_client
 
@@ -129,62 +234,79 @@ async def _find_or_create_comment(
     cache_key = f"{_COMMENT_CACHE_PREFIX}{workspace_id}:{pr_number}"
     marker = _comment_marker(workspace_id)
 
-    # Try cached comment ID
-    cached_id = await redis.get(cache_key)
-    if cached_id:
-        comment_id = int(cached_id)
-        try:
-            if conn.provider == "gitlab":
-                await gitlab_service.update_mr_comment(
-                    conn, owner, repo, pr_number, comment_id, body
-                )
-            else:
-                await github_service.update_pr_comment(conn, owner, repo, comment_id, body)
-            await redis.set(cache_key, str(comment_id), ex=_COMMENT_CACHE_TTL)
-            return
-        except Exception:
-            # Cache stale — fall through to search
-            logger.debug("Cached comment ID stale, searching", comment_id=comment_id)
+    lock_key = f"{_COMMENT_LOCK_PREFIX}{workspace_id}:{pr_number}"
+    lock_token = await _acquire_comment_lock(redis, lock_key)
+    if lock_token is None:
+        # Another worker is mid-flight for this PR. The dispatcher is
+        # idempotent at the (workspace_id, pr_number, status) level —
+        # if our status is fresher, the next trigger for this PR will
+        # re-fire when the lock holder releases. Drop this update.
+        logger.warning(
+            "Could not acquire PR-comment lock; another worker is updating",
+            workspace_id=workspace_id,
+            pr_number=pr_number,
+        )
+        return
 
-    # Search for existing comment with marker
-    comment_id = None
     try:
-        if conn.provider == "gitlab":
-            comments = await gitlab_service.list_mr_comments(conn, owner, repo, pr_number)
-        else:
-            comments = await github_service.list_pr_comments(conn, owner, repo, pr_number)
+        # Try cached comment ID
+        cached_id = await redis.get(cache_key)
+        if cached_id:
+            comment_id = int(cached_id)
+            try:
+                if conn.provider == "gitlab":
+                    await gitlab_service.update_mr_comment(
+                        conn, owner, repo, pr_number, comment_id, body
+                    )
+                else:
+                    await github_service.update_pr_comment(conn, owner, repo, comment_id, body)
+                await redis.set(cache_key, str(comment_id), ex=_COMMENT_CACHE_TTL)
+                return
+            except Exception:
+                # Cache stale — fall through to search
+                logger.debug("Cached comment ID stale, searching", comment_id=comment_id)
 
-        for c in comments:
-            c_body = c.get("body", "")
-            if marker in c_body:
-                comment_id = c["id"]
-                break
-    except Exception as e:
-        logger.warning("Failed to list PR comments for marker search", error=str(e))
-
-    if comment_id:
-        # Update existing
+        # Search for existing comment with marker
+        comment_id = None
         try:
             if conn.provider == "gitlab":
-                await gitlab_service.update_mr_comment(
-                    conn, owner, repo, pr_number, comment_id, body
-                )
+                comments = await gitlab_service.list_mr_comments(conn, owner, repo, pr_number)
             else:
-                await github_service.update_pr_comment(conn, owner, repo, comment_id, body)
-            await redis.set(cache_key, str(comment_id), ex=_COMMENT_CACHE_TTL)
-            return
+                comments = await github_service.list_pr_comments(conn, owner, repo, pr_number)
+
+            for c in comments:
+                c_body = c.get("body", "")
+                if marker in c_body:
+                    comment_id = c["id"]
+                    break
         except Exception as e:
-            logger.warning("Failed to update PR comment", error=str(e))
+            logger.warning("Failed to list PR comments for marker search", error=str(e))
 
-    # Create new
-    try:
-        if conn.provider == "gitlab":
-            new_id = await gitlab_service.create_mr_comment(conn, owner, repo, pr_number, body)
-        else:
-            new_id = await github_service.create_pr_comment(conn, owner, repo, pr_number, body)
-        await redis.set(cache_key, str(new_id), ex=_COMMENT_CACHE_TTL)
-    except Exception as e:
-        logger.warning("Failed to create PR comment", error=str(e))
+        if comment_id:
+            # Update existing
+            try:
+                if conn.provider == "gitlab":
+                    await gitlab_service.update_mr_comment(
+                        conn, owner, repo, pr_number, comment_id, body
+                    )
+                else:
+                    await github_service.update_pr_comment(conn, owner, repo, comment_id, body)
+                await redis.set(cache_key, str(comment_id), ex=_COMMENT_CACHE_TTL)
+                return
+            except Exception as e:
+                logger.warning("Failed to update PR comment", error=str(e))
+
+        # Create new
+        try:
+            if conn.provider == "gitlab":
+                new_id = await gitlab_service.create_mr_comment(conn, owner, repo, pr_number, body)
+            else:
+                new_id = await github_service.create_pr_comment(conn, owner, repo, pr_number, body)
+            await redis.set(cache_key, str(new_id), ex=_COMMENT_CACHE_TTL)
+        except Exception as e:
+            logger.warning("Failed to create PR comment", error=str(e))
+    finally:
+        await _release_comment_lock(redis, lock_key, lock_token)
 
 
 async def handle_vcs_commit_status(payload: dict) -> None:
@@ -317,9 +439,53 @@ async def handle_vcs_commit_status(payload: dict) -> None:
                 error=str(e),
             )
 
-        # Post/update PR comment (only for PR runs)
+        # Post/update PR comment (only for PR runs).
+        #
+        # The comment is shared across every run for this (workspace, PR)
+        # tuple — keyed by `<!-- terrapod:ws:{ws.id} -->` and updated in
+        # place by `_find_or_create_comment`. That means a stale run's
+        # transition (typically the supersede-cancel that fires when a
+        # force-push creates a fresh run for the new HEAD SHA) can land
+        # AFTER the fresh run's writes and clobber the comment with the
+        # old run's status. The per-SHA commit status check is unaffected
+        # (GitHub only surfaces the head SHA's checks), but the comment
+        # is the only shared surface, so only the latest run for this PR
+        # may write to it.
         if run.vcs_pull_request_number:
+            latest_run_id = (
+                await db.execute(
+                    select(Run.id)
+                    .where(
+                        Run.workspace_id == ws.id,
+                        Run.vcs_pull_request_number == run.vcs_pull_request_number,
+                    )
+                    .order_by(Run.created_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if latest_run_id is not None and latest_run_id != run.id:
+                logger.debug(
+                    "Skipping PR comment write for superseded run",
+                    run_id=run_id_str,
+                    latest_run_id=str(latest_run_id),
+                    pr=run.vcs_pull_request_number,
+                )
+                return
+
             run_url = target_url or f"run-{run.id}"
+            # AI plan summary (#401) — included in the comment body when
+            # a ready row exists for this run. The summariser re-enqueues
+            # this same trigger after a ready row lands so the comment
+            # picks up the LLM content as soon as it's available, not on
+            # the next status change.
+            ai_summary = (
+                await db.execute(
+                    select(PlanSummary).where(
+                        PlanSummary.run_id == run.id,
+                        PlanSummary.status == "ready",
+                    )
+                )
+            ).scalar_one_or_none()
             body = _build_comment_body(
                 workspace_name=ws.name,
                 workspace_id=str(ws.id),
@@ -328,6 +494,7 @@ async def handle_vcs_commit_status(payload: dict) -> None:
                 plan_only=run.plan_only,
                 has_changes=has_changes,
                 run_url=run_url,
+                ai_summary=ai_summary,
             )
             await _find_or_create_comment(
                 conn, owner, repo, run.vcs_pull_request_number, str(ws.id), body

@@ -276,6 +276,48 @@ Each version exposes VCS metadata in the API response:
 | `vcs-commit-sha` | The git commit SHA this version was built from (empty for manual uploads) |
 | `vcs-tag` | The tag name that matched (e.g. `v1.2.3`; empty for manual uploads) |
 
+### Module Interface (Inputs & Outputs)
+
+When a module version is published (via upload or VCS tag), Terrapod parses the `.tf` files at the module root to extract Terraform `variable` and `output` declarations. This metadata is stored with the version and displayed in the web UI as an expandable "Inputs & Outputs" card on the module detail page.
+
+**Extracted fields:**
+
+| Block | Fields |
+|---|---|
+| `variable` | name, type, type_schema, description, default, required, sensitive |
+| `output` | name, description, sensitive |
+
+`type` is the human-readable HCL type expression (e.g. `map(string)`). `type_schema` is the equivalent JSON Schema object, ready for client-side input validation without a server round-trip:
+
+| HCL type | `type_schema` |
+|---|---|
+| `string` | `{"type": "string"}` |
+| `number` | `{"type": "number"}` |
+| `bool` | `{"type": "boolean"}` |
+| `list(string)` | `{"type": "array", "items": {"type": "string"}}` |
+| `map(string)` | `{"type": "object", "additionalProperties": {"type": "string"}}` |
+| `object({name = string})` | `{"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}` |
+
+**API endpoint:**
+
+```text
+GET /api/terrapod/v1/registry-modules/private/default/{name}/{provider}/{version}/interface
+```
+
+Returns `inputs` and `outputs` arrays. Returns `null` for versions published before this feature was enabled or when the feature is disabled.
+
+**Configuration:**
+
+```yaml
+api:
+  config:
+    registry:
+      module_interface:
+        enabled: true   # set to false to disable extraction and hide the endpoint
+```
+
+When disabled, the endpoint returns 404 and no HCL parsing occurs during ingest. The web UI gracefully shows "No interface data available" for versions without interface data.
+
 ---
 
 ## Module Impact Analysis

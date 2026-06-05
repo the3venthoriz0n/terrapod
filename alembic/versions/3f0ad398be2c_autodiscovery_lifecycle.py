@@ -38,7 +38,9 @@ def upgrade() -> None:
     )
     op.add_column(
         "workspaces",
-        sa.Column("lifecycle_reason", sa.String(500), nullable=False, server_default=""),
+        sa.Column(
+            "lifecycle_reason", sa.String(500), nullable=False, server_default=""
+        ),
     )
     op.add_column(
         "workspaces",

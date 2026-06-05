@@ -17,9 +17,7 @@ depends_on = None
 
 def upgrade() -> None:
     # Drop FK constraint on runs.listener_id (keep column as bare UUID)
-    op.drop_constraint(
-        "runs_listener_id_fkey", "runs", type_="foreignkey"
-    )
+    op.drop_constraint("runs_listener_id_fkey", "runs", type_="foreignkey")
 
     # Drop runner_listeners table and its index
     op.drop_index("ix_runner_listeners_pool_id", table_name="runner_listeners")
@@ -59,9 +57,7 @@ def downgrade() -> None:
             server_default=sa.func.now(),
         ),
     )
-    op.create_index(
-        "ix_runner_listeners_pool_id", "runner_listeners", ["pool_id"]
-    )
+    op.create_index("ix_runner_listeners_pool_id", "runner_listeners", ["pool_id"])
 
     # Re-add FK constraint on runs.listener_id
     op.create_foreign_key(

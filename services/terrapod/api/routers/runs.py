@@ -34,6 +34,7 @@ from typing import Literal
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Request, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
@@ -43,7 +44,7 @@ from terrapod.api.dependencies import (
     get_current_user,
     get_listener_identity,
 )
-from terrapod.db.models import Run, StateVersion, VCSConnection, Workspace
+from terrapod.db.models import PlanSummary, Run, StateVersion, VCSConnection, Workspace, now_utc
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
 from terrapod.services import agent_pool_service, run_service
@@ -119,6 +120,14 @@ def _run_json(
                 "terraform-version": run.terraform_version,
                 "resource-cpu": run.resource_cpu,
                 "resource-memory": run.resource_memory,
+                # Runner resource profile + OOM detection (#430). All
+                # nullable / empty-string for runs that pre-date the
+                # feature (or where the runner died before capturing).
+                "peak-memory-bytes": run.peak_memory_bytes,
+                "peak-cpu-usec": run.peak_cpu_usec,
+                "runner-exit-code": run.runner_exit_code,
+                "runner-exit-reason": run.runner_exit_reason or "",
+                "runner-exit-status": run.runner_exit_status or "",
                 "error-message": run.error_message,
                 "target-addrs": run.target_addrs or [],
                 "replace-addrs": run.replace_addrs or [],
@@ -650,13 +659,43 @@ async def retry_run(
     if ws is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
+    # Defensive: if the source run has no CV (e.g. it was queued by an
+    # older fire_run_triggers before #439, or by some other path that
+    # forgot to attach one), pick the workspace's latest uploaded CV
+    # rather than faithfully copying the null forward. A retry with no
+    # CV would just re-hit the runner's "no configuration archive (HTTP
+    # 404)" exit — preserving the bug instead of clearing it. Existing
+    # null-CV runs already in the DB become retry-able after this.
+    cv_id_for_retry = run.configuration_version_id
+    if cv_id_for_retry is None:
+        from terrapod.db.models import ConfigurationVersion
+
+        cv_result = await db.execute(
+            select(ConfigurationVersion.id)
+            .where(
+                ConfigurationVersion.workspace_id == ws.id,
+                ConfigurationVersion.status == "uploaded",
+            )
+            .order_by(ConfigurationVersion.created_at.desc())
+            .limit(1)
+        )
+        cv_id_for_retry = cv_result.scalar_one_or_none()
+        if cv_id_for_retry is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Source run has no configuration version and the workspace has "
+                    "never had one uploaded; nothing to retry against."
+                ),
+            )
+
     new_run = await run_service.create_run(
         db,
         workspace=ws,
         message=f"Retry of run-{run.id}",
         source=run.source,
         plan_only=run.plan_only,
-        configuration_version_id=run.configuration_version_id,
+        configuration_version_id=cv_id_for_retry,
         created_by=user.email,
         target_addrs=run.target_addrs,
         replace_addrs=run.replace_addrs,
@@ -687,7 +726,9 @@ def _plan_status(run: Run) -> str:
         return "pending"
     if s == "planning":
         return "running"
-    if s in ("planned", "confirmed", "applying", "applied"):
+    if s in ("planned", "confirmed", "applying", "canceling", "applied"):
+        # `canceling` only arises from `applying`, by which point the
+        # plan phase is finished — report it accordingly.
         return "finished"
     if s == "errored":
         # Errored during plan phase (plan never finished)
@@ -706,7 +747,10 @@ def _apply_status(run: Run) -> str:
         return "unreachable"
     if s == "confirmed":
         return "pending"
-    if s == "applying":
+    if s in ("applying", "canceling"):
+        # `canceling` is "apply is in flight and being killed". From the
+        # phase-status view it's still running until the reconciler
+        # resolves it to a terminal.
         return "running"
     if s == "applied":
         return "finished"
@@ -790,6 +834,10 @@ def _plan_json(run: Run) -> dict:
         attrs["resource-changes"] = run.resource_changes
         attrs["resource-destructions"] = run.resource_destructions
         attrs["resource-imports"] = run.resource_imports
+    # AI plan summary URL — surfaced as a Terrapod-native link on every
+    # plan response so the UI knows where to fetch the structured
+    # summary. 404s gracefully when no summary exists yet.
+    attrs["ai-summary-url"] = f"{base}/api/terrapod/v1/runs/{run.id}/plan-summary"
     return {
         "data": {
             "id": f"plan-{run.id}",
@@ -816,6 +864,190 @@ async def show_plan_by_id(
     run = await _get_run(plan_id.replace("plan-", "run-"), db)
     await _require_run_ws_permission(run, "read", user, db)
     return JSONResponse(content=_plan_json(run))
+
+
+@extensions_router.get("/runs/{run_id}/plan-summary")
+async def show_plan_summary(
+    run_id: str = Path(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """AI-generated plan summary or failure analysis (#401).
+
+    Terrapod-native — not part of the TFE CLI surface. Lives under
+    ``/api/terrapod/v1/`` alongside the other run extensions.
+
+    Returns 404 when no summary exists yet — the UI uses this as the
+    "not summarised" signal (vs a `pending` row which means "in flight").
+    The response shape is the same for both ``kind`` values; the UI
+    branches on the ``kind`` attribute.
+    """
+    run = await _get_run(run_id, db)
+    await _require_run_ws_permission(run, "read", user, db)
+
+    summary = (
+        await db.execute(select(PlanSummary).where(PlanSummary.run_id == run.id))
+    ).scalar_one_or_none()
+    if summary is None:
+        raise HTTPException(status_code=404, detail="no summary for this plan")
+
+    return JSONResponse(
+        content={
+            "data": {
+                "id": f"plan-summary-{summary.id}",
+                "type": "plan-summaries",
+                "attributes": {
+                    "kind": summary.kind,
+                    "status": summary.status,
+                    "description": summary.description,
+                    "risk-level": summary.risk_level,
+                    "risk-factors": summary.risk_factors,
+                    "model": summary.model,
+                    "input-tokens": summary.input_tokens,
+                    "output-tokens": summary.output_tokens,
+                    "error-message": summary.error_message,
+                    "created-at": _rfc3339(summary.created_at),
+                    "updated-at": _rfc3339(summary.updated_at),
+                },
+                "relationships": {
+                    "plan": {"data": {"id": f"plan-{run.id}", "type": "plans"}},
+                    "run": {"data": {"id": f"run-{run.id}", "type": "runs"}},
+                },
+            }
+        }
+    )
+
+
+def _summary_kind_for_run(run: Run) -> str | None:
+    """Pick the right summariser kind for a run's current state.
+
+    Returns "plan_summary" for runs that produced a plan (any state past
+    `planning` except plan-phase errored), "failure_analysis" for runs
+    that failed during the plan phase, and None when no summary kind
+    applies (still in `pending`/`queued`/`planning`, or apply-phase
+    errored — apply failures aren't part of #401).
+    """
+    if run.status == "errored" and run.plan_started_at and run.apply_started_at is None:
+        return "failure_analysis"
+    if run.status in {"planned", "confirmed", "applying", "applied", "discarded"}:
+        return "plan_summary"
+    return None
+
+
+@extensions_router.post("/runs/{run_id}/plan-summary/regenerate")
+async def regenerate_plan_summary(
+    run_id: str = Path(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """Re-fire the AI summary for an existing run (#401 follow-up).
+
+    Anyone with workspace `read` can regenerate; the call doesn't mutate
+    infrastructure. Cost is centrally gated by `ai_summary.daily_token_budget`.
+
+    The endpoint:
+      • picks `kind` from current run state (plan_summary vs failure_analysis)
+      • upserts the PlanSummary row to status='pending' synchronously
+        so the UI immediately reflects the regenerate
+      • enqueues the same `ai_plan_summary` trigger as the auto-fire path,
+        BYPASSING the 5-min dedup (the user explicitly asked)
+      • returns 202 with the now-pending row
+
+    Returns 409 if the run has no summarisable state (still planning, or
+    apply-phase errored). Returns 503 if AI summary is globally disabled.
+    """
+    from terrapod.config import settings as _settings
+    from terrapod.services.scheduler import enqueue_trigger
+
+    if not _settings.ai_summary.enabled:
+        raise HTTPException(status_code=503, detail="AI summary is disabled globally")
+
+    run = await _get_run(run_id, db)
+    await _require_run_ws_permission(run, "read", user, db)
+
+    kind = _summary_kind_for_run(run)
+    if kind is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"run is in state '{run.status}' — no summary kind applies "
+                "(plan_summary needs a post-plan state; failure_analysis "
+                "needs plan-phase errored)"
+            ),
+        )
+
+    # Upsert to pending so the UI shows feedback immediately. Reuses the
+    # same model field so the operator sees which model is being called.
+    pending_values = {
+        "run_id": run.id,
+        "kind": kind,
+        "status": "pending",
+        "model": _settings.ai_summary.model,
+        "description": "",
+        "risk_level": "",
+        "risk_factors": [],
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "error_message": "",
+    }
+    stmt = pg_insert(PlanSummary).values(**pending_values)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["run_id"],
+        set_={
+            "kind": stmt.excluded.kind,
+            "status": stmt.excluded.status,
+            "model": stmt.excluded.model,
+            "description": stmt.excluded.description,
+            "risk_level": stmt.excluded.risk_level,
+            "risk_factors": stmt.excluded.risk_factors,
+            "input_tokens": stmt.excluded.input_tokens,
+            "output_tokens": stmt.excluded.output_tokens,
+            "error_message": stmt.excluded.error_message,
+            "updated_at": now_utc(),
+        },
+    )
+    await db.execute(stmt)
+    await db.commit()
+
+    # Re-read so we return the fresh row (gives us the id + timestamps).
+    summary = (
+        await db.execute(select(PlanSummary).where(PlanSummary.run_id == run.id))
+    ).scalar_one_or_none()
+
+    # No dedup_key → bypass the 5-min auto-dedup. Operator clicks should
+    # always go through, even when an automatic enqueue happened seconds
+    # ago. Budget gating still applies on the handler side.
+    await enqueue_trigger(
+        "ai_plan_summary",
+        {"run_id": str(run.id), "kind": kind},
+    )
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "data": {
+                "id": f"plan-summary-{summary.id}",
+                "type": "plan-summaries",
+                "attributes": {
+                    "kind": summary.kind,
+                    "status": summary.status,
+                    "description": summary.description,
+                    "risk-level": summary.risk_level,
+                    "risk-factors": summary.risk_factors,
+                    "model": summary.model,
+                    "input-tokens": summary.input_tokens,
+                    "output-tokens": summary.output_tokens,
+                    "error-message": summary.error_message,
+                    "created-at": _rfc3339(summary.created_at),
+                    "updated-at": _rfc3339(summary.updated_at),
+                },
+                "relationships": {
+                    "plan": {"data": {"id": f"plan-{run.id}", "type": "plans"}},
+                    "run": {"data": {"id": f"run-{run.id}", "type": "runs"}},
+                },
+            }
+        },
+    )
 
 
 @extensions_router.get("/runs/{run_id}/plan")
@@ -1189,6 +1421,38 @@ async def report_job_status(
 
     await set_job_status(str(run.id), phase, job_status)
 
+    # When the listener reports a failed Job, it MAY also send the container
+    # exit code + K8s termination reason from the terminated pod (#430). Map
+    # K8s reasons to the typed `runner_exit_status` bucket here — single
+    # mapping point so the reconciler + UI + AI gate all agree.
+    exit_code = body.get("exit_code")
+    reason = body.get("reason", "")
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        run.runner_exit_code = exit_code
+    if isinstance(reason, str) and reason:
+        run.runner_exit_reason = reason[:50]  # column is VARCHAR(50)
+
+    # Compute the typed status from whatever signals we have.
+    # - K8s `OOMKilled` reason is the authoritative OOM signal.
+    # - Exit 137 without an explicit reason (pod GC'd before we observed)
+    #   is "killed" — could be OOM, could be eviction, can't be sure.
+    # - Other non-zero exits are "error".
+    # - Exit 0 is "clean" (runner script exited cleanly, plan flow finished).
+    # Only set runner_exit_status when we have a definitive signal — leaving
+    # it "" means "pre-feature run / status unknown" and the UI shows no
+    # banner.
+    if reason == "OOMKilled":
+        run.runner_exit_status = "oom"
+    elif isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        if exit_code == 137:
+            run.runner_exit_status = "killed"
+        elif exit_code != 0:
+            run.runner_exit_status = "error"
+        else:
+            run.runner_exit_status = "clean"
+
+    await db.commit()
+
     return JSONResponse(content={"status": "ok"})
 
 
@@ -1428,12 +1692,24 @@ async def _serve_log(
     1. Object storage (authoritative — final log uploaded by Job on completion)
     2. Redis live stream (live-streamed data from listener during execution)
     3. Empty response (no data available yet — client retries)
+
+    ETX (end-of-log sentinel that tells the UI to stop polling) is appended
+    ONLY when the data came from object storage. The Redis live-stream
+    snapshot is inherently incomplete — the runner uploads the
+    authoritative log to storage from its EXIT trap, which fires AFTER it
+    POSTs plan-result and the run transitions to terminal. If we appended
+    ETX on the Redis path the moment `phase_done` flipped true, the UI
+    would stop polling before the EXIT trap landed the trailing bytes
+    (typically the entrypoint's `PLAN_HAS_CHANGES=...` line and post-plan
+    OPA output). The user then has to refresh to see the tail.
     """
     storage = get_storage()
     phase_done = run.status in phase_complete_states
+    from_storage = False
 
     try:
         data = await storage.get(log_key)
+        from_storage = True
     except ObjectNotFoundError:
         # Try live-streamed data from Redis (available for both in-progress
         # and recently-completed runs where the Job didn't upload final logs)
@@ -1447,7 +1723,8 @@ async def _serve_log(
                     live_data = live_data.encode()
                 data = live_data
             elif phase_done:
-                # Phase finished, no log in storage or Redis — empty stream
+                # Phase finished and neither storage nor Redis has anything —
+                # nothing more is ever coming. Send ETX so the UI gives up.
                 return Response(content=_STX + _ETX, media_type="text/plain")
             else:
                 # Still running, no log yet — return empty (client retries)
@@ -1468,7 +1745,10 @@ async def _serve_log(
     if offset == 0:
         result += _STX
     result += chunk
-    # Append ETX if phase is done and this is the last chunk
-    if phase_done and (limit == 0 or offset + limit >= len(data)):
+    # Append ETX only when serving from storage (authoritative final log)
+    # AND the client has consumed everything. Redis-served data can be a
+    # mid-flight snapshot even when phase_done is true; closing the stream
+    # there truncates the visible log.
+    if from_storage and phase_done and (limit == 0 or offset + limit >= len(data)):
         result += _ETX
     return Response(content=result, media_type="text/plain")

@@ -81,7 +81,16 @@ async def reconcile_runs() -> None:
        this cohort so failures surface in minutes, not hours.
     """
     async with get_db_session() as db:
-        result = await db.execute(select(Run).where(Run.status.in_(["planning", "applying"])))
+        # `canceling` joins planning/applying here: it's the intermediate
+        # state entered when a user cancels an in-flight apply. The
+        # reconciler waits for the listener's Job-status report (the
+        # listener deletes the K8s Job on receiving cancel_job; the next
+        # check_job_status reports "deleted") and then resolves the
+        # canceling run to applied/canceled/errored based on whether a
+        # state-version was actually uploaded.
+        result = await db.execute(
+            select(Run).where(Run.status.in_(["planning", "applying", "canceling"]))
+        )
         runs = list(result.scalars().all())
 
         if not runs:
@@ -104,6 +113,8 @@ async def _reconcile_one(db: AsyncSession, run: Run) -> None:
     """Reconcile a single run."""
     from terrapod.redis.client import get_job_status_from_redis, publish_listener_event
 
+    # `canceling` was entered from `applying`, so the Job that may need
+    # resolution is the apply Job — `phase` follows the same mapping.
     phase = "plan" if run.status == "planning" else "apply"
 
     # If no Job has been launched yet (listener never POSTed job-launched),
@@ -151,10 +162,71 @@ async def _reconcile_one(db: AsyncSession, run: Run) -> None:
     if status == "running":
         return  # Still running, no-op
 
+    # `canceling` resolution is keyed on the Job-completion signal AND
+    # whether a state-version was uploaded by this run; both branches
+    # of the normal-path handlers (succeeded → applied, failed →
+    # errored) would skip the StateVersion check and the
+    # state_diverged signalling.
+    if run.status == "canceling":
+        from terrapod.services import run_service
+
+        await _persist_live_log_if_missing(run, phase)
+        await run_service.resolve_canceling_run(db, run, job_status=status)
+        return
+
     if status == "succeeded":
         await _handle_succeeded(db, run)
     elif status in ("failed", "deleted"):
-        await _handle_failed(db, run, f"Job {status}")
+        # Typed OOM message when the listener captured the K8s
+        # terminated reason (#430). runner_exit_status is set by
+        # report_job_status; we just read it here.
+        await _handle_failed(db, run, _build_failure_message(run, status))
+
+
+def _build_failure_message(run: Run, status: str) -> str:
+    """Render a typed error message from runner_exit_status when set.
+
+    When the listener captured a K8s container-terminated `reason`, the
+    job-status endpoint sets `run.runner_exit_status` to one of:
+        "oom"    — reason == "OOMKilled"
+        "killed" — exit 137 with no explicit reason (could be OOM,
+                   could be eviction; we can't tell after pod GC)
+        "error"  — non-zero exit, not 137
+        "clean"  — exit 0 (shouldn't reach here since status==failed)
+    Returns a human-readable message naming the cause and pointing at
+    the actionable knob (resource_memory bump for OOM).
+    """
+    if run.runner_exit_status == "oom":
+        peak_h = _human_bytes(run.peak_memory_bytes) if run.peak_memory_bytes else None
+        if peak_h:
+            return (
+                f"Runner OOM-killed (peak memory {peak_h}). "
+                f"Workspace resource_memory is {run.resource_memory}; "
+                f"limit is 2× that. Increase resource_memory + retry."
+            )
+        return (
+            f"Runner OOM-killed (workspace resource_memory={run.resource_memory}, "
+            f"limit is 2× that). Increase resource_memory + retry."
+        )
+    if run.runner_exit_status == "killed":
+        return (
+            "Runner killed (SIGKILL, exit 137) without an explicit K8s reason. "
+            "Most likely OOM — check the workspace's resource_memory; could "
+            "also be a node-level eviction."
+        )
+    if run.runner_exit_status == "error" and run.runner_exit_code is not None:
+        return f"Runner exited with code {run.runner_exit_code}"
+    # Fall back to the generic message — matches pre-#430 behaviour.
+    return f"Job {status}"
+
+
+def _human_bytes(n: int) -> str:
+    """Render a byte count as a short human string. Matches K8s convention
+    (Gi/Mi/Ki for binary units; matches values shown in resource_memory)."""
+    for unit, scale in (("Gi", 1 << 30), ("Mi", 1 << 20), ("Ki", 1 << 10)):
+        if n >= scale:
+            return f"{n / scale:.2f} {unit}"
+    return f"{n} B"
 
 
 async def _handle_succeeded(db: AsyncSession, run: Run) -> None:

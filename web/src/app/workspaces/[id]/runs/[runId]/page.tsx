@@ -9,6 +9,8 @@ import { PageHeader } from '@/components/page-header'
 import { LoadingSpinner } from '@/components/loading-spinner'
 import { ErrorBanner } from '@/components/error-banner'
 import { PlanSummaryBadges } from '@/components/plan-summary-badges'
+import { PlanAiSummary } from '@/components/plan-ai-summary'
+import { ResourceUsage } from '@/components/resource-usage'
 import { getAuthState, isAdmin } from '@/lib/auth'
 import { apiFetch } from '@/lib/api'
 import { useRunEvents } from '@/lib/use-run-events'
@@ -52,6 +54,13 @@ interface RunAttrs {
   'module-overrides': Record<string, string> | null
   'status-timestamps': Record<string, string>
   'created-by': string
+  'resource-cpu': string
+  'resource-memory': string
+  'peak-memory-bytes': number | null
+  'peak-cpu-usec': number | null
+  'runner-exit-code': number | null
+  'runner-exit-reason': string
+  'runner-exit-status': string
   actions: RunActions
   permissions: Record<string, boolean>
 }
@@ -316,6 +325,10 @@ export default function RunDetailPage() {
   const [applyHtml, setApplyHtml] = useState('')
   const [planLogLoading, setPlanLogLoading] = useState(false)
   const [applyLogLoading, setApplyLogLoading] = useState(false)
+  // Bumped when the SSE `plan_summary_ready` event arrives so the
+  // PlanAiSummary component refetches without forcing the whole run to
+  // reload.
+  const [aiSummaryRefresh, setAiSummaryRefresh] = useState(0)
 
   // Offset tracking for incremental log fetching (byte position in raw log data)
   const planLogOffset = useRef(0)
@@ -368,16 +381,19 @@ export default function RunDetailPage() {
       if (event.phase === 'plan') loadPlanLog()
       else if (event.phase === 'apply') loadApplyLog()
     }
+    if (event.event === 'plan_summary_ready' && event.run_id === bareId) {
+      setAiSummaryRefresh((n) => n + 1)
+    }
   }, [runId, loadRun]))
 
   useEffect(() => {
     if (!run) return
     const status = run.attributes.status
-    if (['planning', 'planned', 'confirmed', 'applying', 'applied', 'errored', 'canceled', 'discarded'].includes(status)) {
+    if (['planning', 'planned', 'confirmed', 'applying', 'canceling', 'applied', 'errored', 'canceled', 'discarded'].includes(status)) {
       setPlanLogLoading(prev => planLog === null ? true : prev)
       loadPlanLog(true).finally(() => setPlanLogLoading(false))
     }
-    if (['applying', 'applied', 'errored'].includes(status) && !run.attributes['plan-only']) {
+    if (['applying', 'canceling', 'applied', 'errored'].includes(status) && !run.attributes['plan-only']) {
       setApplyLogLoading(prev => applyLog === null ? true : prev)
       loadApplyLog(true).finally(() => setApplyLogLoading(false))
     }
@@ -514,7 +530,7 @@ export default function RunDetailPage() {
     switch (status) {
       case 'applied': return 'bg-green-900/50 text-green-300'
       case 'planned': case 'confirmed': return 'bg-blue-900/50 text-blue-300'
-      case 'planning': case 'applying': case 'queued': return 'bg-yellow-900/50 text-yellow-300'
+      case 'planning': case 'applying': case 'canceling': case 'queued': return 'bg-yellow-900/50 text-yellow-300'
       case 'errored': return 'bg-red-900/50 text-red-300'
       case 'canceled': case 'discarded': return 'bg-slate-700 text-slate-400'
       case 'pending': return 'bg-slate-700 text-slate-300'
@@ -612,6 +628,20 @@ export default function RunDetailPage() {
           </div>
         )}
 
+        {/* Resource usage panel (#430) — peak memory/CPU alongside the
+            workspace's requested/limit, plus an OOM tag when the
+            listener observed an OOMKilled / exit-137 termination. The
+            ResourceUsage component returns null when no peak data is
+            present (pre-#430 runs), so this block is safe to render
+            unconditionally for new runs. */}
+        <div className="mb-6">
+          <ResourceUsage
+            resourceMemory={attrs['resource-memory']}
+            peakMemoryBytes={attrs['peak-memory-bytes']}
+            runnerExitStatus={attrs['runner-exit-status']}
+          />
+        </div>
+
         {/* OPA policy evaluations (#343) */}
         <PolicyPanel runId={runId} runStatus={attrs.status} onChanged={loadRun} />
 
@@ -683,6 +713,10 @@ export default function RunDetailPage() {
             )}
           </div>
         )}
+
+        {/* AI plan summary / failure analysis (#401) — renders nothing
+            when the feature is off or no row exists for this plan. */}
+        <PlanAiSummary runId={runId.replace(/^run-/, '')} refreshKey={aiSummaryRefresh} />
 
         {/* Run metadata */}
         <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 p-6 mb-6">

@@ -28,14 +28,16 @@ gcloud-aio-storage = "^9.6.4"
 sqlalchemy = {extras = ["asyncio"], version = "^2.0"}
 asyncpg = "^0.31.0"
 alembic = "^1.14.0"
+# HCL parsing (module interface extraction)
+python-hcl2 = "^7.0.0"
 # Redis
-redis = "^7.4.0"
+redis = ">=7.4,<9.0"
 # Auth
 authlib = "^1.4.0"
 python3-saml = "^1.16.0"
 cryptography = ">=46.0.5,<49.0.0"
 zxcvbn = "^4.4.28"
-python-multipart = ">=0.0.26,<0.0.30"
+python-multipart = ">=0.0.26,<0.0.31"
 # Kubernetes (runner listener)
 kubernetes = ">=35,<37"
 # GPG key parsing for provider registry
@@ -50,6 +52,31 @@ sse-starlette = "^3.3.2"
 prometheus-client = ">=0.24,<0.26"
 # imghdr removed in Python 3.13; pgpy still imports it
 standard-imghdr = "^3.13"
+# LiteLLM SDK for the AI plan-summary feature (#401). One library, every
+# major provider — Bedrock (native Converse + IAM auth via boto3),
+# OpenAI, Anthropic direct, Gemini, Azure OpenAI, vLLM, etc. Terrapod
+# speaks OpenAI Chat Completions request shape to LiteLLM; LiteLLM
+# handles per-provider request translation and auth in-process.
+#
+# Upper bound <2.0 is the standard major-version cap. The lower bound
+# is 1.83.7, which patches three proxy-mode CVEs (CVE-2026-42203,
+# CVE-2026-42208, CVE-2026-42271) — all proxy-only and not reachable
+# from how Terrapod uses litellm (library-only via acompletion(),
+# proxy never started), but tightening the floor keeps the resolver
+# off the older line.
+#
+# We can't push the floor past 1.83.x to clear CVE-2026-40217 (also
+# proxy-mode, patched in 1.83.11+): every release from 1.83.11 onwards
+# pins Python <3.14, and our API image is on 3.14. Re-checked
+# 2026-06-04: latest 1.87.0 still requires_python = <3.14.
+#
+# We also can't directly bump python-dotenv past 1.0.1 to clear
+# CVE-2026-28684: litellm 1.83.7+ pins python-dotenv==1.0.1 exactly,
+# so a >=1.2.2 floor on dotenv would force the resolver back to
+# litellm 1.83.0 (which has CVEs 42203/42208/42271 unpatched —
+# strictly worse). Tracked together with CVE-2026-40217 — both
+# clear when litellm restores 3.14 compatibility.
+litellm = ">=1.83.7,<2.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.2"
