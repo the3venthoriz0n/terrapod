@@ -2,7 +2,7 @@
 # Minimal image for Alembic database migrations.
 # Only includes SQLAlchemy, asyncpg, and alembic.
 
-FROM python:3.14-slim AS builder
+FROM python:3.13-slim AS builder
 
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     pkg-config \
@@ -15,7 +15,7 @@ COPY services/pyproject-migrations.toml pyproject.toml
 RUN pip install --no-cache-dir .
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
-FROM python:3.14-slim
+FROM python:3.13-slim
 LABEL org.opencontainers.image.source=https://github.com/mattrobinsonsre/terrapod
 
 # Pick up post-publish Debian security patches. Bump APT_REFRESH to
@@ -28,7 +28,7 @@ RUN echo "apt-refresh=${APT_REFRESH}" \
 WORKDIR /app
 
 # Copy installed Python packages from builder
-COPY --from=builder /usr/local/lib/python3.14/site-packages /usr/local/lib/python3.14/site-packages
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Only the modules needed for migrations: db models + alembic config
