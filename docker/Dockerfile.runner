@@ -43,7 +43,7 @@ RUN echo "apt-refresh=${APT_REFRESH}" \
 # TARGETARCH is set by buildx; fall back to dpkg --print-architecture for
 # plain `docker build`.
 ARG TARGETARCH
-ARG OPA_VERSION=1.16.2
+ARG OPA_VERSION=1.17.0
 RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
     && BASE="https://github.com/open-policy-agent/opa/releases/download/v${OPA_VERSION}" \
     && curl -fsSL -o /usr/local/bin/opa "${BASE}/opa_linux_${ARCH}_static" \
@@ -62,6 +62,7 @@ WORKDIR /app
 COPY services/terrapod/runner/__init__.py ./terrapod/runner/__init__.py
 COPY services/terrapod/runner/runner_config.py ./terrapod/runner/runner_config.py
 COPY services/terrapod/runner/download.py ./terrapod/runner/download.py
+COPY services/terrapod/runner/exec_subprocess.py ./terrapod/runner/exec_subprocess.py
 COPY services/terrapod/runner/job_entrypoint.py ./terrapod/runner/job_entrypoint.py
 COPY services/terrapod/runner/phases/ ./terrapod/runner/phases/
 
