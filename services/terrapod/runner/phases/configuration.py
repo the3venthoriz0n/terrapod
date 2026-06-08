@@ -142,7 +142,13 @@ def download_configuration(
     if not cfg.has_api:
         return ConfigurationResult(downloaded=False, strip_dir=strip_dir)
 
-    tarball = work_dir.parent / "config.tar.gz"
+    # /tmp matches every other scratch artifact this orchestrator
+    # writes (combined.log, plan.log, apply.log, plan.json,
+    # terraform.rc, opa work dir) and matches the original bash
+    # entrypoint. The previous bug was that this site computed
+    # `work_dir.parent` which resolved to `/` for the default
+    # WORK_DIR of `/workspace` — not writable for uid 1000.
+    tarball = Path("/tmp") / "config.tar.gz"
     headers = {"Authorization": f"Bearer {cfg.auth_token}"} if cfg.auth_token else {}
 
     logger.info("downloading configuration tarball", run_id=cfg.run_id)

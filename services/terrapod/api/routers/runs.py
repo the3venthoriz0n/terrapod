@@ -922,12 +922,11 @@ def _summary_kind_for_run(run: Run) -> str | None:
     """Pick the right summariser kind for a run's current state.
 
     Returns "plan_summary" for runs that produced a plan (any state past
-    `planning` except plan-phase errored), "failure_analysis" for runs
-    that failed during the plan phase, and None when no summary kind
-    applies (still in `pending`/`queued`/`planning`, or apply-phase
-    errored — apply failures aren't part of #401).
+    `planning` except errored), "failure_analysis" for runs that
+    errored during EITHER plan or apply (#419), and None when no
+    summary kind applies (still in `pending`/`queued`/`planning`).
     """
-    if run.status == "errored" and run.plan_started_at and run.apply_started_at is None:
+    if run.status == "errored" and run.plan_started_at:
         return "failure_analysis"
     if run.status in {"planned", "confirmed", "applying", "applied", "discarded"}:
         return "plan_summary"
@@ -1495,7 +1494,13 @@ async def upload_log_stream(
     )
 
     redis = get_redis_client()
-    await redis.setex(f"{LOG_STREAM_PREFIX}{run.id}:{phase}", 300, body_bytes)
+    # decode_responses=True on the Redis client means a bytes value
+    # going through SETEX gets stringified via str(bytes) — yielding
+    # the literal `b'…\\n…'` text. Decode to UTF-8 str so the value
+    # round-trips cleanly. errors=replace covers any stray non-UTF-8
+    # bytes (e.g. from a stack-trace's escape sequence).
+    body_text = body_bytes.decode("utf-8", errors="replace")
+    await redis.setex(f"{LOG_STREAM_PREFIX}{run.id}:{phase}", 300, body_text)
 
     # Notify frontend that fresh log data is available
     try:

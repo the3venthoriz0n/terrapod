@@ -13,6 +13,7 @@ Cache layers:
     Created when a runner downloads a specific platform via the proxy endpoint.
 """
 
+import asyncio
 import json
 from datetime import UTC, datetime
 
@@ -109,6 +110,13 @@ async def get_or_fetch_platforms(
     For a mix of cached and uncached platforms, cached platforms get presigned
     URLs and uncached platforms get proxy URLs (from Redis metadata).
     """
+    # The operator's eager-cache config — surfaced in every response so
+    # the runner's lock extender can distinguish "deliberate skip" from
+    # "compute failed" when no h1 is present for a given platform.
+    configured_platforms: set[str] = {
+        f"{p['os']}_{p['arch']}" for p in settings.registry.provider_cache.platforms
+    }
+
     # --- Tier 1: check Postgres for cached binaries ---
     result = await db.execute(
         select(CachedProviderPackage).where(
@@ -149,6 +157,39 @@ async def get_or_fetch_platforms(
                 "url": presigned.url,
                 "hashes": [f"zh:{entry.shasum}"],
             }
+            # h1 backfill: cache entries from before h1 tracking (or
+            # ones whose h1 compute failed at ingest) have empty
+            # h1_hash. The runner's lock-extender (and the apply-phase
+            # init reusing a plan-phase lock) needs h1 — without it
+            # they fall back to a full `tofu providers lock` archive
+            # download, defeating the mirror. Compute h1 once from the
+            # cached archive bytes, persist, and serve from then on.
+            if not entry.h1_hash:
+                try:
+                    archive_bytes = await storage.get(key)
+                    entry.h1_hash = await asyncio.to_thread(
+                        _compute_h1_from_zip_bytes, archive_bytes
+                    )
+                    # removeprefix matches the format stored at ingest.
+                    entry.h1_hash = entry.h1_hash.removeprefix("h1:")
+                    logger.info(
+                        "backfilled h1 for cached provider",
+                        hostname=hostname,
+                        provider=f"{namespace}/{type_}",
+                        version=version,
+                        platform=platform_key,
+                    )
+                except Exception:
+                    # Best-effort. On failure, the runner falls back to
+                    # `providers lock` for this provider — same as today.
+                    logger.warning(
+                        "h1 backfill failed; runner will fall back to providers lock",
+                        hostname=hostname,
+                        provider=f"{namespace}/{type_}",
+                        version=version,
+                        platform=platform_key,
+                        exc_info=True,
+                    )
             if entry.h1_hash:
                 archive["hashes"].append(f"h1:{entry.h1_hash}")
             archives[platform_key] = archive
@@ -166,6 +207,12 @@ async def get_or_fetch_platforms(
     else:
         PROVIDER_CACHE_REQUESTS.labels(result="miss").inc()
 
+    def _resp() -> dict:
+        return {
+            "archives": archives,
+            "cached_platforms": sorted(configured_platforms),
+        }
+
     # --- Tier 2: check Redis for upstream metadata ---
     meta = await _get_cached_metadata(hostname, namespace, type_, version)
 
@@ -173,37 +220,41 @@ async def get_or_fetch_platforms(
         # --- Tier 3: fetch from upstream and cache in Redis ---
         cfg = settings.registry.provider_cache
         if not cfg.warm_on_first_request:
-            return {"archives": archives} if archives else {"archives": {}}
+            return _resp()
 
         if hostname not in cfg.upstream_registries:
-            return {"archives": archives} if archives else {"archives": {}}
+            return _resp()
 
         meta = await _fetch_and_cache_upstream_metadata(hostname, namespace, type_, version)
 
     if meta is None:
-        return {"archives": archives} if archives else {"archives": {}}
+        return _resp()
 
     # For uncached platforms: eagerly cache platforms matching the configured
     # filter (returning presigned storage URLs), and return upstream direct
     # download URLs for all others (no auth needed — public registries).
-    configured_platforms = {
-        f"{p['os']}_{p['arch']}" for p in settings.registry.provider_cache.platforms
-    }
 
     for platform_key, platform_meta in meta.items():
         if platform_key in cached_platforms:
             continue  # Already have presigned URL from tier 1
 
         if platform_key in configured_platforms:
-            # Eagerly cache and return presigned URL
+            # Eagerly cache and return presigned URL. Include h1 in the
+            # response if the fetch computed one — without this the
+            # runner's lock extender sees the other-arch entry as
+            # zh-only and falls back to a full `tofu providers lock`
+            # archive download (defeating the whole point of caching).
             os_, arch = platform_key.split("_", 1)
             try:
-                url = await fetch_and_cache_single_platform(
+                url, h1 = await fetch_and_cache_single_platform(
                     db, storage, hostname, namespace, type_, version, os_, arch
                 )
+                hashes = [f"zh:{platform_meta['shasum']}"]
+                if h1:
+                    hashes.append(f"h1:{h1}")
                 archives[platform_key] = {
                     "url": url,
-                    "hashes": [f"zh:{platform_meta['shasum']}"],
+                    "hashes": hashes,
                 }
             except Exception:
                 logger.warning(
@@ -225,7 +276,7 @@ async def get_or_fetch_platforms(
                 "hashes": [f"zh:{platform_meta['shasum']}"],
             }
 
-    return {"archives": archives}
+    return _resp()
 
 
 def _compute_h1_from_zip_bytes(data: bytes) -> str:
@@ -266,8 +317,10 @@ async def fetch_and_cache_single_platform(
     version: str,
     os_: str,
     arch: str,
-) -> str:
-    """Fetch a single platform binary from upstream, cache it, return presigned URL.
+) -> tuple[str, str]:
+    """Fetch a single platform binary from upstream, cache it, return
+    (presigned URL, h1 hash with `h1:` prefix-stripped — empty if compute
+    failed).
 
     Called by the download proxy endpoint when a runner requests a specific
     platform that hasn't been cached yet.
@@ -409,7 +462,7 @@ async def fetch_and_cache_single_platform(
         )
 
     presigned = await storage.presigned_get_url(key)
-    return presigned.url
+    return presigned.url, h1_hash_raw
 
 
 async def get_cached_platform(
