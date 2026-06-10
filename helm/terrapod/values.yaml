@@ -297,11 +297,25 @@ api:
     ai_summary:
       enabled: false
       # LiteLLM model string. Examples:
+      #   bedrock/us.anthropic.claude-sonnet-4-6  (default — recommended for chat)
       #   bedrock/anthropic.claude-opus-4-8
       #   openai/gpt-5
       #   anthropic/claude-opus-4-8
       #   gemini/gemini-2.5-pro
-      model: ""
+      #
+      # The default targets Anthropic Sonnet 4.6 on Bedrock — chosen
+      # because it supports Bedrock prompt caching (chat follow-ups
+      # are ~10% the input-token cost of fresh requests), is in the
+      # recommended-for-chat tier (multi-turn coherence proven), and
+      # is ~5× cheaper than Opus while better at JSON-schema
+      # compliance for the structured tool calls. `enabled: false`
+      # remains the chart default so the feature is still
+      # double-opt-in; setting a sensible model just means operators
+      # don't ALSO have to look one up.
+      #
+      # See `docs/ai-plan-summary.md#choosing-a-model-for-chat` for
+      # the full recommended tier when picking a different provider.
+      model: "bedrock/us.anthropic.claude-sonnet-4-6"
       # Optional base URL override (vLLM, LiteLLM proxy, custom Azure).
       # Leave empty for vendor providers — LiteLLM knows the defaults.
       api_base: ""
@@ -314,6 +328,16 @@ api:
       request_timeout_seconds: 60
       # Output-token cap per UTC day across all summaries. 0 = unlimited.
       daily_token_budget: 0
+      # Follow-up chat (#463). Per-run cap on USER turns — once an
+      # operator has posted this many follow-ups on a single run,
+      # the UI disables the chat input. Set to 0 to disable the
+      # chat feature entirely (initial summary still fires).
+      followup_max_messages_per_run: 20
+      # Output-token cap per follow-up reply. Smaller than
+      # max_output_tokens because follow-ups are conversational,
+      # not full re-summaries. Bump only if operators routinely
+      # hit `finish_reason=length` on detailed answers.
+      followup_max_output_tokens: 2048
       # Size caps on the inputs attached to the model request.
       plan_json_max_bytes: 500000
       code_context_max_bytes: 200000
