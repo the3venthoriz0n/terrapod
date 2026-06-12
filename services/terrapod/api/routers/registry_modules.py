@@ -32,7 +32,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from terrapod.api.dependencies import AuthenticatedUser, get_current_user, require_non_runner
+from terrapod.api.dependencies import (
+    AuthenticatedUser,
+    effective_platform_roles,
+    get_current_user,
+    require_non_runner,
+)
 from terrapod.api.labels import validate_labels
 from terrapod.db.models import ModuleWorkspaceLink, RegistryModuleVersion, Workspace
 from terrapod.db.session import get_db
@@ -50,7 +55,7 @@ from terrapod.services.registry_module_service import (
 from terrapod.services.registry_rbac_service import (
     REGISTRY_PERMISSION_HIERARCHY,
     has_registry_permission,
-    resolve_registry_permission,
+    resolve_registry_permission_for,
 )
 from terrapod.storage import get_storage
 from terrapod.storage.protocol import ObjectStore
@@ -182,14 +187,12 @@ async def list_module_versions_cli(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    perm = await resolve_registry_permission_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
     if not has_registry_permission(perm, "read"):
         raise HTTPException(status_code=404, detail="Module not found")
@@ -219,14 +222,12 @@ async def download_module_cli(
     """Get download URL for a module version (CLI protocol). Requires read."""
     module = await get_module(db, namespace, name, provider)
     if module is not None:
-        perm = await resolve_registry_permission(
+        perm = await resolve_registry_permission_for(
             db,
-            user.email,
-            user.roles,
+            user,
             module.name,
             module.labels or {},
             module.owner_email,
-            auth_method=user.auth_method,
         )
         if not has_registry_permission(perm, "read"):
             raise HTTPException(status_code=404, detail="Module version not found")
@@ -315,14 +316,12 @@ async def list_modules_endpoint(
     modules = await list_modules(db)
     visible = []
     for m in modules:
-        perm = await resolve_registry_permission(
+        perm = await resolve_registry_permission_for(
             db,
-            user.email,
-            user.roles,
+            user,
             m.name,
             m.labels or {},
             m.owner_email,
-            auth_method=user.auth_method,
         )
         if perm is not None:
             visible.append(_module_to_jsonapi(m, perm))
@@ -341,14 +340,12 @@ async def show_module_endpoint(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    perm = await resolve_registry_permission_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
     if not has_registry_permission(perm, "read"):
         raise HTTPException(status_code=404, detail="Module not found")
@@ -374,14 +371,12 @@ async def module_interface_endpoint(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    perm = await resolve_registry_permission_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
     if not has_registry_permission(perm, "read"):
         raise HTTPException(status_code=404, detail="Module not found")
@@ -424,14 +419,12 @@ async def delete_module_endpoint(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    perm = await resolve_registry_permission_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
     if not has_registry_permission(perm, "admin"):
         raise HTTPException(
@@ -460,14 +453,12 @@ async def update_module_endpoint(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    perm = await resolve_registry_permission_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
     if not has_registry_permission(perm, "admin"):
         raise HTTPException(
@@ -478,7 +469,7 @@ async def update_module_endpoint(
     attrs = body.get("data", {}).get("attributes", {})
 
     if "owner-email" in attrs:
-        if "admin" not in user.roles:
+        if "admin" not in effective_platform_roles(user):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only platform admins can change owner",
@@ -493,17 +484,15 @@ async def update_module_endpoint(
         if (
             new_labels != (module.labels or {})
             and not attrs.get("force")
-            and "admin" not in user.roles
+            and "admin" not in effective_platform_roles(user)
             and module.owner_email != user.email
         ):
-            new_perm = await resolve_registry_permission(
+            new_perm = await resolve_registry_permission_for(
                 db,
-                user.email,
-                user.roles,
+                user,
                 module.name,
                 new_labels,
                 module.owner_email,
-                auth_method=user.auth_method,
             )
             if new_perm is None or REGISTRY_PERMISSION_HIERARCHY.get(
                 new_perm, -1
@@ -575,14 +564,12 @@ async def create_module_version_endpoint(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    perm = await resolve_registry_permission_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
     if not has_registry_permission(perm, "write"):
         raise HTTPException(
@@ -633,14 +620,12 @@ async def delete_module_version_endpoint(
     """Delete a specific module version. Requires admin on module."""
     module = await get_module(db, "default", name, provider)
     if module is not None:
-        perm = await resolve_registry_permission(
+        perm = await resolve_registry_permission_for(
             db,
-            user.email,
-            user.roles,
+            user,
             module.name,
             module.labels or {},
             module.owner_email,
-            auth_method=user.auth_method,
         )
         if not has_registry_permission(perm, "admin"):
             raise HTTPException(
@@ -676,14 +661,12 @@ async def upload_module_version_endpoint(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    perm = await resolve_registry_permission_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
     if not has_registry_permission(perm, "write"):
         raise HTTPException(
@@ -755,14 +738,12 @@ async def update_module_vcs_endpoint(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    perm = await resolve_registry_permission_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
     if not has_registry_permission(perm, "admin"):
         raise HTTPException(
@@ -849,14 +830,12 @@ async def list_workspace_links(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    perm = await resolve_registry_permission_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
     if not has_registry_permission(perm, "read"):
         raise HTTPException(status_code=404, detail="Module not found")
@@ -884,14 +863,12 @@ async def create_workspace_link(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    perm = await resolve_registry_permission_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
     if not has_registry_permission(perm, "admin"):
         raise HTTPException(
@@ -957,14 +934,12 @@ async def delete_workspace_link(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    perm = await resolve_registry_permission_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
     if not has_registry_permission(perm, "admin"):
         raise HTTPException(

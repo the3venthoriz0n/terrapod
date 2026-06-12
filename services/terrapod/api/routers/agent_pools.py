@@ -34,6 +34,7 @@ from terrapod.api.dependencies import (
     DEFAULT_ORG,
     AuthenticatedUser,
     ListenerIdentity,
+    effective_platform_roles,
     get_current_user,
     get_listener_identity,
     require_admin,
@@ -46,7 +47,7 @@ from terrapod.services.pool_rbac_service import (
     POOL_PERMISSION_HIERARCHY,
     fetch_custom_roles,
     has_pool_permission,
-    resolve_pool_permission,
+    resolve_pool_permission_for,
 )
 
 router = APIRouter(tags=["agent-pools"])
@@ -237,10 +238,9 @@ async def _require_pool_permission(
     Returns the effective permission. Raises 404 if no access, 403 if
     insufficient.
     """
-    perm = await resolve_pool_permission(
+    perm = await resolve_pool_permission_for(
         db,
-        user_email=user.email,
-        user_roles=user.roles,
+        user,
         pool_name=pool.name,
         pool_labels=pool.labels or {},
         owner_email=pool.owner_email or "",
@@ -266,10 +266,9 @@ async def list_pools(
     custom_roles = await fetch_custom_roles(db, user.roles)
     result = []
     for p in pools:
-        perm = await resolve_pool_permission(
+        perm = await resolve_pool_permission_for(
             db,
-            user_email=user.email,
-            user_roles=user.roles,
+            user,
             pool_name=p.name,
             pool_labels=p.labels or {},
             owner_email=p.owner_email or "",
@@ -355,14 +354,13 @@ async def update_pool(
 
     # Self-lockout check: warn if label/owner change would reduce user's access.
     # Platform admins are immune (their access doesn't depend on labels/owner).
-    if "admin" not in set(user.roles) and not attrs.get("force"):
+    if "admin" not in effective_platform_roles(user) and not attrs.get("force"):
         new_labels = labels_arg if labels_arg is not _UNSET else (pool.labels or {})
         new_owner = (owner_arg or None) if owner_arg is not _UNSET else pool.owner_email
         if new_labels != (pool.labels or {}) or new_owner != pool.owner_email:
-            new_perm = await resolve_pool_permission(
+            new_perm = await resolve_pool_permission_for(
                 db,
-                user_email=user.email,
-                user_roles=user.roles,
+                user,
                 pool_name=attrs.get("name") or pool.name,
                 pool_labels=new_labels,
                 owner_email=new_owner or "",
@@ -688,13 +686,13 @@ async def delete_listener(
     pool_id_str = listener.get("pool_id", "")
     if not pool_id_str:
         # Orphaned listener — require platform admin to clean up
-        if "admin" not in set(user.roles):
+        if "admin" not in effective_platform_roles(user):
             raise HTTPException(status_code=403, detail="Admin access required")
     else:
         pool = await agent_pool_service.get_pool(db, uuid.UUID(pool_id_str))
         if pool is None:
             # Pool deleted but listener Redis key persists — require platform admin
-            if "admin" not in set(user.roles):
+            if "admin" not in effective_platform_roles(user):
                 raise HTTPException(status_code=403, detail="Admin access required")
         else:
             await _require_pool_permission(pool, user, db, "admin")

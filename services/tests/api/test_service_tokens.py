@@ -91,18 +91,47 @@ async def test_create_service_bound(mock_create, *_):
     assert attrs["kind"] == "service_bound"
     assert attrs["token"] == "raw.tpod.secret"
     assert attrs["bound-to"] == "dev@example.com"
+    # The pinned scope is surfaced so the tokens UI can display it (#495).
+    assert attrs["pinned-roles"] == ["plan-only"]
 
 
 @_app_patched
-async def test_create_detached_gated_422(*_):
-    app = _make_app(_user(roles=["admin"]))
+async def test_create_detached_non_admin_403(*_):
+    # Detached tokens are admin-only and unbound; a non-admin is refused.
+    app = _make_app(_user())  # no admin role
     async with _client(app) as c:
         r = await c.post(
             "/api/terrapod/v1/users/dev/authentication-tokens",
             json={"data": {"attributes": {"kind": "service_detached"}}},
             headers={"Authorization": "Bearer x"},
         )
-    assert r.status_code == 422
+    assert r.status_code == 403
+
+
+@_app_patched
+@patch("terrapod.api.routers.tokens.create_api_token")
+async def test_create_detached_admin_unbound(mock_create, *_):
+    # An admin CAN create a detached token; it is unbound (bound-to null) and
+    # carries the pinned scope the admin specified.
+    mock_create.return_value = (
+        _token_mock(kind="service_detached", bound_to=None, pinned_roles=["deployer"]),
+        "raw.tpod.secret",
+    )
+    app = _make_app(_user(roles=["admin"]))
+    async with _client(app) as c:
+        r = await c.post(
+            "/api/terrapod/v1/users/dev/authentication-tokens",
+            json={
+                "data": {"attributes": {"kind": "service_detached", "pinned_roles": ["deployer"]}}
+            },
+            headers={"Authorization": "Bearer x"},
+        )
+    assert r.status_code == 201
+    attrs = r.json()["data"]["attributes"]
+    assert attrs["kind"] == "service_detached"
+    assert attrs["bound-to"] is None
+    # The endpoint pins the token unbound, regardless of the path username.
+    assert mock_create.call_args.kwargs["bound_to"] is None
 
 
 @_app_patched
@@ -224,16 +253,43 @@ async def test_expiring_caller_scoped(mock_expiring, *_):
 
 @_app_patched
 @patch("terrapod.api.routers.tokens.get_token_by_id")
-async def test_retag_to_detached_gated_422(mock_get, *_):
+async def test_retag_to_detached_non_admin_403(mock_get, *_):
+    # Converting a token TO detached is admin-only — even the token's own
+    # owner can't self-promote it to an unbound detached token.
     mock_get.return_value = _token_mock(kind="interactive", bound_to="dev@example.com")
-    app = _make_app(_user(roles=["admin"]))
+    app = _make_app(_user())  # owner of the token, but not admin
     async with _client(app) as c:
         r = await c.patch(
             "/api/terrapod/v1/authentication-tokens/at-svc",
             json={"data": {"attributes": {"kind": "service_detached"}}},
             headers={"Authorization": "Bearer x"},
         )
-    assert r.status_code == 422
+    assert r.status_code == 403
+
+
+@_app_patched
+@patch("terrapod.api.routers.tokens.get_redis_client")
+@patch("terrapod.api.routers.tokens.get_token_by_id")
+async def test_retag_to_detached_admin_unbinds(mock_get, mock_redis, *_):
+    # An admin converting a bound token TO detached unbinds it, pins the
+    # supplied scope, and busts the role cache for the (former) owner.
+    mock_get.return_value = _token_mock(kind="service_bound", bound_to="dev@example.com")
+    mock_redis.return_value = MagicMock(delete=AsyncMock())
+    app = _make_app(_user(roles=["admin"]))
+    async with _client(app) as c:
+        r = await c.patch(
+            "/api/terrapod/v1/authentication-tokens/at-svc",
+            json={
+                "data": {"attributes": {"kind": "service_detached", "pinned_roles": ["deployer"]}}
+            },
+            headers={"Authorization": "Bearer x"},
+        )
+    assert r.status_code == 200
+    attrs = r.json()["data"]["attributes"]
+    assert attrs["kind"] == "service_detached"
+    assert attrs["bound-to"] is None
+    # The former owner's cached role resolution is invalidated.
+    mock_redis.return_value.delete.assert_any_await("tp:token_roles:dev@example.com")
 
 
 def test_no_token_path_under_api_v2():

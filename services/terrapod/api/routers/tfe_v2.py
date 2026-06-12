@@ -48,6 +48,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from terrapod.api.dependencies import (
     DEFAULT_ORG,
     AuthenticatedUser,
+    effective_platform_roles,
     get_current_user,
     require_non_runner,
 )
@@ -63,11 +64,11 @@ from terrapod.db.models import (
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
 from terrapod.services import agent_pool_service as _agent_pool_service
-from terrapod.services.pool_rbac_service import has_pool_permission, resolve_pool_permission
+from terrapod.services.pool_rbac_service import has_pool_permission, resolve_pool_permission_for
 from terrapod.services.workspace_rbac_service import (
     PERMISSION_HIERARCHY,
     has_permission,
-    resolve_workspace_permission,
+    resolve_workspace_permission_for,
 )
 from terrapod.storage import get_storage
 from terrapod.storage.keys import state_index_key, state_key
@@ -386,11 +387,11 @@ async def account_details(
                 "attributes": {
                     "username": username,
                     "email": user.email,
-                    "is-service-account": user.auth_method == "api_token",
+                    "is-service-account": user.kind in ("service_bound", "service_detached"),
                     "avatar-url": "",
                     "v2-only": False,
                     "permissions": {
-                        "can-create-organizations": "admin" in user.roles,
+                        "can-create-organizations": "admin" in effective_platform_roles(user),
                         "can-change-email": False,
                         "can-change-username": False,
                     },
@@ -424,13 +425,13 @@ async def show_organization(
                     "created-at": "2025-01-01T00:00:00.000Z",
                     "email": "",
                     "permissions": {
-                        "can-update": "admin" in user.roles,
+                        "can-update": "admin" in effective_platform_roles(user),
                         "can-destroy": False,
                         "can-access-via-teams": False,
                         "can-create-module": True,
                         "can-create-team": False,
                         "can-create-workspace": True,
-                        "can-manage-users": "admin" in user.roles,
+                        "can-manage-users": "admin" in effective_platform_roles(user),
                         "can-manage-subscription": False,
                         "can-manage-sso": False,
                         "can-update-oauth": False,
@@ -439,7 +440,7 @@ async def show_organization(
                         "can-update-api-token": True,
                         "can-traverse": True,
                         "can-start-trial": False,
-                        "can-update-agent-pools": "admin" in user.roles,
+                        "can-update-agent-pools": "admin" in effective_platform_roles(user),
                         "can-manage-tags": True,
                         "can-manage-varsets": True,
                         "can-read-varsets": True,
@@ -828,7 +829,7 @@ async def list_workspaces(
     # Filter to workspaces user has at least read access to
     visible = []
     for ws in workspaces:
-        perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+        perm = await resolve_workspace_permission_for(db, user, ws)
         if perm is not None:
             visible.append(_workspace_json(ws, perm, latest_run=latest_runs.get(ws.id))["data"])
 
@@ -851,7 +852,7 @@ async def show_workspace(
     if ws is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if perm is None:
         # Runner-token consumers can resolve the producer workspace by name
         # so the OpenTofu `remote` backend's first hop (workspace lookup) in
@@ -919,10 +920,9 @@ async def create_workspace(
         target_pool = await _agent_pool_service.get_pool(db, agent_pool_id)
         if target_pool is None:
             raise HTTPException(status_code=404, detail="Agent pool not found")
-        pool_perm = await resolve_pool_permission(
+        pool_perm = await resolve_pool_permission_for(
             db,
-            user_email=user.email,
-            user_roles=user.roles,
+            user,
             pool_name=target_pool.name,
             pool_labels=target_pool.labels or {},
             owner_email=target_pool.owner_email or "",
@@ -1004,7 +1004,7 @@ async def _require_ws_permission(
 ) -> tuple[Workspace, str]:
     """Load workspace and check permission. Returns (workspace, effective_permission)."""
     ws = await _get_workspace_by_id(workspace_id, db)
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if not has_permission(perm, required):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -1101,7 +1101,7 @@ async def show_workspace_by_id(
     state-read endpoints further down.
     """
     ws = await _get_workspace_by_id(workspace_id, db)
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if not has_permission(perm, "read"):
         if await _runner_state_read_allowed(db, user, ws):
             perm = "read"
@@ -1271,7 +1271,7 @@ async def update_workspace(
 
     # owner-email can only be changed by platform admin
     if "owner-email" in attrs:
-        if "admin" not in user.roles:
+        if "admin" not in effective_platform_roles(user):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only platform admins can change workspace owner",
@@ -1383,12 +1383,12 @@ async def update_workspace(
         if (
             new_labels != (ws.labels or {})
             and not attrs.get("force")
-            and "admin" not in user.roles
+            and "admin" not in effective_platform_roles(user)
             and ws.owner_email != user.email
         ):
             old_labels = ws.labels
             ws.labels = new_labels
-            new_perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+            new_perm = await resolve_workspace_permission_for(db, user, ws)
             ws.labels = old_labels  # revert before deciding
             if new_perm is None or PERMISSION_HIERARCHY.get(
                 new_perm, -1
@@ -1433,10 +1433,9 @@ async def update_workspace(
             target_pool = await _agent_pool_service.get_pool(db, new_pool_id)
             if target_pool is None:
                 raise HTTPException(status_code=404, detail="Agent pool not found")
-            pool_perm = await resolve_pool_permission(
+            pool_perm = await resolve_pool_permission_for(
                 db,
-                user_email=user.email,
-                user_roles=user.roles,
+                user,
                 pool_name=target_pool.name,
                 pool_labels=target_pool.labels or {},
                 owner_email=target_pool.owner_email or "",
@@ -1593,7 +1592,7 @@ async def current_state_version(
     """
     ws = await _get_workspace_by_id(workspace_id, db)
     if not await _runner_state_read_allowed(db, user, ws):
-        perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+        perm = await resolve_workspace_permission_for(db, user, ws)
         if not has_permission(perm, "read"):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -1638,7 +1637,7 @@ async def download_state(
     if ws is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     if not await _runner_state_read_allowed(db, user, ws):
-        perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+        perm = await resolve_workspace_permission_for(db, user, ws)
         if not has_permission(perm, "plan"):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -1783,7 +1782,7 @@ async def show_state_version(
     # Check read permission on workspace
     ws = await db.get(Workspace, sv.workspace_id)
     if ws is not None:
-        perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+        perm = await resolve_workspace_permission_for(db, user, ws)
         if perm is None:
             raise HTTPException(status_code=404, detail="State version not found")
 
@@ -2039,7 +2038,7 @@ async def unlock_workspace(
 ) -> JSONResponse:
     """Unlock a workspace. Plan for own lock, admin for force-unlock."""
     ws = await _get_workspace_by_id(workspace_id, db)
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
 
     # Check: at minimum plan permission required
     if not has_permission(perm, "plan"):
