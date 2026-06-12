@@ -83,6 +83,7 @@ export default function TokensPage() {
   const [pinnedRoles, setPinnedRoles] = useState<Set<string>>(new Set())
   const [creating, setCreating] = useState(false)
   const [createdToken, setCreatedToken] = useState<string | null>(null)
+  const [showToken, setShowToken] = useState(false)
   const [showAll, setShowAll] = useState(false)
   const [kindFilter, setKindFilter] = useState<string>('all')
   const [selected, setSelected] = useState<Set<string>>(new Set())
@@ -185,6 +186,7 @@ export default function TokensPage() {
       }
       const data = await res.json()
       setCreatedToken(data.data?.attributes?.token || null)
+      setShowToken(false)
       resetCreateForm()
       setShowCreate(false)
       await loadTokens()
@@ -210,6 +212,7 @@ export default function TokensPage() {
       }
       const data = await res.json()
       setCreatedToken(data.data?.attributes?.token || null)
+      setShowToken(false)
       await loadTokens()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to rotate token')
@@ -283,12 +286,25 @@ export default function TokensPage() {
     })
   }
 
-  function expiryColor(iso: string | null): string {
+  // A token minted by `terraform login` / `tofu login` — the server always
+  // sets this exact description prefix on the OAuth token-exchange (#502).
+  // These are intentionally short-lived (login_token_ttl_hours, default 12h),
+  // so an imminent expiry is by design, not a foot-gun worth warning about.
+  // Every other token — including manually-created personal tokens — keeps the
+  // amber "nearing expiry" warning.
+  function isLoginToken(tok: Token): boolean {
+    return (
+      tok.attributes.kind === 'interactive' &&
+      (tok.attributes.description || '').startsWith('terraform login')
+    )
+  }
+
+  function expiryColor(iso: string | null, isLogin: boolean): string {
     if (!iso) return 'text-slate-400'
     const now = Date.now()
     const expires = new Date(iso).getTime()
     if (expires <= now) return 'text-red-400'
-    if (expires - now < 30 * 24 * 60 * 60 * 1000) return 'text-amber-400'
+    if (!isLogin && expires - now < 30 * 24 * 60 * 60 * 1000) return 'text-amber-400'
     return 'text-slate-400'
   }
 
@@ -332,13 +348,31 @@ export default function TokensPage() {
         {error && <ErrorBanner message={error} />}
 
         {createdToken && (
-          <div className="mb-6 p-4 bg-green-900/30 rounded-lg border border-green-800/50">
+          <div className="relative mb-6 p-4 pr-10 bg-green-900/30 rounded-lg border border-green-800/50">
+            <button
+              onClick={() => { setCreatedToken(null); setShowToken(false) }}
+              aria-label="Dismiss token"
+              className="absolute top-2 right-2 text-green-400 hover:text-green-200 transition-colors"
+            >
+              ✕
+            </button>
             <p className="text-sm text-green-300 font-medium mb-1">Token ready</p>
             <p className="text-xs text-green-400 mb-2">Copy this token now — it will not be shown again.</p>
             <div className="flex items-center gap-2">
-              <code className="flex-1 text-sm text-green-200 bg-green-900/30 p-2 rounded font-mono overflow-x-auto">
-                {createdToken}
+              <code
+                className={`flex-1 text-sm text-green-200 bg-green-900/30 p-2 rounded font-mono overflow-x-auto ${
+                  showToken ? '' : 'select-none'
+                }`}
+              >
+                {showToken ? createdToken : '•'.repeat(48)}
               </code>
+              <button
+                onClick={() => setShowToken((v) => !v)}
+                aria-pressed={showToken}
+                className="px-3 py-1 rounded text-xs font-medium bg-green-800/50 hover:bg-green-700/50 text-green-200 transition-colors flex-shrink-0 w-14"
+              >
+                {showToken ? 'Hide' : 'Show'}
+              </button>
               <button
                 onClick={() => navigator.clipboard.writeText(createdToken)}
                 className="px-3 py-1 rounded text-xs font-medium bg-green-800/50 hover:bg-green-700/50 text-green-200 transition-colors flex-shrink-0"
@@ -544,7 +578,7 @@ export default function TokensPage() {
                       <td className="px-4 py-3 text-slate-400 text-xs">
                         {formatDate(tok.attributes['last-used-at'])}
                       </td>
-                      <td className={`px-4 py-3 text-xs ${expiryColor(tok.attributes['expires-at'])}`}>
+                      <td className={`px-4 py-3 text-xs ${expiryColor(tok.attributes['expires-at'], isLoginToken(tok))}`}>
                         {formatDate(tok.attributes['expires-at'])}
                       </td>
                       <td className="px-4 py-3 text-right whitespace-nowrap">
