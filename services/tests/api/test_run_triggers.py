@@ -66,8 +66,9 @@ class TestCreateRunTrigger:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission")
-    async def test_create_run_trigger(self, mock_resolve, *mocks):
+    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission_for")
+    @patch("terrapod.redis.client.publish_workspace_event", new_callable=AsyncMock)
+    async def test_create_run_trigger(self, mock_publish, mock_resolve, *mocks):
         """Happy path: create a run trigger → 201."""
         mock_resolve.return_value = "admin"
         dest_ws = _mock_workspace(name="dest")
@@ -111,11 +112,17 @@ class TestCreateRunTrigger:
             )
         assert resp.status_code == 201
         assert resp.json()["data"]["type"] == "run-triggers"
+        # SSE: both the destination and source workspace channels get a
+        # run_trigger_change event so inbound + outbound edges appear live.
+        published = {c.args[1] for c in mock_publish.await_args_list}
+        assert published == {"run_trigger_change"}
+        published_ids = {c.args[0] for c in mock_publish.await_args_list}
+        assert {str(dest_ws.id), str(source_ws.id)} == published_ids
 
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission")
+    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission_for")
     async def test_create_self_referential_rejected(self, mock_resolve, *mocks):
         """Same source and destination workspace → 422."""
         mock_resolve.return_value = "admin"
@@ -144,7 +151,7 @@ class TestCreateRunTrigger:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission")
+    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission_for")
     async def test_create_duplicate_rejected(self, mock_resolve, *mocks):
         """Same pair twice → 409."""
         mock_resolve.return_value = "admin"
@@ -184,7 +191,7 @@ class TestCreateRunTrigger:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission")
+    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission_for")
     async def test_create_max_20_sources(self, mock_resolve, *mocks):
         """21st source → 422."""
         mock_resolve.return_value = "admin"
@@ -228,7 +235,7 @@ class TestCreateRunTrigger:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission")
+    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission_for")
     async def test_create_requires_admin(self, mock_resolve, *mocks):
         """Non-admin → 403."""
         mock_resolve.return_value = "write"
@@ -263,7 +270,7 @@ class TestListRunTriggers:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission")
+    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission_for")
     async def test_list_inbound(self, mock_resolve, *mocks):
         mock_resolve.return_value = "read"
         ws = _mock_workspace()
@@ -289,7 +296,7 @@ class TestListRunTriggers:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission")
+    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission_for")
     async def test_list_outbound(self, mock_resolve, *mocks):
         mock_resolve.return_value = "read"
         ws = _mock_workspace()
@@ -315,7 +322,7 @@ class TestListRunTriggers:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission")
+    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission_for")
     async def test_list_requires_filter(self, mock_resolve, *mocks):
         """Missing filter → 422."""
         mock_resolve.return_value = "read"
@@ -341,7 +348,7 @@ class TestShowRunTrigger:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission")
+    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission_for")
     async def test_show_run_trigger(self, mock_resolve, *mocks):
         mock_resolve.return_value = "read"
         trigger = _mock_trigger()
@@ -378,7 +385,7 @@ class TestDeleteRunTrigger:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission")
+    @patch("terrapod.api.routers.run_triggers.resolve_workspace_permission_for")
     async def test_delete_run_trigger(self, mock_resolve, *mocks):
         """Happy path → 204."""
         mock_resolve.return_value = "admin"
@@ -468,3 +475,62 @@ class TestFireRunTriggers:
         await transition_run(mock_db, run, "applied")
 
         mock_fire.assert_called_once_with(mock_db, run.workspace_id)
+
+    @patch("terrapod.services.run_service.queue_run")
+    @patch("terrapod.services.run_service.create_run")
+    async def test_fire_triggers_attaches_latest_cv(self, mock_create, mock_queue):
+        """#439: triggered runs must carry the destination's latest uploaded CV."""
+        from terrapod.services.run_service import fire_run_triggers
+
+        source_ws_id = uuid.uuid4()
+        dest_ws = _mock_workspace(name="downstream")
+        trigger = MagicMock()
+        trigger.workspace = dest_ws
+
+        source_ws = _mock_workspace(ws_id=source_ws_id, name="upstream")
+        latest_cv_id = uuid.uuid4()
+
+        triggers_result = MagicMock()
+        triggers_result.scalars.return_value.all.return_value = [trigger]
+        cv_result = MagicMock()
+        cv_result.scalar_one_or_none.return_value = latest_cv_id
+
+        mock_db = AsyncMock()
+        mock_db.execute.side_effect = [triggers_result, cv_result]
+        mock_db.get.return_value = source_ws
+
+        downstream_run = MagicMock()
+        mock_create.return_value = downstream_run
+
+        await fire_run_triggers(mock_db, source_ws_id)
+
+        mock_create.assert_called_once()
+        assert mock_create.call_args.kwargs["configuration_version_id"] == latest_cv_id
+        mock_queue.assert_called_once_with(mock_db, downstream_run)
+
+    @patch("terrapod.services.run_service.queue_run")
+    @patch("terrapod.services.run_service.create_run")
+    async def test_fire_triggers_skips_destination_with_no_cv(self, mock_create, mock_queue):
+        """#439: destination with no uploaded CV is skipped (no doomed run)."""
+        from terrapod.services.run_service import fire_run_triggers
+
+        source_ws_id = uuid.uuid4()
+        dest_ws = _mock_workspace(name="downstream")
+        trigger = MagicMock()
+        trigger.workspace = dest_ws
+
+        source_ws = _mock_workspace(ws_id=source_ws_id, name="upstream")
+
+        triggers_result = MagicMock()
+        triggers_result.scalars.return_value.all.return_value = [trigger]
+        cv_result = MagicMock()
+        cv_result.scalar_one_or_none.return_value = None
+
+        mock_db = AsyncMock()
+        mock_db.execute.side_effect = [triggers_result, cv_result]
+        mock_db.get.return_value = source_ws
+
+        await fire_run_triggers(mock_db, source_ws_id)
+
+        mock_create.assert_not_called()
+        mock_queue.assert_not_called()

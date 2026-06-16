@@ -34,6 +34,7 @@ from typing import Literal
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Request, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
@@ -43,11 +44,23 @@ from terrapod.api.dependencies import (
     get_current_user,
     get_listener_identity,
 )
-from terrapod.db.models import Run, StateVersion, VCSConnection, Workspace
+from terrapod.config import settings
+from terrapod.db.models import (
+    PlanSummary,
+    PlanSummaryMessage,
+    Run,
+    StateVersion,
+    VCSConnection,
+    Workspace,
+    now_utc,
+)
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
 from terrapod.services import agent_pool_service, run_service
-from terrapod.services.workspace_rbac_service import has_permission, resolve_workspace_permission
+from terrapod.services.workspace_rbac_service import (
+    has_permission,
+    resolve_workspace_permission_for,
+)
 from terrapod.storage import get_storage
 from terrapod.storage.keys import apply_log_key, plan_json_output_key, plan_log_key
 from terrapod.storage.protocol import ObjectNotFoundError
@@ -119,6 +132,14 @@ def _run_json(
                 "terraform-version": run.terraform_version,
                 "resource-cpu": run.resource_cpu,
                 "resource-memory": run.resource_memory,
+                # Runner resource profile + OOM detection (#430). All
+                # nullable / empty-string for runs that pre-date the
+                # feature (or where the runner died before capturing).
+                "peak-memory-bytes": run.peak_memory_bytes,
+                "peak-cpu-usec": run.peak_cpu_usec,
+                "runner-exit-code": run.runner_exit_code,
+                "runner-exit-reason": run.runner_exit_reason or "",
+                "runner-exit-status": run.runner_exit_status or "",
                 "error-message": run.error_message,
                 "target-addrs": run.target_addrs or [],
                 "replace-addrs": run.replace_addrs or [],
@@ -250,7 +271,7 @@ async def _require_run_ws_permission(
     ws = await db.get(Workspace, run.workspace_id)
     if ws is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if not has_permission(perm, required):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -322,6 +343,17 @@ async def _fetch_vcs_config(
     # (one request, one workspace), so we don't bother computing a wider
     # union. If another caller fetched the same SHA with a different path
     # set, that's a different cache entry — content-addressed by paths_hash.
+    #
+    # If the workspace's terraform crosses directory boundaries via relative
+    # module sources (`module "auth0" { source = "../auth0" }`), the operator
+    # MUST declare the referenced paths in `trigger_prefixes` — sparse-checkout
+    # cone mode includes parent directories but not siblings, so without an
+    # explicit prefix the runner would `lstat ../foo: no such file`. This
+    # contract is consistent with the VCS-poll path's `_compute_paths_unions`,
+    # so a workspace that works under VCS poll also works here. See #478 /
+    # #480 for the history (v0.35.3 briefly forced whole-repo here as a
+    # blanket fix; v0.35.4 reverted that and put the responsibility back on
+    # the workspace declaration).
     fetch_paths: list[str] = []
     if ws.working_directory:
         fetch_paths.append(ws.working_directory.strip("/ "))
@@ -380,7 +412,7 @@ async def create_run(
 
     # Check permission: plan-only requires plan, apply requires write
     required = "plan" if plan_only else "write"
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if not has_permission(perm, required):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -517,7 +549,7 @@ async def list_workspace_runs(
 ) -> JSONResponse:
     """List runs for a workspace. Requires read."""
     ws = await _get_workspace(workspace_id, db)
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if not has_permission(perm, "read"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -650,13 +682,43 @@ async def retry_run(
     if ws is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
+    # Defensive: if the source run has no CV (e.g. it was queued by an
+    # older fire_run_triggers before #439, or by some other path that
+    # forgot to attach one), pick the workspace's latest uploaded CV
+    # rather than faithfully copying the null forward. A retry with no
+    # CV would just re-hit the runner's "no configuration archive (HTTP
+    # 404)" exit — preserving the bug instead of clearing it. Existing
+    # null-CV runs already in the DB become retry-able after this.
+    cv_id_for_retry = run.configuration_version_id
+    if cv_id_for_retry is None:
+        from terrapod.db.models import ConfigurationVersion
+
+        cv_result = await db.execute(
+            select(ConfigurationVersion.id)
+            .where(
+                ConfigurationVersion.workspace_id == ws.id,
+                ConfigurationVersion.status == "uploaded",
+            )
+            .order_by(ConfigurationVersion.created_at.desc())
+            .limit(1)
+        )
+        cv_id_for_retry = cv_result.scalar_one_or_none()
+        if cv_id_for_retry is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Source run has no configuration version and the workspace has "
+                    "never had one uploaded; nothing to retry against."
+                ),
+            )
+
     new_run = await run_service.create_run(
         db,
         workspace=ws,
         message=f"Retry of run-{run.id}",
         source=run.source,
         plan_only=run.plan_only,
-        configuration_version_id=run.configuration_version_id,
+        configuration_version_id=cv_id_for_retry,
         created_by=user.email,
         target_addrs=run.target_addrs,
         replace_addrs=run.replace_addrs,
@@ -687,7 +749,9 @@ def _plan_status(run: Run) -> str:
         return "pending"
     if s == "planning":
         return "running"
-    if s in ("planned", "confirmed", "applying", "applied"):
+    if s in ("planned", "confirmed", "applying", "canceling", "applied"):
+        # `canceling` only arises from `applying`, by which point the
+        # plan phase is finished — report it accordingly.
         return "finished"
     if s == "errored":
         # Errored during plan phase (plan never finished)
@@ -706,7 +770,10 @@ def _apply_status(run: Run) -> str:
         return "unreachable"
     if s == "confirmed":
         return "pending"
-    if s == "applying":
+    if s in ("applying", "canceling"):
+        # `canceling` is "apply is in flight and being killed". From the
+        # phase-status view it's still running until the reconciler
+        # resolves it to a terminal.
         return "running"
     if s == "applied":
         return "finished"
@@ -771,8 +838,6 @@ async def list_run_events(
 
 def _plan_json(run: Run) -> dict:
     """Build plan JSON:API response for a run."""
-    from terrapod.config import settings
-
     base = settings.auth.callback_base_url.rstrip("/")
     attrs: dict = {
         "status": _plan_status(run),
@@ -790,6 +855,13 @@ def _plan_json(run: Run) -> dict:
         attrs["resource-changes"] = run.resource_changes
         attrs["resource-destructions"] = run.resource_destructions
         attrs["resource-imports"] = run.resource_imports
+    # AI plan summary URL — surfaced as a Terrapod-native link on every
+    # plan response so the UI knows where to fetch the structured
+    # summary. 404s gracefully when no summary exists yet. Omitted
+    # entirely when the feature is globally disabled so the UI
+    # doesn't make a doomed fetch for every page load (#463 phase 7).
+    if settings.ai_summary.enabled:
+        attrs["ai-summary-url"] = f"{base}/api/terrapod/v1/runs/{run.id}/plan-summary"
     return {
         "data": {
             "id": f"plan-{run.id}",
@@ -816,6 +888,363 @@ async def show_plan_by_id(
     run = await _get_run(plan_id.replace("plan-", "run-"), db)
     await _require_run_ws_permission(run, "read", user, db)
     return JSONResponse(content=_plan_json(run))
+
+
+@extensions_router.get("/runs/{run_id}/plan-summary")
+async def show_plan_summary(
+    run_id: str = Path(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """AI-generated plan summary or failure analysis (#401).
+
+    Terrapod-native — not part of the TFE CLI surface. Lives under
+    ``/api/terrapod/v1/`` alongside the other run extensions.
+
+    Returns 404 when no summary exists yet — the UI uses this as the
+    "not summarised" signal (vs a `pending` row which means "in flight").
+    The response shape is the same for both ``kind`` values; the UI
+    branches on the ``kind`` attribute.
+    """
+    run = await _get_run(run_id, db)
+    await _require_run_ws_permission(run, "read", user, db)
+
+    summary = (
+        await db.execute(select(PlanSummary).where(PlanSummary.run_id == run.id))
+    ).scalar_one_or_none()
+    if summary is None:
+        raise HTTPException(status_code=404, detail="no summary for this plan")
+
+    return JSONResponse(
+        content={
+            "data": {
+                "id": f"plan-summary-{summary.id}",
+                "type": "plan-summaries",
+                "attributes": {
+                    "kind": summary.kind,
+                    "status": summary.status,
+                    "description": summary.description,
+                    "risk-level": summary.risk_level,
+                    "risk-factors": summary.risk_factors,
+                    "model": summary.model,
+                    "input-tokens": summary.input_tokens,
+                    "output-tokens": summary.output_tokens,
+                    "error-message": summary.error_message,
+                    "created-at": _rfc3339(summary.created_at),
+                    "updated-at": _rfc3339(summary.updated_at),
+                },
+                "relationships": {
+                    "plan": {"data": {"id": f"plan-{run.id}", "type": "plans"}},
+                    "run": {"data": {"id": f"run-{run.id}", "type": "runs"}},
+                },
+            }
+        }
+    )
+
+
+def _summary_kind_for_run(run: Run) -> str | None:
+    """Pick the right summariser kind for a run's current state.
+
+    Returns "plan_summary" for runs that produced a plan (any state past
+    `planning` except errored), "failure_analysis" for runs that
+    errored during EITHER plan or apply (#419), and None when no
+    summary kind applies (still in `pending`/`queued`/`planning`).
+    """
+    if run.status == "errored" and run.plan_started_at:
+        return "failure_analysis"
+    if run.status in {"planned", "confirmed", "applying", "applied", "discarded"}:
+        return "plan_summary"
+    return None
+
+
+@extensions_router.post("/runs/{run_id}/plan-summary/regenerate")
+async def regenerate_plan_summary(
+    run_id: str = Path(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """Re-fire the AI summary for an existing run (#401 follow-up).
+
+    Anyone with workspace `read` can regenerate; the call doesn't mutate
+    infrastructure. Cost is centrally gated by `ai_summary.daily_token_budget`.
+
+    The endpoint:
+      • picks `kind` from current run state (plan_summary vs failure_analysis)
+      • upserts the PlanSummary row to status='pending' synchronously
+        so the UI immediately reflects the regenerate
+      • enqueues the same `ai_plan_summary` trigger as the auto-fire path,
+        BYPASSING the 5-min dedup (the user explicitly asked)
+      • returns 202 with the now-pending row
+
+    Returns 409 if the run has no summarisable state (still planning, or
+    apply-phase errored). Returns 503 if AI summary is globally disabled.
+    """
+    from terrapod.config import settings as _settings
+    from terrapod.services.scheduler import enqueue_trigger
+
+    if not _settings.ai_summary.enabled:
+        raise HTTPException(status_code=503, detail="AI summary is disabled globally")
+
+    run = await _get_run(run_id, db)
+    await _require_run_ws_permission(run, "read", user, db)
+
+    kind = _summary_kind_for_run(run)
+    if kind is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"run is in state '{run.status}' — no summary kind applies "
+                "(plan_summary needs a post-plan state; failure_analysis "
+                "needs plan-phase errored)"
+            ),
+        )
+
+    # Upsert to pending so the UI shows feedback immediately. Reuses the
+    # same model field so the operator sees which model is being called.
+    pending_values = {
+        "run_id": run.id,
+        "kind": kind,
+        "status": "pending",
+        "model": _settings.ai_summary.model,
+        "description": "",
+        "risk_level": "",
+        "risk_factors": [],
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "error_message": "",
+    }
+    stmt = pg_insert(PlanSummary).values(**pending_values)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["run_id"],
+        set_={
+            "kind": stmt.excluded.kind,
+            "status": stmt.excluded.status,
+            "model": stmt.excluded.model,
+            "description": stmt.excluded.description,
+            "risk_level": stmt.excluded.risk_level,
+            "risk_factors": stmt.excluded.risk_factors,
+            "input_tokens": stmt.excluded.input_tokens,
+            "output_tokens": stmt.excluded.output_tokens,
+            "error_message": stmt.excluded.error_message,
+            "updated_at": now_utc(),
+        },
+    )
+    await db.execute(stmt)
+    await db.commit()
+
+    # Re-read so we return the fresh row (gives us the id + timestamps).
+    summary = (
+        await db.execute(select(PlanSummary).where(PlanSummary.run_id == run.id))
+    ).scalar_one_or_none()
+
+    # No dedup_key → bypass the 5-min auto-dedup. Operator clicks should
+    # always go through, even when an automatic enqueue happened seconds
+    # ago. Budget gating still applies on the handler side.
+    await enqueue_trigger(
+        "ai_plan_summary",
+        {"run_id": str(run.id), "kind": kind},
+    )
+
+    # SSE so the run-detail page reverts to the pending placeholder
+    # immediately on regenerate, without waiting for the handler to
+    # fire its own pending event (#463 phase 4).
+    try:
+        from terrapod.services.summariser import _emit_summary_event
+
+        await _emit_summary_event("plan_summary_pending", run.workspace_id, run.id)
+    except Exception as e:  # SSE is best-effort
+        logger.debug("Failed to publish pending event on regenerate", error=str(e))
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "data": {
+                "id": f"plan-summary-{summary.id}",
+                "type": "plan-summaries",
+                "attributes": {
+                    "kind": summary.kind,
+                    "status": summary.status,
+                    "description": summary.description,
+                    "risk-level": summary.risk_level,
+                    "risk-factors": summary.risk_factors,
+                    "model": summary.model,
+                    "input-tokens": summary.input_tokens,
+                    "output-tokens": summary.output_tokens,
+                    "error-message": summary.error_message,
+                    "created-at": _rfc3339(summary.created_at),
+                    "updated-at": _rfc3339(summary.updated_at),
+                },
+                "relationships": {
+                    "plan": {"data": {"id": f"plan-{run.id}", "type": "plans"}},
+                    "run": {"data": {"id": f"run-{run.id}", "type": "runs"}},
+                },
+            }
+        },
+    )
+
+
+# ── Plan summary follow-up chat (#463) ─────────────────────────────────
+
+
+def _plan_summary_message_attr(msg: PlanSummaryMessage) -> dict:
+    """JSON:API attributes block for a single chat turn."""
+    return {
+        "role": msg.role,
+        "content": msg.content,
+        "model": msg.model,
+        "input-tokens": msg.input_tokens,
+        "output-tokens": msg.output_tokens,
+        "error-message": msg.error_message,
+        "created-at": _rfc3339(msg.created_at),
+    }
+
+
+async def _resolve_plan_summary_for_chat(
+    run_id: str, user: AuthenticatedUser, db: AsyncSession
+) -> tuple[Run, PlanSummary, Workspace]:
+    """Shared header for both chat endpoints.
+
+    Verifies the run exists, the user has workspace `read`, an
+    initial summary has landed (404 otherwise — can't chat against a
+    plan that hasn't been summarised), and returns the joined rows.
+    """
+    run = await _get_run(run_id, db)
+    await _require_run_ws_permission(run, "read", user, db)
+    summary = (
+        await db.execute(select(PlanSummary).where(PlanSummary.run_id == run.id))
+    ).scalar_one_or_none()
+    if summary is None:
+        raise HTTPException(status_code=404, detail="no summary for this plan")
+    if summary.status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail=f"initial summary is '{summary.status}', not 'ready' — cannot start chat",
+        )
+    workspace = (
+        await db.execute(select(Workspace).where(Workspace.id == run.workspace_id))
+    ).scalar_one_or_none()
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="workspace not found")
+    return run, summary, workspace
+
+
+@extensions_router.get("/runs/{run_id}/plan-summary/messages")
+async def list_plan_summary_messages(
+    run_id: str = Path(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """Full transcript of the AI plan-summary chat thread (#463).
+
+    Returns the messages in chronological order. The initial
+    structured summary lives on the parent `PlanSummary` row
+    (`description` + `risk_factors`); this endpoint returns ONLY the
+    conversational follow-ups. The UI renders message[0] from the
+    parent summary and appends these.
+
+    Empty list when no follow-ups have been posted yet.
+    """
+    _run, summary, _ws = await _resolve_plan_summary_for_chat(run_id, user, db)
+    rows = (
+        (
+            await db.execute(
+                select(PlanSummaryMessage)
+                .where(PlanSummaryMessage.plan_summary_id == summary.id)
+                .order_by(PlanSummaryMessage.created_at, PlanSummaryMessage.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return JSONResponse(
+        content={
+            "data": [
+                {
+                    "id": f"plan-summary-message-{row.id}",
+                    "type": "plan-summary-messages",
+                    "attributes": _plan_summary_message_attr(row),
+                }
+                for row in rows
+            ],
+            "meta": {
+                "count": len(rows),
+            },
+        }
+    )
+
+
+@extensions_router.post("/runs/{run_id}/plan-summary/messages")
+async def post_plan_summary_message(
+    run_id: str = Path(...),
+    body: dict = Body(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """Post a user follow-up + get the synchronous assistant reply (#463).
+
+    Body: ``{"data": {"attributes": {"content": "..."}}}`` (JSON:API
+    shape, matches the rest of Terrapod's POST endpoints).
+
+    The service path persists the user row first (so a failed model
+    call still records what was asked), then calls the model with
+    the cacheable prefix the initial summary used (Anthropic /
+    Bedrock-Anthropic / Bedrock-Nova get the prompt-cache hit), then
+    persists the assistant turn + telemetry.
+
+    Returns 201 with the assistant message attributes. Authorisation
+    is read-on-workspace — anyone who can see the run can chat in
+    its thread (matches PR conversation semantics, not per-user
+    threads).
+    """
+    from terrapod.services.summariser import (
+        FollowupBudgetExhausted,
+        FollowupCapReached,
+        FollowupDisabled,
+        FollowupError,
+        post_followup,
+    )
+
+    content = ""
+    try:
+        attrs = body.get("data", {}).get("attributes", {}) or {}
+        content = str(attrs.get("content", "") or "")
+    except AttributeError:
+        raise HTTPException(status_code=400, detail="malformed body") from None
+
+    run, summary, workspace = await _resolve_plan_summary_for_chat(run_id, user, db)
+
+    try:
+        assistant_row = await post_followup(
+            db=db,
+            plan_summary=summary,
+            run=run,
+            workspace=workspace,
+            user_message_text=content,
+        )
+    except FollowupDisabled as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except FollowupCapReached as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except FollowupBudgetExhausted as e:
+        raise HTTPException(status_code=429, detail=str(e)) from e
+    except FollowupError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except (RuntimeError, ValueError) as e:
+        # Model HTTP / parse failure. The service has persisted both
+        # the user turn AND an errored assistant turn, so the
+        # transcript reflects the failure.
+        raise HTTPException(status_code=502, detail=f"model call failed: {e}") from e
+
+    return JSONResponse(
+        status_code=201,
+        content={
+            "data": {
+                "id": f"plan-summary-message-{assistant_row.id}",
+                "type": "plan-summary-messages",
+                "attributes": _plan_summary_message_attr(assistant_row),
+            }
+        },
+    )
 
 
 @extensions_router.get("/runs/{run_id}/plan")
@@ -900,7 +1329,7 @@ async def run_events_stream(
 
     async with get_db_session() as db:
         ws = await _get_workspace(workspace_id, db)
-        perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+        perm = await resolve_workspace_permission_for(db, user, ws)
         if not has_permission(perm, "read"):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -1189,6 +1618,38 @@ async def report_job_status(
 
     await set_job_status(str(run.id), phase, job_status)
 
+    # When the listener reports a failed Job, it MAY also send the container
+    # exit code + K8s termination reason from the terminated pod (#430). Map
+    # K8s reasons to the typed `runner_exit_status` bucket here — single
+    # mapping point so the reconciler + UI + AI gate all agree.
+    exit_code = body.get("exit_code")
+    reason = body.get("reason", "")
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        run.runner_exit_code = exit_code
+    if isinstance(reason, str) and reason:
+        run.runner_exit_reason = reason[:50]  # column is VARCHAR(50)
+
+    # Compute the typed status from whatever signals we have.
+    # - K8s `OOMKilled` reason is the authoritative OOM signal.
+    # - Exit 137 without an explicit reason (pod GC'd before we observed)
+    #   is "killed" — could be OOM, could be eviction, can't be sure.
+    # - Other non-zero exits are "error".
+    # - Exit 0 is "clean" (runner script exited cleanly, plan flow finished).
+    # Only set runner_exit_status when we have a definitive signal — leaving
+    # it "" means "pre-feature run / status unknown" and the UI shows no
+    # banner.
+    if reason == "OOMKilled":
+        run.runner_exit_status = "oom"
+    elif isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        if exit_code == 137:
+            run.runner_exit_status = "killed"
+        elif exit_code != 0:
+            run.runner_exit_status = "error"
+        else:
+            run.runner_exit_status = "clean"
+
+    await db.commit()
+
     return JSONResponse(content={"status": "ok"})
 
 
@@ -1231,7 +1692,13 @@ async def upload_log_stream(
     )
 
     redis = get_redis_client()
-    await redis.setex(f"{LOG_STREAM_PREFIX}{run.id}:{phase}", 300, body_bytes)
+    # decode_responses=True on the Redis client means a bytes value
+    # going through SETEX gets stringified via str(bytes) — yielding
+    # the literal `b'…\\n…'` text. Decode to UTF-8 str so the value
+    # round-trips cleanly. errors=replace covers any stray non-UTF-8
+    # bytes (e.g. from a stack-trace's escape sequence).
+    body_text = body_bytes.decode("utf-8", errors="replace")
+    await redis.setex(f"{LOG_STREAM_PREFIX}{run.id}:{phase}", 300, body_text)
 
     # Notify frontend that fresh log data is available
     try:
@@ -1428,12 +1895,24 @@ async def _serve_log(
     1. Object storage (authoritative — final log uploaded by Job on completion)
     2. Redis live stream (live-streamed data from listener during execution)
     3. Empty response (no data available yet — client retries)
+
+    ETX (end-of-log sentinel that tells the UI to stop polling) is appended
+    ONLY when the data came from object storage. The Redis live-stream
+    snapshot is inherently incomplete — the runner uploads the
+    authoritative log to storage from its EXIT trap, which fires AFTER it
+    POSTs plan-result and the run transitions to terminal. If we appended
+    ETX on the Redis path the moment `phase_done` flipped true, the UI
+    would stop polling before the EXIT trap landed the trailing bytes
+    (typically the entrypoint's `PLAN_HAS_CHANGES=...` line and post-plan
+    OPA output). The user then has to refresh to see the tail.
     """
     storage = get_storage()
     phase_done = run.status in phase_complete_states
+    from_storage = False
 
     try:
         data = await storage.get(log_key)
+        from_storage = True
     except ObjectNotFoundError:
         # Try live-streamed data from Redis (available for both in-progress
         # and recently-completed runs where the Job didn't upload final logs)
@@ -1447,7 +1926,8 @@ async def _serve_log(
                     live_data = live_data.encode()
                 data = live_data
             elif phase_done:
-                # Phase finished, no log in storage or Redis — empty stream
+                # Phase finished and neither storage nor Redis has anything —
+                # nothing more is ever coming. Send ETX so the UI gives up.
                 return Response(content=_STX + _ETX, media_type="text/plain")
             else:
                 # Still running, no log yet — return empty (client retries)
@@ -1468,7 +1948,10 @@ async def _serve_log(
     if offset == 0:
         result += _STX
     result += chunk
-    # Append ETX if phase is done and this is the last chunk
-    if phase_done and (limit == 0 or offset + limit >= len(data)):
+    # Append ETX only when serving from storage (authoritative final log)
+    # AND the client has consumed everything. Redis-served data can be a
+    # mid-flight snapshot even when phase_done is true; closing the stream
+    # there truncates the visible log.
+    if from_storage and phase_done and (limit == 0 or offset + limit >= len(data)):
         result += _ETX
     return Response(content=result, media_type="text/plain")

@@ -25,7 +25,10 @@ from terrapod.api.dependencies import AuthenticatedUser, get_current_user
 from terrapod.db.models import RunTrigger, Workspace
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
-from terrapod.services.workspace_rbac_service import has_permission, resolve_workspace_permission
+from terrapod.services.workspace_rbac_service import (
+    has_permission,
+    resolve_workspace_permission_for,
+)
 
 router = APIRouter(tags=["run-triggers"])
 logger = get_logger(__name__)
@@ -79,7 +82,7 @@ async def _get_workspace(workspace_id: str, db: AsyncSession) -> Workspace:
 async def _require_ws_permission(
     ws: Workspace, required: str, user: AuthenticatedUser, db: AsyncSession
 ) -> None:
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if not has_permission(perm, required):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -143,6 +146,14 @@ async def create_run_trigger(
     await db.refresh(trigger, attribute_names=["workspace", "source_workspace"])
 
     await db.commit()
+
+    # Live-update both endpoints' Run Triggers tabs: the destination gets a new
+    # outbound edge, the source a new inbound edge. The inbound edge in
+    # particular would otherwise never appear without a manual refresh.
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(str(ws.id), "run_trigger_change")
+    await publish_workspace_event(str(source_ws.id), "run_trigger_change")
 
     logger.info(
         "Run trigger created",
@@ -235,7 +246,17 @@ async def delete_run_trigger(
     ws = trigger.workspace
     await _require_ws_permission(ws, "admin", user, db)
 
+    # Capture both endpoint ids before the row is gone.
+    dest_id = str(trigger.workspace_id)
+    source_id = str(trigger.source_workspace_id)
+    trigger_id = str(trigger.id)
+
     await db.delete(trigger)
     await db.commit()
 
-    logger.info("Run trigger deleted", trigger_id=str(trigger.id))
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(dest_id, "run_trigger_change")
+    await publish_workspace_event(source_id, "run_trigger_change")
+
+    logger.info("Run trigger deleted", trigger_id=trigger_id)

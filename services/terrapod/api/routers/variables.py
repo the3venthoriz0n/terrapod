@@ -37,7 +37,10 @@ from terrapod.db.models import (
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
 from terrapod.services import variable_service
-from terrapod.services.workspace_rbac_service import has_permission, resolve_workspace_permission
+from terrapod.services.workspace_rbac_service import (
+    has_permission,
+    resolve_workspace_permission_for,
+)
 
 router = APIRouter(prefix="/api/v2", tags=["variables"])
 logger = get_logger(__name__)
@@ -96,7 +99,7 @@ async def list_workspace_vars(
 ) -> JSONResponse:
     """List all variables for a workspace. Requires read."""
     ws = await _get_workspace(workspace_id, db)
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if not has_permission(perm, "read"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="Requires read permission on workspace"
@@ -114,7 +117,7 @@ async def create_workspace_var(
 ) -> JSONResponse:
     """Create a variable for a workspace. Requires write."""
     ws = await _get_workspace(workspace_id, db)
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if not has_permission(perm, "write"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="Requires write permission on workspace"
@@ -140,6 +143,10 @@ async def create_workspace_var(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
 
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(str(ws.id), "workspace_variable_change")
+
     return JSONResponse(content={"data": _var_json(var)}, status_code=201)
 
 
@@ -153,7 +160,7 @@ async def update_workspace_var(
 ) -> JSONResponse:
     """Update a workspace variable. Requires write."""
     ws = await _get_workspace(workspace_id, db)
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if not has_permission(perm, "write"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="Requires write permission on workspace"
@@ -181,6 +188,10 @@ async def update_workspace_var(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
 
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(str(ws.id), "workspace_variable_change")
+
     return JSONResponse(content={"data": _var_json(var)})
 
 
@@ -193,7 +204,7 @@ async def delete_workspace_var(
 ) -> None:
     """Delete a workspace variable. Requires write."""
     ws = await _get_workspace(workspace_id, db)
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if not has_permission(perm, "write"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="Requires write permission on workspace"
@@ -206,6 +217,10 @@ async def delete_workspace_var(
 
     await variable_service.delete_variable(db, var)
     await db.commit()
+
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(str(ws.id), "workspace_variable_change")
 
 
 # ── Variable Sets ────────────────────────────────────────────────────────

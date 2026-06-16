@@ -160,6 +160,16 @@ func (r *workspaceResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 				Optional:    true,
 				ElementType: types.StringType,
 			},
+			"trigger_prefixes": schema.ListAttribute{
+				Description: "Repo-root-relative directories to include in the sparse VCS fetch in addition to `working_directory`. Required when the workspace's terraform crosses directory boundaries via relative module sources (`module \"foo\" { source = \"../foo\" }`) — sparse-checkout cone mode includes parents of the listed directories but NOT siblings, so the referenced sibling must be declared here or the runner will error with `Unable to evaluate directory symlink`.",
+				Optional:    true,
+				ElementType: types.StringType,
+			},
+			"drift_ignore_rules": schema.ListAttribute{
+				Description: "Glob-aware patterns suppressed by the drift-result classifier (#482). Each entry is a Terraform resource address optionally suffixed with a dotted attribute path; `*` matches zero or more non-`.` characters (so it can span `[N]` indices but not segment boundaries), and `[*]` matches any bracketed index. A bare address with no attribute suffix silences any change to that resource — including destroys — so use carefully. Examples: `aws_iam_role.foo.tags.Environment`, `aws_autoscaling_group.workers[*].desired_capacity`, `module.eks*.argocd_cluster.*.config.tls_client_config.ca_data`, `aws_iam_role.foo`. Empty list (the default) means classic drift behaviour: every plan diff counts. Affects drift-detection runs only — regular plan/apply is untouched.",
+				Optional:    true,
+				ElementType: types.StringType,
+			},
 			"drift_detection_enabled": schema.BoolAttribute{
 				Description: "Enable drift detection for this workspace. Defaults to true for VCS-connected workspaces, false otherwise.",
 				Optional:    true,
@@ -174,6 +184,22 @@ func (r *workspaceResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 				Computed:    true,
 				PlanModifiers: []planmodifier.Int64{
 					int64planmodifier.UseStateForUnknown(),
+				},
+			},
+			"ai_summary_mode": schema.StringAttribute{
+				Description: "Per-workspace AI plan-summary opt-in (#401). One of \"default\" (follow the deployment's global `ai_summary.enabled` setting), \"enabled\" (always summarise this workspace's plans), or \"disabled\" (never summarise — overrides global). Defaults to \"default\".",
+				Optional:    true,
+				Computed:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"ai_summary_context": schema.StringAttribute{
+				Description: "Workspace-specific facts appended to the AI summariser's prompt (#401). Additive to the deployment-wide fleet context. Use to flag blast-radius concerns or domain knowledge the model should weigh when describing changes for this workspace. Max 4000 characters.",
+				Optional:    true,
+				Computed:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
 			"remote_state_consumers": schema.SetAttribute{
@@ -194,16 +220,84 @@ func (r *workspaceResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
+			// `UseStateForUnknown` ONLY belongs on Computed-only attrs
+			// whose value definitely does NOT change as a side effect of
+			// the apply. v0.35.5 applied it everywhere and broke apply
+			// on every workspace because the server-volatile timestamps
+			// (updated_at ticks on every PATCH; vcs_last_polled_at ticks
+			// on every poll cycle) produced plan-vs-apply-time mismatches
+			// → terraform-plugin-framework's consistency check aborted.
+			//
+			// Safe-for-UseStateForUnknown set (each field's invariant):
+			//   created_at         — immutable after creation
+			//   owner_email        — only the platform admin can change; PATCH never does
+			//   agent_pool_name    — only changes when agent_pool_id changes (caller's PATCH)
+			//   vcs_connection_name — only changes when vcs_connection_id changes
+			//   state_diverged     — only set/cleared by a state upload pathway; not by PATCH
+			//
+			// Server-volatile set (NO UseStateForUnknown — plan will
+			// honestly show `(known after apply)`; the diff noise is the
+			// right answer because the value can legitimately change
+			// between plan and apply):
+			//   updated_at, vcs_last_polled_at, vcs_last_error,
+			//   vcs_last_error_at, drift_status, drift_last_checked_at,
+			//   drift_latest_run_id, lifecycle_state, lifecycle_reason,
+			//   locked
 			"drift_status": schema.StringAttribute{
-				Description: "Current drift status.",
+				Description: "Current drift status: \"\" (never checked), \"no_drift\", \"drifted\", or \"errored\". Server-volatile — updates when a drift run completes.",
 				Computed:    true,
 			},
 			"drift_last_checked_at": schema.StringAttribute{
-				Description: "Timestamp of the last drift check.",
+				Description: "Timestamp of the last drift check. Server-volatile.",
 				Computed:    true,
 			},
+			"drift_latest_run_id": schema.StringAttribute{
+				Description: "ID of the drift run that produced the current `drift_status`, prefixed `run-…`. Empty when drift has never run or when cleared by a successful apply. Server-volatile.",
+				Computed:    true,
+			},
+			"state_diverged": schema.BoolAttribute{
+				Description: "True when an apply Job succeeded but uploading the resulting state to Terrapod failed; the recorded state is out of sync with reality. Stable across PATCHes — only the state-upload pathway changes this.",
+				Computed:    true,
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"lifecycle_state": schema.StringAttribute{
+				Description: "Autodiscovery lifecycle state for managed workspaces: \"active\", \"pending_deletion\", or \"archived\". Server-volatile — autodiscovery lifecycle reconciler can move this between plan and apply.",
+				Computed:    true,
+			},
+			"lifecycle_reason": schema.StringAttribute{
+				Description: "Human-readable explanation of `lifecycle_state`. Empty for active workspaces. Server-volatile.",
+				Computed:    true,
+			},
+			"vcs_last_polled_at": schema.StringAttribute{
+				Description: "Timestamp of the most recent successful VCS poll cycle. Server-volatile — VCS poller writes this every `vcs.poll_interval_seconds` (default 60s).",
+				Computed:    true,
+			},
+			"vcs_last_error": schema.StringAttribute{
+				Description: "Most recent VCS poll error message. Empty when the last poll succeeded. Server-volatile.",
+				Computed:    true,
+			},
+			"vcs_last_error_at": schema.StringAttribute{
+				Description: "Timestamp of `vcs_last_error`. Server-volatile.",
+				Computed:    true,
+			},
+			"agent_pool_name": schema.StringAttribute{
+				Description: "Human-readable name of the assigned agent pool, server-derived from `agent_pool_id`. Only changes when `agent_pool_id` changes.",
+				Computed:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"vcs_connection_name": schema.StringAttribute{
+				Description: "Human-readable name of the assigned VCS connection, server-derived from `vcs_connection_id`. Only changes when `vcs_connection_id` changes.",
+				Computed:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
 			"locked": schema.BoolAttribute{
-				Description: "Whether the workspace is locked.",
+				Description: "Whether the workspace is locked. Server-volatile — operators can lock/unlock via the API outside of Terraform.",
 				Computed:    true,
 			},
 			"created_at": schema.StringAttribute{
@@ -214,7 +308,7 @@ func (r *workspaceResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 				},
 			},
 			"updated_at": schema.StringAttribute{
-				Description: "Last update timestamp.",
+				Description: "Last update timestamp. Server-volatile — ticks on every PATCH and on every server-side write (drift detection, VCS poll, lifecycle reconciler).",
 				Computed:    true,
 			},
 		},
@@ -453,6 +547,20 @@ func buildCreateWorkspaceRequest(ctx context.Context, m *workspaceModel) (terrap
 		}
 		req.VarFiles = varFiles
 	}
+	if !m.TriggerPrefixes.IsNull() && !m.TriggerPrefixes.IsUnknown() {
+		triggerPrefixes := []string{}
+		for _, v := range m.TriggerPrefixes.Elements() {
+			triggerPrefixes = append(triggerPrefixes, v.(types.String).ValueString())
+		}
+		req.TriggerPrefixes = triggerPrefixes
+	}
+	if !m.DriftIgnoreRules.IsNull() && !m.DriftIgnoreRules.IsUnknown() {
+		rules := []string{}
+		for _, v := range m.DriftIgnoreRules.Elements() {
+			rules = append(rules, v.(types.String).ValueString())
+		}
+		req.DriftIgnoreRules = rules
+	}
 	if !m.DriftDetectionEnabled.IsNull() && !m.DriftDetectionEnabled.IsUnknown() {
 		v := m.DriftDetectionEnabled.ValueBool()
 		req.DriftDetectionEnabled = &v
@@ -460,6 +568,12 @@ func buildCreateWorkspaceRequest(ctx context.Context, m *workspaceModel) (terrap
 	if !m.DriftDetectionIntervalSeconds.IsNull() && !m.DriftDetectionIntervalSeconds.IsUnknown() {
 		v := m.DriftDetectionIntervalSeconds.ValueInt64()
 		req.DriftDetectionIntervalSeconds = &v
+	}
+	if !m.AISummaryMode.IsNull() && !m.AISummaryMode.IsUnknown() {
+		req.AISummaryMode = m.AISummaryMode.ValueString()
+	}
+	if !m.AISummaryContext.IsNull() && !m.AISummaryContext.IsUnknown() {
+		req.AISummaryContext = m.AISummaryContext.ValueString()
 	}
 	return req, diags
 }
@@ -534,6 +648,20 @@ func buildUpdateWorkspaceRequest(ctx context.Context, m *workspaceModel) (terrap
 		}
 		req.VarFiles = varFiles
 	}
+	if !m.TriggerPrefixes.IsNull() && !m.TriggerPrefixes.IsUnknown() {
+		triggerPrefixes := []string{}
+		for _, v := range m.TriggerPrefixes.Elements() {
+			triggerPrefixes = append(triggerPrefixes, v.(types.String).ValueString())
+		}
+		req.TriggerPrefixes = triggerPrefixes
+	}
+	if !m.DriftIgnoreRules.IsNull() && !m.DriftIgnoreRules.IsUnknown() {
+		rules := []string{}
+		for _, v := range m.DriftIgnoreRules.Elements() {
+			rules = append(rules, v.(types.String).ValueString())
+		}
+		req.DriftIgnoreRules = rules
+	}
 	if !m.DriftDetectionEnabled.IsNull() && !m.DriftDetectionEnabled.IsUnknown() {
 		v := m.DriftDetectionEnabled.ValueBool()
 		req.DriftDetectionEnabled = &v
@@ -541,6 +669,13 @@ func buildUpdateWorkspaceRequest(ctx context.Context, m *workspaceModel) (terrap
 	if !m.DriftDetectionIntervalSeconds.IsNull() && !m.DriftDetectionIntervalSeconds.IsUnknown() {
 		v := m.DriftDetectionIntervalSeconds.ValueInt64()
 		req.DriftDetectionIntervalSeconds = &v
+	}
+	if !m.AISummaryMode.IsNull() && !m.AISummaryMode.IsUnknown() {
+		req.AISummaryMode = m.AISummaryMode.ValueString()
+	}
+	if !m.AISummaryContext.IsNull() && !m.AISummaryContext.IsUnknown() {
+		v := m.AISummaryContext.ValueString()
+		req.AISummaryContext = &v
 	}
 	return req, diags
 }
@@ -612,23 +747,122 @@ func readWorkspaceIntoModel(ctx context.Context, ws *terrapod.Workspace, m *work
 	} else {
 		m.DriftLastCheckedAt = types.StringNull()
 	}
-
-	// Var files
-	if len(ws.VarFiles) > 0 {
-		val, d := types.ListValueFrom(ctx, types.StringType, ws.VarFiles)
-		diags.Append(d...)
-		m.VarFiles = val
+	if ws.DriftLatestRunID != "" {
+		m.DriftLatestRunID = types.StringValue(ws.DriftLatestRunID)
 	} else {
-		m.VarFiles = types.ListNull(types.StringType)
+		m.DriftLatestRunID = types.StringNull()
 	}
 
-	// Labels
-	if len(ws.Labels) > 0 {
+	// State + lifecycle + VCS poll status — read-only fields the server
+	// surfaces for diagnostics and operator UX. Empty-string from the
+	// SDK becomes Terraform null so a fresh workspace doesn't show
+	// "empty string" values in the state diff.
+	m.StateDiverged = types.BoolValue(ws.StateDiverged)
+	if ws.LifecycleState != "" {
+		m.LifecycleState = types.StringValue(ws.LifecycleState)
+	} else {
+		m.LifecycleState = types.StringNull()
+	}
+	if ws.LifecycleReason != "" {
+		m.LifecycleReason = types.StringValue(ws.LifecycleReason)
+	} else {
+		m.LifecycleReason = types.StringNull()
+	}
+	if ws.VCSLastPolledAt != "" {
+		m.VCSLastPolledAt = types.StringValue(ws.VCSLastPolledAt)
+	} else {
+		m.VCSLastPolledAt = types.StringNull()
+	}
+	if ws.VCSLastError != "" {
+		m.VCSLastError = types.StringValue(ws.VCSLastError)
+	} else {
+		m.VCSLastError = types.StringNull()
+	}
+	if ws.VCSLastErrorAt != "" {
+		m.VCSLastErrorAt = types.StringValue(ws.VCSLastErrorAt)
+	} else {
+		m.VCSLastErrorAt = types.StringNull()
+	}
+	if ws.AgentPoolName != "" {
+		m.AgentPoolName = types.StringValue(ws.AgentPoolName)
+	} else {
+		m.AgentPoolName = types.StringNull()
+	}
+	if ws.VCSConnectionName != "" {
+		m.VCSConnectionName = types.StringValue(ws.VCSConnectionName)
+	} else {
+		m.VCSConnectionName = types.StringNull()
+	}
+
+	// AI plan summary (#401). The server always returns a concrete
+	// value for `ai-summary-mode` (defaulting to "default"); the
+	// context is the empty string for new workspaces. Pin both to
+	// concrete StringValues so Terraform doesn't see "unknown" drift.
+	if ws.AISummaryMode != "" {
+		m.AISummaryMode = types.StringValue(ws.AISummaryMode)
+	} else {
+		m.AISummaryMode = types.StringValue("default")
+	}
+	m.AISummaryContext = types.StringValue(ws.AISummaryContext)
+
+	// Var files — same null-vs-empty rule as trigger_prefixes above.
+	if m.VarFiles.IsNull() && len(ws.VarFiles) == 0 {
+		m.VarFiles = types.ListNull(types.StringType)
+	} else {
+		vfVal, vfDiag := types.ListValueFrom(ctx, types.StringType, ws.VarFiles)
+		diags.Append(vfDiag...)
+		m.VarFiles = vfVal
+	}
+
+	// Trigger prefixes — repo paths beyond `working_directory` that must
+	// land in the sparse-checkout fetch.
+	//
+	// The null-vs-empty-list ambiguity is the most-bitten edge in the
+	// terraform-plugin-framework Optional list pattern, and we've been
+	// burned by both directions:
+	//
+	// - v0.35.4: Read coerced `[]` to null. A caller that declared
+	//   `trigger_prefixes = []` got plan=[] / apply=null mismatch.
+	// - v0.35.5: Read coerced null to `[]`. A caller that OMITTED the
+	//   field got plan=null / apply=[] mismatch on the very first
+	//   apply against the new provider.
+	//
+	// Right answer: respect what the prior state holds. The framework
+	// passes the prior state into this function via `m`, so checking
+	// `m.TriggerPrefixes.IsNull()` BEFORE we overwrite it lets us
+	// preserve null when the caller's config + prior state were both
+	// null and the API just returned its default empty list. Only
+	// materialise as `[]` when the prior state already had a non-null
+	// list (or when the API returned a populated list).
+	if m.TriggerPrefixes.IsNull() && len(ws.TriggerPrefixes) == 0 {
+		// prior null + server empty → preserve null (caller omitted it)
+		m.TriggerPrefixes = types.ListNull(types.StringType)
+	} else {
+		tpVal, tpDiag := types.ListValueFrom(ctx, types.StringType, ws.TriggerPrefixes)
+		diags.Append(tpDiag...)
+		m.TriggerPrefixes = tpVal
+	}
+
+	// Drift-ignore rules (#482) — same null-vs-empty preservation rule
+	// as trigger_prefixes. Server default `[]` is preserved as null in
+	// state when the caller didn't declare the attribute.
+	if m.DriftIgnoreRules.IsNull() && len(ws.DriftIgnoreRules) == 0 {
+		m.DriftIgnoreRules = types.ListNull(types.StringType)
+	} else {
+		dirVal, dirDiag := types.ListValueFrom(ctx, types.StringType, ws.DriftIgnoreRules)
+		diags.Append(dirDiag...)
+		m.DriftIgnoreRules = dirVal
+	}
+
+	// Labels — same null-vs-empty-map rule as trigger_prefixes above.
+	// `len(nil-map) == 0` so an empty server map collapses to the
+	// preserve-null branch when prior state was null.
+	if m.Labels.IsNull() && len(ws.Labels) == 0 {
+		m.Labels = types.MapNull(types.StringType)
+	} else {
 		val, d := types.MapValueFrom(ctx, types.StringType, ws.Labels)
 		diags.Append(d...)
 		m.Labels = val
-	} else {
-		m.Labels = types.MapNull(types.StringType)
 	}
 	return diags
 }

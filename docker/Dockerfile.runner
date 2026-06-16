@@ -1,49 +1,98 @@
-# Minimal runner image for Terrapod K8s Jobs.
+# Runner image for Terrapod K8s Jobs.
 #
-# No terraform/tofu binary baked in — downloaded at runtime from binary cache.
-# Includes signal-forwarding entrypoint for graceful spot instance termination.
+# Pure Python orchestrator — the bash entrypoint and the curl/jq/tar/unzip
+# tooling it relied on are gone in v0.32.1. Only what the Python
+# orchestrator (terrapod.runner.job_entrypoint) and its phase modules
+# actually need is installed:
+#
+#   - python:3.13-slim base
+#   - git + openssh-client + ca-certificates — for module sources
+#     resolved by `tofu init` (terraform's `git::ssh://...` /
+#     `git::https://...` schemes shell out to system git)
+#   - opa — for the runner-side OPA policy evaluation (#343)
+#
+# Other tools the bash era pulled in (curl, jq, tar, unzip, openssl) are
+# no longer installed. The Python phase modules use httpx for HTTP,
+# json for parsing, tarfile/zipfile for extraction, and the stdlib's
+# TLS stack.
 
-FROM alpine:3.23.4
+# ── Builder ────────────────────────────────────────────────────────────
+# Two jobs: install the runner Python deps, AND download+verify OPA. OPA
+# lives in the builder so the runtime image stays free of curl; the
+# binary is COPY'd into the runtime stage below.
+FROM python:3.13-slim AS builder
+
+# curl + ca-certificates for the OPA download — present only in the
+# builder image, not the runtime.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG TARGETARCH
+ARG OPA_VERSION=1.17.0
+# GitHub Releases intermittently 5xx; --retry-all-errors covers 5xx as
+# well as transport errors. 6 attempts × 4s base = ~25s ceiling.
+RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
+    && BASE="https://github.com/open-policy-agent/opa/releases/download/v${OPA_VERSION}" \
+    && curl -fsSL --retry 6 --retry-delay 4 --retry-all-errors -o /tmp/opa "${BASE}/opa_linux_${ARCH}_static" \
+    && curl -fsSL --retry 6 --retry-delay 4 --retry-all-errors -o /tmp/opa.sha256 "${BASE}/opa_linux_${ARCH}_static.sha256" \
+    && echo "$(cut -d' ' -f1 /tmp/opa.sha256)  /tmp/opa" | sha256sum -c - \
+    && rm /tmp/opa.sha256 \
+    && chmod 0755 /tmp/opa
+
+WORKDIR /build
+COPY services/pyproject-runner.toml pyproject.toml
+RUN pip install --no-cache-dir .
+
+# ── Runtime ────────────────────────────────────────────────────────────
+FROM python:3.13-slim
 LABEL org.opencontainers.image.source=https://github.com/mattrobinsonsre/terrapod
 
-# Bump APK_REFRESH to invalidate the cached layer and pick up the latest
-# Alpine security patches (e.g. nghttp2 1.68.1 fix for CVE-2026-27135).
-ARG APK_REFRESH=2026-05-11
-RUN echo "apk-refresh=${APK_REFRESH}" \
-    && apk upgrade --no-cache \
-    && apk add --no-cache \
-    curl \
-    tar \
-    jq \
-    unzip \
-    git \
-    openssh-client \
-    openssl
+# Bump APT_REFRESH to bust the cached apt layer and re-pull Debian
+# security patches. See Dockerfile.api for the same pattern.
+ARG APT_REFRESH=2026-06-08
+RUN echo "apt-refresh=${APT_REFRESH}" \
+    && apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+        git \
+        openssh-client \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# OPA (Open Policy Agent) — the policy-as-code evaluation engine (#343).
-# The runner evaluates applicable policy sets against the local plan JSON
-# and posts results to the API before reporting plan-result. Pinned,
-# statically-linked binary, SHA256-verified. Kept in sync with the same
-# OPA_VERSION baked into docker/Dockerfile.api and docker/Dockerfile.test.
-# TARGETARCH is set by buildx; fall back to `apk --print-arch` for plain
-# `docker build`.
-ARG TARGETARCH
-ARG OPA_VERSION=1.16.2
-RUN ARCH="${TARGETARCH:-$(apk --print-arch | sed 's/aarch64/arm64/;s/x86_64/amd64/')}" \
-    && BASE="https://github.com/open-policy-agent/opa/releases/download/v${OPA_VERSION}" \
-    && curl -fsSL -o /usr/local/bin/opa "${BASE}/opa_linux_${ARCH}_static" \
-    && curl -fsSL -o /tmp/opa.sha256 "${BASE}/opa_linux_${ARCH}_static.sha256" \
-    && echo "$(cut -d' ' -f1 /tmp/opa.sha256)  /usr/local/bin/opa" | sha256sum -c - \
-    && rm /tmp/opa.sha256 \
-    && chmod 0755 /usr/local/bin/opa \
-    && /usr/local/bin/opa version
+# OPA from the builder stage. Verified there; just copy it.
+COPY --from=builder /tmp/opa /usr/local/bin/opa
+RUN /usr/local/bin/opa version
 
-COPY docker/runner-entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# Python deps from builder
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
 
-RUN mkdir -p /workspace /tmp/bin && chown -R 1000:1000 /workspace /tmp/bin
+# Runner Python module — only what the Job entrypoint imports.
+WORKDIR /app
+COPY services/terrapod/runner/__init__.py ./terrapod/runner/__init__.py
+COPY services/terrapod/runner/runner_config.py ./terrapod/runner/runner_config.py
+COPY services/terrapod/runner/download.py ./terrapod/runner/download.py
+COPY services/terrapod/runner/exec_subprocess.py ./terrapod/runner/exec_subprocess.py
+COPY services/terrapod/runner/lock_extender.py ./terrapod/runner/lock_extender.py
+COPY services/terrapod/runner/plan_artifacts.py ./terrapod/runner/plan_artifacts.py
+COPY services/terrapod/runner/job_entrypoint.py ./terrapod/runner/job_entrypoint.py
+COPY services/terrapod/runner/phases/ ./terrapod/runner/phases/
+
+# /home/runner is the writable HOME for UID 1000 — without it, tools
+# that consult $HOME (helm's repository/index cache, kubectl's
+# ~/.kube/cache, git's ~/.gitconfig, AWS CLI's ~/.aws) fall back to
+# os.UserHomeDir() lookups that resolve to "/" for a UID with no
+# /etc/passwd entry, then write to /.cache/… which isn't writable
+# and triggers misleading "cannot be reached" errors from helm
+# specifically. Keeping HOME off /workspace so terraform's .terraform/
+# and the user's HCL stay separate from tool caches.
+RUN mkdir -p /workspace /tmp/bin /home/runner \
+    && chown -R 1000:1000 /workspace /tmp/bin /home/runner
 
 USER 1000:1000
+ENV HOME=/home/runner \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app
 WORKDIR /workspace
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["python", "-m", "terrapod.runner.job_entrypoint"]

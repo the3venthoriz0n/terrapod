@@ -276,6 +276,48 @@ Each version exposes VCS metadata in the API response:
 | `vcs-commit-sha` | The git commit SHA this version was built from (empty for manual uploads) |
 | `vcs-tag` | The tag name that matched (e.g. `v1.2.3`; empty for manual uploads) |
 
+### Module Interface (Inputs & Outputs)
+
+When a module version is published (via upload or VCS tag), Terrapod parses the `.tf` files at the module root to extract Terraform `variable` and `output` declarations. This metadata is stored with the version and displayed in the web UI as an expandable "Inputs & Outputs" card on the module detail page.
+
+**Extracted fields:**
+
+| Block | Fields |
+|---|---|
+| `variable` | name, type, type_schema, description, default, required, sensitive |
+| `output` | name, description, sensitive |
+
+`type` is the human-readable HCL type expression (e.g. `map(string)`). `type_schema` is the equivalent JSON Schema object, ready for client-side input validation without a server round-trip:
+
+| HCL type | `type_schema` |
+|---|---|
+| `string` | `{"type": "string"}` |
+| `number` | `{"type": "number"}` |
+| `bool` | `{"type": "boolean"}` |
+| `list(string)` | `{"type": "array", "items": {"type": "string"}}` |
+| `map(string)` | `{"type": "object", "additionalProperties": {"type": "string"}}` |
+| `object({name = string})` | `{"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}` |
+
+**API endpoint:**
+
+```text
+GET /api/terrapod/v1/registry-modules/private/default/{name}/{provider}/{version}/interface
+```
+
+Returns `inputs` and `outputs` arrays. Returns `null` for versions published before this feature was enabled or when the feature is disabled.
+
+**Configuration:**
+
+```yaml
+api:
+  config:
+    registry:
+      module_interface:
+        enabled: true   # set to false to disable extraction and hide the endpoint
+```
+
+When disabled, the endpoint returns 404 and no HCL parsing occurs during ingest. The web UI gracefully shows "No interface data available" for versions without interface data.
+
 ---
 
 ## Module Impact Analysis
@@ -525,7 +567,8 @@ The provider cache implements the Terraform network mirror protocol. Runner Jobs
    }
    ```
 2. Terraform requests `{version}.json` from the mirror URL (authenticated via credentials block)
-3. Terrapod uses a **three-tier cache lookup**:
+3. Terrapod uses a **four-tier cache lookup**:
+   - **Tier 0 — Self-hosted registry**: when the request hostname matches Terrapod's own `external_url`, the private provider registry tables are authoritative. Self-served providers (e.g. the platform `terrapod` provider, or any operator-published provider) are returned with presigned URLs plus both `zh:` (SHA-256) and `h1:` (terraform/tofu dirhash) so the runner's lock-extender can splice the lock entry directly into `.terraform.lock.hcl` without a `tofu providers lock` fallback. The `h1_hash` is computed eagerly at upload-confirm time and lazy-backfilled on first read for older rows.
    - **Tier 1 — Postgres**: check for cached binaries in object storage. Cached platforms get presigned download URLs
    - **Tier 2 — Redis**: check for upstream metadata (24h TTL). Uncached platforms get proxy download URLs
    - **Tier 3 — Upstream**: fetch metadata from upstream registry, cache in Redis, return proxy URLs
@@ -562,7 +605,22 @@ Returns a version list for the provider.
 GET /v1/providers/{hostname}/{namespace}/{type}/{version}.json
 ```
 
-Returns platform-specific download info with `zh:` (zip hash) checksums. Cached platforms get presigned storage URLs; uncached platforms get proxy download URLs.
+Returns platform-specific download info with `zh:` (zip hash) checksums. Cached platforms get presigned storage URLs; uncached platforms get proxy download URLs. Cached platforms additionally carry the precomputed `h1:` directory hash in their `hashes` array (see "Cross-arch lock-file extension" below).
+
+The response also includes a top-level `cached_platforms` field — the list of `{os}_{arch}` strings the operator has configured under `registry.provider_cache.platforms`. The runner's lock-extender uses this to distinguish "no h1 because the operator deliberately doesn't cache this arch" (silent skip, no fallback) from "no h1 because compute failed" (warn + fallback). Single-arch deployments stop logging spurious "no h1 from mirror" warnings.
+
+### Cross-arch lock-file extension
+
+When a runner Job's plan phase runs on `linux/arm64` but the matching apply lands on `linux/amd64` (or vice-versa) — common on mixed-arch nodepools or after a spot reschedule — `tofu init` at the apply pod will reject the workspace's `.terraform.lock.hcl` because its `h1:` hashes only cover the plan-arch's archive contents.
+
+Terrapod extends the lock file at plan time so the OTHER architecture's `h1:` is present when the apply runs. The cheap path: the mirror has already cached the archive, so it returns the precomputed `h1:` in `{version}.json`'s `hashes` array; the runner's lock-extender splices the hash directly into `.terraform.lock.hcl` — one ~1 KB JSON request per provider, **no archive downloads**.
+
+Behaviour when `h1:` is absent from the mirror response depends on the operator's `provider_cache.platforms` config:
+
+- **Other-arch is in `cached_platforms`** but the mirror returned no `h1:` for it (compute failed at ingest, or the cached row predates h1 tracking): the runner backfills h1 lazily on the next request from the cached archive bytes, then serves it. If backfill also fails, the runner falls through to `tofu providers lock -platform=<other_arch>` which downloads the archive itself. Each download primes the mirror's cache; subsequent plans take the cheap path.
+- **Other-arch is NOT in `cached_platforms`**: the operator has deliberately scoped the mirror to a subset of arches — for example a single-arch cluster that will never run apply on the other arch. The lock-extender treats this as a silent skip: no warning, no archive download, no `providers lock` fallback.
+
+Operators don't need to configure anything for this — the lock-extender runs automatically during the plan phase whenever `.terraform.lock.hcl` exists and the runner detects a supported arch (`linux_amd64` or `linux_arm64`). Look for `runner.lock_extender` log lines in plan output to see hit/miss per provider.
 
 ```
 GET /v1/providers/{hostname}/{namespace}/{type}/{version}/download/{os}/{arch}

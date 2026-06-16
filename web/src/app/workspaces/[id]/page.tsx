@@ -11,6 +11,7 @@ import { SortableHeader } from '@/components/sortable-header'
 import { LabelsEditor } from '@/components/labels-editor'
 import { HealthConditions } from '@/components/health-conditions'
 import { PlanSummaryBadges } from '@/components/plan-summary-badges'
+import { WorkspacePicker } from '@/components/workspace-picker'
 import { getAuthState, isAdmin } from '@/lib/auth'
 import { apiFetch } from '@/lib/api'
 import { useSortable } from '@/lib/use-sortable'
@@ -46,6 +47,7 @@ interface WorkspaceAttrs {
   'owner-email': string
   'var-files': string[]
   'trigger-prefixes': string[]
+  'drift-ignore-rules': string[]
   'vcs-repo-url': string
   'vcs-branch': string
   'vcs-connection-id': string | null
@@ -53,6 +55,8 @@ interface WorkspaceAttrs {
   'vcs-workflow': 'merge_then_apply' | 'apply_then_merge'
   'auto-merge': boolean
   'auto-merge-strategy': 'merge' | 'squash' | 'rebase'
+  'ai-summary-mode': 'default' | 'enabled' | 'disabled'
+  'ai-summary-context': string
   'drift-detection-enabled': boolean
   'drift-detection-interval-seconds': number
   'drift-last-checked-at': string
@@ -203,9 +207,9 @@ const ALL_TRIGGERS = [
 const ALL_STAGES = ['pre_plan', 'post_plan', 'pre_apply'] as const
 const ALL_ENFORCEMENT_LEVELS = ['mandatory', 'advisory'] as const
 
-type Tab = 'overview' | 'variables' | 'runs' | 'state' | 'configurations' | 'notifications' | 'run-tasks' | 'sharing'
+type Tab = 'overview' | 'variables' | 'runs' | 'state' | 'configurations' | 'notifications' | 'run-tasks' | 'run-triggers' | 'sharing'
 
-const VALID_TABS: Set<string> = new Set(['overview', 'variables', 'runs', 'state', 'configurations', 'notifications', 'run-tasks', 'sharing'])
+const VALID_TABS: Set<string> = new Set(['overview', 'variables', 'runs', 'state', 'configurations', 'notifications', 'run-tasks', 'run-triggers', 'sharing'])
 
 export default function WorkspaceDetailPage() {
   return (
@@ -250,6 +254,8 @@ function WorkspaceDetailContent() {
   const [newVarFile, setNewVarFile] = useState('')
   const [editTriggerPrefixes, setEditTriggerPrefixes] = useState<string[]>([])
   const [newTriggerPrefix, setNewTriggerPrefix] = useState('')
+  const [editDriftIgnoreRules, setEditDriftIgnoreRules] = useState<string[]>([])
+  const [newDriftIgnoreRule, setNewDriftIgnoreRule] = useState('')
   const [editWorkingDir, setEditWorkingDir] = useState('')
   const [editVcsConnectionId, setEditVcsConnectionId] = useState<string | null>(null)
   const [editVcsRepoUrl, setEditVcsRepoUrl] = useState('')
@@ -338,6 +344,12 @@ function WorkspaceDetailContent() {
   const [checkingDrift, setCheckingDrift] = useState(false)
   const [dismissingDrift, setDismissingDrift] = useState(false)
 
+  // AI plan summary (#401). Local draft for the context textarea so we
+  // can autosave on blur rather than every keystroke; mode is saved on
+  // dropdown change directly.
+  const [savingAiSummary, setSavingAiSummary] = useState(false)
+  const [aiSummaryContextDraft, setAiSummaryContextDraft] = useState<string | null>(null)
+
   // Delete confirmation
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [deleting, setDeleting] = useState(false)
@@ -358,8 +370,23 @@ function WorkspaceDetailContent() {
   const [rscOutbound, setRscOutbound] = useState<RemoteStateEdge[]>([])
   const [rscInbound, setRscInbound] = useState<RemoteStateEdge[]>([])
   const [rscLoading, setRscLoading] = useState(false)
-  const [rscAddName, setRscAddName] = useState('')
+  const [rscAddingId, setRscAddingId] = useState('')
   const [rscAdding, setRscAdding] = useState(false)
+
+  // Run Triggers — cross-workspace apply-fires-plan dependency edges
+  interface RunTriggerEdge {
+    id: string
+    workspaceId: string
+    workspaceName: string
+    sourceableId: string
+    sourceableName: string
+    createdAt: string
+  }
+  const [trgInbound, setTrgInbound] = useState<RunTriggerEdge[]>([])
+  const [trgOutbound, setTrgOutbound] = useState<RunTriggerEdge[]>([])
+  const [trgLoading, setTrgLoading] = useState(false)
+  const [trgAddingId, setTrgAddingId] = useState('')
+  const [trgAdding, setTrgAdding] = useState(false)
 
   // Notifications
   const [notifications, setNotifications] = useState<NotificationConfig[]>([])
@@ -451,7 +478,6 @@ function WorkspaceDetailContent() {
   }, [router, loadWorkspace])
 
   const loadRuns = useCallback(async () => {
-    setRunsLoading(true)
     try {
       const res = await apiFetch(`/api/v2/workspaces/${workspaceId}/runs`)
       if (!res.ok) throw new Error('Failed to load runs')
@@ -492,6 +518,7 @@ function WorkspaceDetailContent() {
     if (activeTab === 'configurations') loadConfigurations()
     if (activeTab === 'notifications') loadNotifications()
     if (activeTab === 'run-tasks') loadRunTasks()
+    if (activeTab === 'run-triggers') loadRunTriggers()
   }, [activeTab, workspace, loadRuns])
 
   // Load VCS refs when plan options panel opens on a VCS-connected workspace
@@ -511,12 +538,18 @@ function WorkspaceDetailContent() {
   // Real-time workspace events via SSE (run status, lock/unlock, state, settings)
   useRunEvents(workspaceId, useCallback((event) => {
     loadWorkspace()
+    const ev = event.event
+    const reconnect = ev === 'reconnect'
     if (activeTab === 'runs') loadRuns()
-    if (activeTab === 'state' && (event.event === 'state_version_created' || event.event === 'reconnect')) loadStateVersions()
+    if (activeTab === 'state' && (ev === 'state_version_created' || reconnect)) loadStateVersions()
+    if (activeTab === 'variables' && (ev === 'workspace_variable_change' || reconnect)) loadVariables()
+    if (activeTab === 'notifications' && (ev === 'workspace_notification_change' || reconnect)) loadNotifications()
+    if (activeTab === 'run-tasks' && (ev === 'workspace_run_task_change' || reconnect)) loadRunTasks()
+    if (activeTab === 'run-triggers' && (ev === 'run_trigger_change' || reconnect)) loadRunTriggers()
+    if (activeTab === 'sharing' && (ev === 'remote_state_consumer_change' || reconnect)) loadRemoteStateConsumers()
   }, [activeTab, loadRuns, loadWorkspace]))
 
   async function loadVariables() {
-    setVarsLoading(true)
     try {
       const res = await apiFetch(`/api/v2/workspaces/${workspaceId}/vars`)
       if (!res.ok) throw new Error('Failed to load variables')
@@ -530,7 +563,6 @@ function WorkspaceDetailContent() {
   }
 
   async function loadStateVersions() {
-    setStateLoading(true)
     try {
       const res = await apiFetch(`/api/v2/workspaces/${workspaceId}/state-versions`)
       if (!res.ok) throw new Error('Failed to load state versions')
@@ -689,20 +721,11 @@ function WorkspaceDetailContent() {
     }
   }
 
-  async function addRemoteStateConsumer() {
-    const name = rscAddName.trim()
-    if (!name) return
+  async function addRemoteStateConsumer(consumerId: string) {
+    if (!consumerId) return
+    setRscAddingId(consumerId)
     setRscAdding(true)
     try {
-      // Resolve consumer workspace name → id via the by-name endpoint.
-      const lookup = await apiFetch(`/api/v2/organizations/default/workspaces/${encodeURIComponent(name)}`)
-      if (!lookup.ok) {
-        throw new Error(lookup.status === 404 ? `Workspace "${name}" not found` : 'Failed to resolve consumer workspace')
-      }
-      const wsBody = await lookup.json()
-      const consumerId = wsBody.data?.id
-      if (!consumerId) throw new Error('Workspace lookup returned no id')
-
       const res = await apiFetch(
         `/api/terrapod/v1/workspaces/${workspaceId}/remote-state-consumers`,
         {
@@ -717,12 +740,12 @@ function WorkspaceDetailContent() {
         const err = await res.json().catch(() => ({ detail: 'Failed to authorize consumer' }))
         throw new Error(err.detail || 'Failed to authorize consumer')
       }
-      setRscAddName('')
       await loadRemoteStateConsumers()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to authorize consumer')
     } finally {
       setRscAdding(false)
+      setRscAddingId('')
     }
   }
 
@@ -736,6 +759,79 @@ function WorkspaceDetailContent() {
       await loadRemoteStateConsumers()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to revoke consumer')
+    }
+  }
+
+  function _trgFromRow(row: { id: string; relationships?: { workspace?: { data?: { id: string } }; sourceable?: { data?: { id: string } } }; attributes: { 'workspace-name'?: string; 'sourceable-name'?: string; 'created-at'?: string } }): RunTriggerEdge {
+    return {
+      id: row.id,
+      workspaceId: row.relationships?.workspace?.data?.id || '',
+      workspaceName: row.attributes['workspace-name'] || '',
+      sourceableId: row.relationships?.sourceable?.data?.id || '',
+      sourceableName: row.attributes['sourceable-name'] || '',
+      createdAt: row.attributes['created-at'] || '',
+    }
+  }
+
+  async function loadRunTriggers() {
+    setTrgLoading(true)
+    try {
+      const base = `/api/terrapod/v1/workspaces/${workspaceId}/run-triggers`
+      const [inRes, outRes] = await Promise.all([
+        apiFetch(`${base}?filter[run-trigger][type]=inbound`),
+        apiFetch(`${base}?filter[run-trigger][type]=outbound`),
+      ])
+      if (!inRes.ok) throw new Error('Failed to load inbound run triggers')
+      if (!outRes.ok) throw new Error('Failed to load outbound run triggers')
+      const inData = await inRes.json()
+      const outData = await outRes.json()
+      setTrgInbound((inData.data || []).map(_trgFromRow))
+      setTrgOutbound((outData.data || []).map(_trgFromRow))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load run triggers')
+    } finally {
+      setTrgLoading(false)
+    }
+  }
+
+  async function addRunTrigger(sourceId: string) {
+    if (!sourceId) return
+    setTrgAddingId(sourceId)
+    setTrgAdding(true)
+    try {
+      const res = await apiFetch(
+        `/api/terrapod/v1/workspaces/${workspaceId}/run-triggers`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/vnd.api+json' },
+          body: JSON.stringify({
+            data: { relationships: { sourceable: { data: { id: sourceId, type: 'workspaces' } } } },
+          }),
+        },
+      )
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Failed to add run trigger' }))
+        throw new Error(err.detail || 'Failed to add run trigger')
+      }
+      await loadRunTriggers()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to add run trigger')
+    } finally {
+      setTrgAdding(false)
+      setTrgAddingId('')
+    }
+  }
+
+  async function removeRunTrigger(triggerId: string) {
+    try {
+      const res = await apiFetch(`/api/terrapod/v1/run-triggers/${triggerId}`, { method: 'DELETE' })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Failed to remove run trigger' }))
+        throw new Error(err.detail || 'Failed to remove run trigger')
+      }
+      await loadRunTriggers()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to remove run trigger')
     }
   }
 
@@ -832,6 +928,8 @@ function WorkspaceDetailContent() {
     setNewVarFile('')
     setEditTriggerPrefixes(workspace.attributes['trigger-prefixes'] || [])
     setNewTriggerPrefix('')
+    setEditDriftIgnoreRules(workspace.attributes['drift-ignore-rules'] || [])
+    setNewDriftIgnoreRule('')
     setEditWorkingDir(workspace.attributes['working-directory'] || '')
     setEditVcsConnectionId(workspace.attributes['vcs-connection-id'] || null)
     setEditVcsRepoUrl(workspace.attributes['vcs-repo-url'] || '')
@@ -888,6 +986,7 @@ function WorkspaceDetailContent() {
               'working-directory': editWorkingDir,
               'var-files': editVarFiles,
               'trigger-prefixes': editTriggerPrefixes,
+              'drift-ignore-rules': editDriftIgnoreRules,
               'vcs-repo-url': editVcsRepoUrl,
               'vcs-branch': editVcsBranch,
               'vcs-workflow': editVcsWorkflow,
@@ -936,6 +1035,30 @@ function WorkspaceDetailContent() {
       await loadWorkspace()
     } catch (err) {
       setError(err instanceof Error ? err.message : `Failed to ${action} workspace`)
+    }
+  }
+
+  // AI plan summary (#401)
+  async function handleAiSummaryAttrUpdate(patch: { 'ai-summary-mode'?: string; 'ai-summary-context'?: string }) {
+    if (!workspace) return
+    setSavingAiSummary(true)
+    try {
+      const res = await apiFetch(`/api/v2/workspaces/${workspaceId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/vnd.api+json' },
+        body: JSON.stringify({ data: { type: 'workspaces', attributes: patch } }),
+      })
+      if (!res.ok) {
+        const body = await res.text()
+        throw new Error(body || 'Failed to update AI summary settings')
+      }
+      const data = await res.json()
+      setWorkspace(data.data)
+      setAiSummaryContextDraft(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update AI summary settings')
+    } finally {
+      setSavingAiSummary(false)
     }
   }
 
@@ -1338,6 +1461,7 @@ function WorkspaceDetailContent() {
     { key: 'configurations', label: 'Configurations' },
     { key: 'notifications', label: 'Notifications' },
     { key: 'run-tasks', label: 'Run Tasks' },
+    { key: 'run-triggers', label: 'Run Triggers' },
     { key: 'sharing', label: 'Sharing' },
   ]
 
@@ -1345,7 +1469,7 @@ function WorkspaceDetailContent() {
     switch (status) {
       case 'applied': return 'bg-green-900/50 text-green-300'
       case 'planned': return 'bg-blue-900/50 text-blue-300'
-      case 'planning': case 'applying': return 'bg-yellow-900/50 text-yellow-300'
+      case 'planning': case 'applying': case 'canceling': return 'bg-yellow-900/50 text-yellow-300'
       case 'errored': return 'bg-red-900/50 text-red-300'
       case 'canceled': case 'discarded': return 'bg-slate-700 text-slate-400'
       default: return 'bg-slate-700 text-slate-400'
@@ -1864,6 +1988,68 @@ function WorkspaceDetailContent() {
                     </dd>
                   )}
                 </div>
+                <div className="sm:col-span-2">
+                  <dt className="text-xs text-slate-500 mb-1">Drift Ignore Rules</dt>
+                  {editing && perms['can-update'] ? (
+                    <div className="space-y-2">
+                      <p className="text-xs text-slate-400">
+                        Glob-aware Terraform address + attribute paths suppressed by the drift classifier. <code className="text-[10px] bg-slate-800 px-1">*</code> matches zero or more non-<code className="text-[10px] bg-slate-800 px-1">.</code> chars (spans <code className="text-[10px] bg-slate-800 px-1">[N]</code> indices); <code className="text-[10px] bg-slate-800 px-1">[*]</code> matches any bracketed index. A bare address with no attribute suffix silences any change to that resource — including destroys. Affects drift only, not regular plan/apply. See <a href="https://github.com/mattrobinsonsre/terrapod/blob/main/docs/drift-ignore-rules.md" target="_blank" rel="noreferrer" className="text-brand-400 hover:underline">drift-ignore-rules.md</a> for the full grammar.
+                      </p>
+                      {editDriftIgnoreRules.map((r, i) => (
+                        <div key={`${r}-${i}`} className="flex items-center gap-2">
+                          <code className="text-sm text-slate-200 bg-slate-700 px-2 py-0.5 rounded flex-1 truncate">{r}</code>
+                          <button
+                            onClick={() => setEditDriftIgnoreRules(editDriftIgnoreRules.filter((_, j) => j !== i))}
+                            className="text-xs text-red-400 hover:text-red-300"
+                          >Remove</button>
+                        </div>
+                      ))}
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          value={newDriftIgnoreRule}
+                          onChange={(e) => setNewDriftIgnoreRule(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && newDriftIgnoreRule.trim()) {
+                              e.preventDefault()
+                              const v = newDriftIgnoreRule.trim()
+                              if (v && !editDriftIgnoreRules.includes(v)) {
+                                setEditDriftIgnoreRules([...editDriftIgnoreRules, v])
+                              }
+                              setNewDriftIgnoreRule('')
+                            }
+                          }}
+                          placeholder="e.g. module.eks*.argocd_cluster.*.config.tls_client_config.ca_data"
+                          className="flex-1 px-2 py-1 text-sm border border-slate-600 rounded bg-slate-700 text-slate-100 focus:outline-none focus:ring-1 focus:ring-brand-500 font-mono"
+                        />
+                        <button
+                          onClick={() => {
+                            if (newDriftIgnoreRule.trim()) {
+                              const v = newDriftIgnoreRule.trim()
+                              if (v && !editDriftIgnoreRules.includes(v)) {
+                                setEditDriftIgnoreRules([...editDriftIgnoreRules, v])
+                              }
+                              setNewDriftIgnoreRule('')
+                            }
+                          }}
+                          className="text-xs text-brand-400 hover:text-brand-300"
+                        >Add</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <dd className="mt-1 text-sm text-slate-200">
+                      {(attrs['drift-ignore-rules'] || []).length > 0 ? (
+                        <div className="flex flex-col gap-1">
+                          {attrs['drift-ignore-rules'].map((r) => (
+                            <code key={r} className="bg-slate-700 px-2 py-0.5 rounded text-xs font-mono">{r}</code>
+                          ))}
+                        </div>
+                      ) : (
+                        <span className="text-slate-500">None (every plan diff counts as drift)</span>
+                      )}
+                    </dd>
+                  )}
+                </div>
               </dl>
               {lockoutWarning && (
                 <div className="mt-4 p-3 bg-amber-900/30 border border-amber-700/50 rounded-lg">
@@ -1987,6 +2173,83 @@ function WorkspaceDetailContent() {
                     </button>
                   </div>
                 )}
+              </dl>
+            </div>
+
+            {/* AI Plan Summary (#401) */}
+            <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 p-6">
+              <div className="flex items-center justify-between mb-4">
+                <div>
+                  <h3 className="text-sm font-medium text-slate-300">AI Plan Summary</h3>
+                  <p className="text-xs text-slate-500 mt-1">
+                    Automatic LLM-generated change summary, risk assessment, and failure
+                    analysis on every plan-phase outcome for this workspace.
+                  </p>
+                </div>
+              </div>
+              <dl className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <dt className="text-xs text-slate-500">Mode</dt>
+                  <dd className="mt-1">
+                    {perms['can-update'] ? (
+                      <select
+                        value={attrs['ai-summary-mode'] || 'default'}
+                        onChange={(e) => handleAiSummaryAttrUpdate({ 'ai-summary-mode': e.target.value })}
+                        disabled={savingAiSummary}
+                        className="w-full px-2 py-1 text-sm border border-slate-600 rounded bg-slate-700 text-slate-100 focus:outline-none focus:ring-1 focus:ring-brand-500"
+                      >
+                        <option value="default">Follow deployment default</option>
+                        <option value="enabled">Always summarise</option>
+                        <option value="disabled">Never summarise</option>
+                      </select>
+                    ) : (
+                      <span className="text-sm text-slate-200">
+                        {attrs['ai-summary-mode'] === 'enabled'
+                          ? 'Always summarise'
+                          : attrs['ai-summary-mode'] === 'disabled'
+                            ? 'Never summarise'
+                            : 'Follow deployment default'}
+                      </span>
+                    )}
+                  </dd>
+                </div>
+                <div className="sm:col-span-2">
+                  <dt className="text-xs text-slate-500">
+                    Workspace context
+                    <span className="ml-2 text-slate-600">(optional, additive)</span>
+                  </dt>
+                  <dd className="mt-1">
+                    {perms['can-update'] ? (
+                      <textarea
+                        value={aiSummaryContextDraft ?? attrs['ai-summary-context'] ?? ''}
+                        onChange={(e) => setAiSummaryContextDraft(e.target.value)}
+                        onBlur={() => {
+                          if (
+                            aiSummaryContextDraft !== null &&
+                            aiSummaryContextDraft !== (attrs['ai-summary-context'] ?? '')
+                          ) {
+                            handleAiSummaryAttrUpdate({ 'ai-summary-context': aiSummaryContextDraft })
+                          } else {
+                            setAiSummaryContextDraft(null)
+                          }
+                        }}
+                        placeholder="Facts the AI should know about this workspace specifically. e.g. 'Fronts the vault for service X — destroying the KMS key causes a global outage.'"
+                        rows={3}
+                        maxLength={4000}
+                        disabled={savingAiSummary}
+                        className="w-full px-3 py-2 text-sm border border-slate-600 rounded bg-slate-700 text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-brand-500 font-mono"
+                      />
+                    ) : attrs['ai-summary-context'] ? (
+                      <p className="text-sm text-slate-200 whitespace-pre-wrap">{attrs['ai-summary-context']}</p>
+                    ) : (
+                      <p className="text-sm text-slate-500 italic">No workspace context set.</p>
+                    )}
+                    <p className="text-xs text-slate-500 mt-1">
+                      Added on top of deployment-wide context. Max 4000 characters.
+                      {savingAiSummary && <span className="ml-2 text-brand-400">Saving…</span>}
+                    </p>
+                  </dd>
+                </div>
               </dl>
             </div>
 
@@ -3031,6 +3294,79 @@ function WorkspaceDetailContent() {
           </div>
         )}
 
+        {/* Run Triggers Tab — cross-workspace apply-fires-plan edges */}
+        {activeTab === 'run-triggers' && (
+          <div>
+            <div className="flex items-baseline justify-between mb-1">
+              <h3 className="text-lg font-semibold text-slate-200">Run Triggers</h3>
+              {trgLoading && <span className="text-xs text-slate-500">loading…</span>}
+            </div>
+            <p className="text-xs text-slate-500 mb-6">
+              When a source workspace completes an apply, downstream workspaces get a new run queued automatically. Up to 20 source workspaces per destination.
+            </p>
+
+            {/* Inbound — source workspaces that trigger runs HERE */}
+            <div className="mb-8">
+              <h4 className="text-sm font-medium text-slate-300 mb-2">Source workspaces that trigger runs here</h4>
+              {trgInbound.length === 0 ? (
+                <p className="text-sm text-slate-500 italic">No source workspaces trigger runs on this workspace.</p>
+              ) : (
+                <ul className="space-y-1">
+                  {trgInbound.map((t) => (
+                    <li key={t.id} className="flex items-center justify-between gap-3 rounded bg-slate-800/40 px-3 py-2 text-sm">
+                      <div>
+                        <a href={`/workspaces/${t.sourceableId}`} className="text-brand-400 hover:text-brand-300 font-medium">
+                          {t.sourceableName || t.sourceableId}
+                        </a>
+                      </div>
+                      {perms['can-update'] && (
+                        <button
+                          type="button"
+                          onClick={() => removeRunTrigger(t.id)}
+                          className="rounded px-2 py-1 text-xs font-medium bg-red-900/40 text-red-200 hover:bg-red-900/60"
+                        >
+                          Remove
+                        </button>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              {perms['can-update'] && (
+                <div className="mt-3" data-testid="run-trigger-picker">
+                  <WorkspacePicker
+                    placeholder="Search workspaces to add as a source…"
+                    excludeIds={[workspaceId, ...trgInbound.map((e) => e.sourceableId)]}
+                    busyId={trgAddingId}
+                    disabled={trgAdding}
+                    onSelect={(ws) => addRunTrigger(ws.id)}
+                  />
+                </div>
+              )}
+            </div>
+
+            {/* Outbound — destination workspaces this one triggers */}
+            <div>
+              <h4 className="text-sm font-medium text-slate-300 mb-2">Destination workspaces this workspace triggers</h4>
+              {trgOutbound.length === 0 ? (
+                <p className="text-sm text-slate-500 italic">This workspace does not trigger runs on any other workspace.</p>
+              ) : (
+                <ul className="space-y-1">
+                  {trgOutbound.map((t) => (
+                    <li key={t.id} className="rounded bg-slate-800/40 px-3 py-2 text-sm">
+                      <a href={`/workspaces/${t.workspaceId}`} className="text-brand-400 hover:text-brand-300 font-medium">
+                        {t.workspaceName || t.workspaceId}
+                      </a>
+                      <span className="ml-2 text-xs text-slate-500">(destination; remove from there)</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* Sharing Tab — cross-workspace remote-state allowlist (#344, #349) */}
         {activeTab === 'sharing' && (
           <div>
@@ -3079,26 +3415,15 @@ function WorkspaceDetailContent() {
               )}
 
               {perms['can-update'] && (
-                <form
-                  onSubmit={(e) => { e.preventDefault(); addRemoteStateConsumer() }}
-                  className="mt-3 flex items-center gap-2"
-                >
-                  <input
-                    type="text"
-                    value={rscAddName}
-                    onChange={(e) => setRscAddName(e.target.value)}
-                    placeholder="Authorize consumer workspace by name"
-                    className="flex-1 rounded border border-slate-700 bg-slate-900 px-3 py-1.5 text-sm text-slate-200 placeholder-slate-500"
+                <div className="mt-3" data-testid="remote-state-consumer-picker">
+                  <WorkspacePicker
+                    placeholder="Search workspaces to authorize as a consumer…"
+                    excludeIds={[workspaceId, ...rscOutbound.map((e) => e.consumerId)]}
+                    busyId={rscAddingId}
                     disabled={rscAdding}
+                    onSelect={(ws) => addRemoteStateConsumer(ws.id)}
                   />
-                  <button
-                    type="submit"
-                    disabled={rscAdding || !rscAddName.trim()}
-                    className="rounded bg-brand-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-brand-500 disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    {rscAdding ? 'Authorizing…' : 'Authorize'}
-                  </button>
-                </form>
+                </div>
               )}
             </div>
 

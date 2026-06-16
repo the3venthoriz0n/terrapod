@@ -23,7 +23,10 @@ from terrapod.api.dependencies import AuthenticatedUser, get_current_user
 from terrapod.db.models import StateVersion, Workspace
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
-from terrapod.services.workspace_rbac_service import has_permission, resolve_workspace_permission
+from terrapod.services.workspace_rbac_service import (
+    has_permission,
+    resolve_workspace_permission_for,
+)
 from terrapod.storage import get_storage
 from terrapod.storage.keys import state_key
 
@@ -51,7 +54,7 @@ async def _require_sv_workspace_permission(
     ws = await db.get(Workspace, sv.workspace_id)
     if ws is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if not has_permission(perm, required):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -130,6 +133,7 @@ async def delete_state_version(
 
 @router.post("/state-versions/{state_version_id}/actions/rollback")
 async def rollback_state_version(
+    request: Request,
     state_version_id: str = Path(...),
     user: AuthenticatedUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -203,7 +207,7 @@ async def rollback_state_version(
     from terrapod.api.routers.tfe_v2 import _state_version_json
 
     return JSONResponse(
-        content=_state_version_json(new_sv),
+        content=_state_version_json(new_sv, request),
         status_code=201,
     )
 
@@ -223,7 +227,7 @@ async def upload_state_manual(
     from terrapod.api.routers.tfe_v2 import _get_workspace_by_id
 
     ws = await _get_workspace_by_id(workspace_id, db)
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if not has_permission(perm, "write"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -287,6 +291,6 @@ async def upload_state_manual(
     from terrapod.api.routers.tfe_v2 import _state_version_json
 
     return JSONResponse(
-        content=_state_version_json(sv),
+        content=_state_version_json(sv, request),
         status_code=201,
     )

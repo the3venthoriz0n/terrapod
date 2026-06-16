@@ -48,6 +48,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from terrapod.api.dependencies import (
     DEFAULT_ORG,
     AuthenticatedUser,
+    effective_platform_roles,
     get_current_user,
     require_non_runner,
 )
@@ -63,11 +64,11 @@ from terrapod.db.models import (
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
 from terrapod.services import agent_pool_service as _agent_pool_service
-from terrapod.services.pool_rbac_service import has_pool_permission, resolve_pool_permission
+from terrapod.services.pool_rbac_service import has_pool_permission, resolve_pool_permission_for
 from terrapod.services.workspace_rbac_service import (
     PERMISSION_HIERARCHY,
     has_permission,
-    resolve_workspace_permission,
+    resolve_workspace_permission_for,
 )
 from terrapod.storage import get_storage
 from terrapod.storage.keys import state_index_key, state_key
@@ -175,6 +176,55 @@ def _validate_trigger_prefixes(raw: object) -> list[str]:
         if not v:
             raise HTTPException(
                 status_code=422, detail="trigger-prefixes entries must be non-empty"
+            )
+        result.append(v)
+    return result
+
+
+_DRIFT_IGNORE_RULE_RE = re.compile(r"^[A-Za-z0-9_*.\-\[\]\"]+$")
+
+
+def _validate_drift_ignore_rules(raw: object) -> list[str]:
+    """Validate `drift-ignore-rules` input (#482).
+
+    Each entry is a glob-aware Terraform-address-plus-attribute-path
+    string consumed by `drift_ignore_classifier.classify_drift`. The
+    character set is intentionally narrow — letters, digits, the
+    delimiters `.` `[` `]` `*`, plus underscore, hyphen, double quote
+    (for `for_each` keys). Anything else is rejected so a stray space
+    or backtick can't sneak through and cause a regex-compile failure
+    later in the drift-classifier path. Max 50 entries; max 500 chars
+    per entry (loose enough for `module.x.module.y.aws_iam_policy.z
+    .statements[*].conditions[*].values[*]`-style paths without
+    risking unbounded growth).
+    """
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=422, detail="drift-ignore-rules must be a list of strings")
+    if len(raw) > 50:
+        raise HTTPException(status_code=422, detail="drift-ignore-rules: maximum 50 entries")
+    result: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            raise HTTPException(
+                status_code=422, detail="drift-ignore-rules entries must be strings"
+            )
+        v = entry.strip()
+        if not v:
+            raise HTTPException(
+                status_code=422, detail="drift-ignore-rules entries must be non-empty"
+            )
+        if len(v) > 500:
+            raise HTTPException(
+                status_code=422,
+                detail="drift-ignore-rules entries must be ≤ 500 characters",
+            )
+        if not _DRIFT_IGNORE_RULE_RE.match(v):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "drift-ignore-rules entries may only contain letters, digits, "
+                    "underscores, hyphens, dots, brackets, asterisks, and double quotes"
+                ),
             )
         result.append(v)
     return result
@@ -337,11 +387,11 @@ async def account_details(
                 "attributes": {
                     "username": username,
                     "email": user.email,
-                    "is-service-account": user.auth_method == "api_token",
+                    "is-service-account": user.kind in ("service_bound", "service_detached"),
                     "avatar-url": "",
                     "v2-only": False,
                     "permissions": {
-                        "can-create-organizations": "admin" in user.roles,
+                        "can-create-organizations": "admin" in effective_platform_roles(user),
                         "can-change-email": False,
                         "can-change-username": False,
                     },
@@ -375,13 +425,13 @@ async def show_organization(
                     "created-at": "2025-01-01T00:00:00.000Z",
                     "email": "",
                     "permissions": {
-                        "can-update": "admin" in user.roles,
+                        "can-update": "admin" in effective_platform_roles(user),
                         "can-destroy": False,
                         "can-access-via-teams": False,
                         "can-create-module": True,
                         "can-create-team": False,
                         "can-create-workspace": True,
-                        "can-manage-users": "admin" in user.roles,
+                        "can-manage-users": "admin" in effective_platform_roles(user),
                         "can-manage-subscription": False,
                         "can-manage-sso": False,
                         "can-update-oauth": False,
@@ -390,7 +440,7 @@ async def show_organization(
                         "can-update-api-token": True,
                         "can-traverse": True,
                         "can-start-trial": False,
-                        "can-update-agent-pools": "admin" in user.roles,
+                        "can-update-agent-pools": "admin" in effective_platform_roles(user),
                         "can-manage-tags": True,
                         "can-manage-varsets": True,
                         "can-read-varsets": True,
@@ -605,10 +655,16 @@ def _workspace_json(
                 else None,
                 "var-files": ws.var_files or [],
                 "trigger-prefixes": ws.trigger_prefixes or [],
+                "drift-ignore-rules": ws.drift_ignore_rules or [],
+                "ai-summary-mode": ws.ai_summary_mode,
+                "ai-summary-context": ws.ai_summary_context,
                 "drift-detection-enabled": ws.drift_detection_enabled,
                 "drift-detection-interval-seconds": ws.drift_detection_interval_seconds,
                 "drift-last-checked-at": _rfc3339(ws.drift_last_checked_at),
                 "drift-status": ws.drift_status,
+                "drift-latest-run-id": (
+                    f"run-{ws.drift_latest_run_id}" if ws.drift_latest_run_id else None
+                ),
                 "state-diverged": ws.state_diverged,
                 "lifecycle-state": ws.lifecycle_state,
                 "lifecycle-reason": ws.lifecycle_reason,
@@ -773,7 +829,7 @@ async def list_workspaces(
     # Filter to workspaces user has at least read access to
     visible = []
     for ws in workspaces:
-        perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+        perm = await resolve_workspace_permission_for(db, user, ws)
         if perm is not None:
             visible.append(_workspace_json(ws, perm, latest_run=latest_runs.get(ws.id))["data"])
 
@@ -796,9 +852,18 @@ async def show_workspace(
     if ws is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if perm is None:
-        raise HTTPException(status_code=404, detail="Workspace not found")
+        # Runner-token consumers can resolve the producer workspace by name
+        # so the OpenTofu `remote` backend's first hop (workspace lookup) in
+        # `data "terraform_remote_state"` finds it instead of falling through
+        # to its create-if-not-found code path (which then 403s on the
+        # runner's missing org-write permission). Allowlist check mirrors
+        # the state-read endpoints below.
+        if await _runner_state_read_allowed(db, user, ws):
+            perm = "read"
+        else:
+            raise HTTPException(status_code=404, detail="Workspace not found")
 
     # Load latest primary run for this workspace (excludes module-test / speculative PR runs)
     run_result = await db.execute(
@@ -855,10 +920,9 @@ async def create_workspace(
         target_pool = await _agent_pool_service.get_pool(db, agent_pool_id)
         if target_pool is None:
             raise HTTPException(status_code=404, detail="Agent pool not found")
-        pool_perm = await resolve_pool_permission(
+        pool_perm = await resolve_pool_permission_for(
             db,
-            user_email=user.email,
-            user_roles=user.roles,
+            user,
             pool_name=target_pool.name,
             pool_labels=target_pool.labels or {},
             owner_email=target_pool.owner_email or "",
@@ -895,6 +959,7 @@ async def create_workspace(
         vcs_branch=attrs.get("vcs-branch", ""),
         var_files=_validate_var_files(attrs.get("var-files", [])),
         trigger_prefixes=_validate_trigger_prefixes(attrs.get("trigger-prefixes", [])),
+        drift_ignore_rules=_validate_drift_ignore_rules(attrs.get("drift-ignore-rules", [])),
         drift_detection_enabled=attrs.get(
             "drift-detection-enabled",
             True if vcs_connection_id else False,
@@ -939,7 +1004,7 @@ async def _require_ws_permission(
 ) -> tuple[Workspace, str]:
     """Load workspace and check permission. Returns (workspace, effective_permission)."""
     ws = await _get_workspace_by_id(workspace_id, db)
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if not has_permission(perm, required):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -1028,8 +1093,23 @@ async def show_workspace_by_id(
     user: AuthenticatedUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
-    """Show a workspace by its ID."""
-    ws, perm = await _require_ws_permission(workspace_id, "read", user, db)
+    """Show a workspace by its ID.
+
+    Mirrors the name-keyed handler's allowlist treatment so runner-token
+    consumers (cross-workspace ``terraform_remote_state``) can resolve
+    the producer workspace through this endpoint as well as the
+    state-read endpoints further down.
+    """
+    ws = await _get_workspace_by_id(workspace_id, db)
+    perm = await resolve_workspace_permission_for(db, user, ws)
+    if not has_permission(perm, "read"):
+        if await _runner_state_read_allowed(db, user, ws):
+            perm = "read"
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Requires read permission on workspace",
+            )
 
     # Load latest primary run for this workspace (excludes module-test / speculative PR runs)
     run_result = await db.execute(
@@ -1191,7 +1271,7 @@ async def update_workspace(
 
     # owner-email can only be changed by platform admin
     if "owner-email" in attrs:
-        if "admin" not in user.roles:
+        if "admin" not in effective_platform_roles(user):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only platform admins can change workspace owner",
@@ -1303,12 +1383,12 @@ async def update_workspace(
         if (
             new_labels != (ws.labels or {})
             and not attrs.get("force")
-            and "admin" not in user.roles
+            and "admin" not in effective_platform_roles(user)
             and ws.owner_email != user.email
         ):
             old_labels = ws.labels
             ws.labels = new_labels
-            new_perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+            new_perm = await resolve_workspace_permission_for(db, user, ws)
             ws.labels = old_labels  # revert before deciding
             if new_perm is None or PERMISSION_HIERARCHY.get(
                 new_perm, -1
@@ -1339,6 +1419,8 @@ async def update_workspace(
         ws.var_files = _validate_var_files(attrs["var-files"])
     if "trigger-prefixes" in attrs:
         ws.trigger_prefixes = _validate_trigger_prefixes(attrs["trigger-prefixes"])
+    if "drift-ignore-rules" in attrs:
+        ws.drift_ignore_rules = _validate_drift_ignore_rules(attrs["drift-ignore-rules"])
     if "agent-pool-id" in attrs:
         import uuid as _uuid
 
@@ -1351,10 +1433,9 @@ async def update_workspace(
             target_pool = await _agent_pool_service.get_pool(db, new_pool_id)
             if target_pool is None:
                 raise HTTPException(status_code=404, detail="Agent pool not found")
-            pool_perm = await resolve_pool_permission(
+            pool_perm = await resolve_pool_permission_for(
                 db,
-                user_email=user.email,
-                user_roles=user.roles,
+                user,
                 pool_name=target_pool.name,
                 pool_labels=target_pool.labels or {},
                 owner_email=target_pool.owner_email or "",
@@ -1377,6 +1458,33 @@ async def update_workspace(
         ws.drift_detection_interval_seconds = _clamp_drift_interval(
             attrs["drift-detection-interval-seconds"]
         )
+
+    # AI plan summary opt-in (#401). The mode is a three-state enum
+    # constrained by a DB CHECK; reject other values up-front rather than
+    # surfacing a less-helpful 500 from the integrity error.
+    if "ai-summary-mode" in attrs:
+        mode = attrs["ai-summary-mode"]
+        if mode not in ("default", "enabled", "disabled"):
+            raise HTTPException(
+                status_code=422,
+                detail="ai-summary-mode must be 'default', 'enabled', or 'disabled'",
+            )
+        ws.ai_summary_mode = mode
+    if "ai-summary-context" in attrs:
+        ctx = attrs["ai-summary-context"]
+        if ctx is None:
+            ctx = ""
+        if not isinstance(ctx, str):
+            raise HTTPException(status_code=422, detail="ai-summary-context must be a string")
+        # Cap at a reasonable size — workspace context is a hint, not a
+        # repo. Anything bigger lives in fleet_context or a doc the user
+        # can paste into their prompt_suffix.
+        if len(ctx) > 4000:
+            raise HTTPException(
+                status_code=422,
+                detail="ai-summary-context max length is 4000 characters",
+            )
+        ws.ai_summary_context = ctx
 
     # VCS connection relationship
     relationships = body.get("data", {}).get("relationships", {})
@@ -1444,6 +1552,7 @@ async def delete_workspace(
 
 @router.get("/workspaces/{workspace_id}/state-versions")
 async def list_state_versions(
+    request: Request,
     workspace_id: str = Path(...),
     user: AuthenticatedUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -1460,7 +1569,7 @@ async def list_state_versions(
 
     return JSONResponse(
         content={
-            "data": [_state_version_json(sv)["data"] for sv in state_versions],
+            "data": [_state_version_json(sv, request)["data"] for sv in state_versions],
         },
         headers=_tfe_headers(),
     )
@@ -1468,6 +1577,7 @@ async def list_state_versions(
 
 @router.get("/workspaces/{workspace_id}/current-state-version")
 async def current_state_version(
+    request: Request,
     workspace_id: str = Path(...),
     user: AuthenticatedUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -1482,7 +1592,7 @@ async def current_state_version(
     """
     ws = await _get_workspace_by_id(workspace_id, db)
     if not await _runner_state_read_allowed(db, user, ws):
-        perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+        perm = await resolve_workspace_permission_for(db, user, ws)
         if not has_permission(perm, "read"):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -1499,7 +1609,7 @@ async def current_state_version(
     if sv is None:
         raise HTTPException(status_code=404, detail="No state versions found")
 
-    return JSONResponse(content=_state_version_json(sv), headers=_tfe_headers())
+    return JSONResponse(content=_state_version_json(sv, request), headers=_tfe_headers())
 
 
 @router.get("/state-versions/{state_version_id}/download")
@@ -1527,7 +1637,7 @@ async def download_state(
     if ws is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     if not await _runner_state_read_allowed(db, user, ws):
-        perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+        perm = await resolve_workspace_permission_for(db, user, ws)
         if not has_permission(perm, "plan"):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -1544,15 +1654,85 @@ async def download_state(
     return Response(content=data, media_type="application/json")
 
 
-def _state_version_json(sv: StateVersion) -> dict:
-    """Serialize a StateVersion to TFE V2 JSON:API format.
+def _request_base_url(request: Request | None) -> str:
+    """Reconstruct the URL the *client* used to reach the API, so the
+    hosted-state-{download,upload}-url values we emit round-trip back
+    to the same hostname.
 
-    Uses callback_base_url for absolute URLs (go-tfe requires absolute URLs
-    for hosted-state-upload-url).
+    Why this matters: internal-ingress deployments expose the API on
+    two hostnames — a public one (browsers, terraform login, external
+    CLI) and an internal cluster-only one (in-cluster runners hitting
+    their cloud-block backend). A single global `callback_base_url`
+    can't serve both audiences: the URL we put in
+    `hosted-state-download-url` has to come back through a hostname
+    the caller can actually reach. Mirroring the request's host on
+    each response solves that — external requests get the public URL
+    back, internal requests get the internal URL back.
+
+    Lookup order:
+      1. X-Forwarded-Host + X-Forwarded-Proto (set by every standard
+         ingress / reverse proxy: Traefik, ingress-nginx, the Next.js
+         BFF, etc.). Preserved across the BFF chain.
+      2. The bare Host header — only used if it looks like a real
+         hostname (contains a `.`). Service-DNS names like
+         `terrapod-api:8000` are skipped because emitting them would
+         publish a URL only the API pod itself can resolve.
+      3. settings.auth.callback_base_url — last-resort fallback for
+         direct calls that bypass any proxy.
+
+    request may be None (legacy callers, tests) — fall straight to
+    callback_base_url in that case.
     """
     from terrapod.config import settings
 
-    base = settings.auth.callback_base_url.rstrip("/")
+    fallback = settings.auth.callback_base_url.rstrip("/")
+    if request is None:
+        return fallback
+    xfh = request.headers.get("x-forwarded-host")
+    if xfh:
+        proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+        candidate = xfh.split(",", 1)[0].strip()
+        if _is_safe_host(candidate) and _is_safe_scheme(proto):
+            return f"{proto}://{candidate}"  # both parts validated above
+        return fallback
+    host = request.headers.get("host")
+    if host and "." in host and _is_safe_host(host):
+        # Plain Host header that looks like an external hostname.
+        # Use request.url.scheme — we may not have x-forwarded-proto
+        # so the scheme reflects what FastAPI saw on the wire.
+        scheme = request.url.scheme
+        if _is_safe_scheme(scheme):
+            return f"{scheme}://{host}"  # both parts validated above
+    return fallback
+
+
+# RFC 1123 hostname + optional port. Strict whitelist — letters, digits,
+# dot, hyphen, plus an optional `:NNNN` suffix. Length capped at 253
+# (DNS label limit) + 6 for the port. Defense in depth against a
+# malicious upstream proxy injecting CRLF or other separators into
+# X-Forwarded-Host / Host: the resulting string is concatenated into
+# URLs we emit in JSON:API bodies; without validation a header carrying
+# `evil.com\r\nLocation: ...` could end up in a downstream redirect or
+# response header.
+_HOST_RE = re.compile(r"^[A-Za-z0-9.\-]{1,253}(:\d{1,5})?$")
+
+
+def _is_safe_host(value: str) -> bool:
+    return bool(value) and bool(_HOST_RE.match(value))
+
+
+def _is_safe_scheme(value: str) -> bool:
+    return value in ("http", "https")
+
+
+def _state_version_json(sv: StateVersion, request: Request | None = None) -> dict:
+    """Serialize a StateVersion to TFE V2 JSON:API format.
+
+    go-tfe requires absolute URLs for hosted-state-{download,upload}-url.
+    Pass `request` so the URLs use the same hostname the caller used —
+    see `_request_base_url`.
+    """
+    base = _request_base_url(request)
     sv_id = f"sv-{sv.id}"
     return {
         "data": {
@@ -1584,6 +1764,7 @@ def _state_version_json(sv: StateVersion) -> dict:
 
 @router.get("/state-versions/{state_version_id}")
 async def show_state_version(
+    request: Request,
     state_version_id: str = Path(...),
     user: AuthenticatedUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -1601,11 +1782,11 @@ async def show_state_version(
     # Check read permission on workspace
     ws = await db.get(Workspace, sv.workspace_id)
     if ws is not None:
-        perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+        perm = await resolve_workspace_permission_for(db, user, ws)
         if perm is None:
             raise HTTPException(status_code=404, detail="State version not found")
 
-    return JSONResponse(content=_state_version_json(sv), headers=_tfe_headers())
+    return JSONResponse(content=_state_version_json(sv, request), headers=_tfe_headers())
 
 
 @router.post("/workspaces/{workspace_id}/state-versions")
@@ -1675,7 +1856,7 @@ async def create_state_version(
     await publish_workspace_event(str(ws.id), "state_version_created")
 
     return JSONResponse(
-        content=_state_version_json(sv),
+        content=_state_version_json(sv, request),
         status_code=201,
         headers=_tfe_headers(),
     )
@@ -1857,7 +2038,7 @@ async def unlock_workspace(
 ) -> JSONResponse:
     """Unlock a workspace. Plan for own lock, admin for force-unlock."""
     ws = await _get_workspace_by_id(workspace_id, db)
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
 
     # Check: at minimum plan permission required
     if not has_permission(perm, "plan"):

@@ -78,6 +78,79 @@ A run is marked "stale" by the reconciler when it has been in `planning` or `app
 
 ---
 
+## Drift Run Exceeded Max Duration
+
+A drift detection run was errored by the reconciler because it spent longer than `runners.driftMaxDurationSeconds` (default: 30 min) in `planning`. Distinct from the generic stale timeout — the listener and runner pod were both healthy; the underlying `tofu plan` was simply taking too long for a background plan-only check.
+
+### Symptoms
+
+- Workspace's Drifted/Errored badge in the workspace list shows `drift-status: errored`
+- The linked drift run's `error_message` reads `Drift run exceeded max duration (1800s)`
+- Listener and runner pods for the drift run were healthy at the time of failure (no `stale` or `launch-timeout` message)
+
+### Diagnosis
+
+The typical underlying cause is a refresh path that talks to a rate-limited upstream — e.g. the `integrations/github` provider refreshing dozens of `github_repository` / `github_branch_protection` resources, or a Vault provider reading a long secret list. Confirm by looking at the run's plan log: if the last activity is a `Refreshing state...` line and no `Plan: ...` summary, the plan was wedged in refresh, not the drift cap itself misbehaving.
+
+### Resolution
+
+Two reasonable options depending on whether the slow refresh is expected:
+
+1. **Slow plan is expected** — raise the cap. `runners.driftMaxDurationSeconds: 3600` (or higher) in Helm values, then `helm upgrade`. Set to `0` to disable the cap entirely.
+2. **Slow plan is not expected** — investigate the refresh path itself. Common fixes: shrink the workspace by splitting it; configure a stricter provider page-size; add a provider-level cache (e.g. github_repository data sources reading the same repo from multiple resources).
+
+### Verification
+
+- A new drift cycle completes within the cap
+- `drift-status` returns to `no_drift` (or `drifted` if there's real drift to report)
+- The Errored badge clears on the workspace list
+
+---
+
+## Runner OOM-Killed (#430)
+
+A runner Job was killed by Kubernetes because its container exceeded its memory limit (`2 × workspace.resource_memory`). This usually shows up after a provider schema grows or a workspace acquires a lot more managed resources than it had when `resource_memory` was first set.
+
+### Symptoms
+
+- Run status `errored` with one of:
+  - `Runner OOM-killed (peak memory N.NN Gi). Workspace resource_memory is XGi; limit is 2× that. Increase resource_memory + retry.`
+  - `Runner killed (SIGKILL, exit 137) without an explicit K8s reason. Most likely OOM…`
+- Run detail page shows the **Resource usage** panel with a red `OOM-killed` or `Killed (likely OOM)` badge
+- AI plan summary (if enabled) is marked `skipped — runner exited abnormally (oom|killed)`
+- No plan log uploaded, or only a partial log
+
+### Diagnosis
+
+1. **Confirm the failure mode** — open the Run detail page. The Resource usage panel shows peak memory next to the workspace's request + limit. If the memory bar is solid red, this is a true OOM.
+2. **Check the runner_exit_status** — `oom` is definitive (we read it from `container.state.terminated.reason == "OOMKilled"`). `killed` is "exit 137 with no reason" — usually still OOM, but the pod was GCed before the listener could capture the terminated state; could also be a node-level eviction (e.g. spot instance preemption).
+3. **Look at workload-shape changes** — has the workspace grown? `terraform state list | wc -l` against the latest applied state version, compared to a known-good run from before the OOM started happening.
+4. **For `killed` runs, rule out preemption** — check node events around the run's `apply_started_at`. If the node disappeared (spot instance, autoscaler scale-down), it's not strictly OOM and the workspace is sized correctly; the run can be retried on a stable node.
+
+### Resolution
+
+**For true OOMs (`oom` status):**
+
+1. Bump `resource_memory` on the workspace. UI: workspace settings. API: `PATCH /api/v2/workspaces/{id}` with `data.attributes.resource-memory`.
+2. The limit auto-derives as `2 × request`, so doubling the request doubles the limit.
+3. Re-queue the run (Retry button on the Run detail page).
+4. After the new run succeeds, re-check the Resource usage panel — the bar should be in amber (80–95%) or green (<80%). If it's still red, bump again.
+
+**Rule of thumb**: set `resource_memory` to ~50% above typical peak. Anything tracking ≥95% is one provider-schema change away from OOMing.
+
+**For ambiguous `killed` runs:**
+
+- If multiple consecutive runs `killed` at the same workspace, treat as OOM and bump `resource_memory` anyway.
+- If only one isolated `killed` and the node is gone, it was preemption — retry as-is.
+
+### Verification
+
+- New run completes successfully
+- Resource usage panel shows memory bar in green or amber, not red
+- `runner_exit_status` is `clean` on the successful run (visible in the API response, not currently rendered in UI)
+
+---
+
 ## State Diverged
 
 The runner entrypoint marks a workspace as "state diverged" when an `apply` succeeds (infrastructure changed) but the state file upload to object storage fails. This is a critical situation — real infrastructure has changed but Terrapod's state doesn't reflect it.
@@ -752,3 +825,161 @@ service=terrapod-api logger=terrapod.services.vcs_status_dispatcher
 
 - Run logs after the rotation show `level=info logger=terrapod.services.gitlab_service msg="GitLab commit status posted"` (or the equivalent for GitHub).
 - The PR check on the next pushed commit lands within ~30 seconds of the run completing.
+
+---
+
+## AI plan-summary daily token budget exhausted
+
+**Symptom**: AI plan summary panels on run detail pages start showing "Summary skipped for this run" (italic grey muted text) instead of the LLM description. New `plan_summaries` rows arrive with `status='skipped'` and `error_message='daily token budget exhausted'`. The run lifecycle itself is unaffected (plan / apply / lock state machine continues normally) — only the summary surface is muted.
+
+**Why**: `api.config.ai_summary.daily_token_budget` caps the total *output* tokens spent across all summaries per UTC day. A Redis counter at `tp:ai_summary:budget:YYYYMMDD` (key TTL ~36h) accumulates `usage.completion_tokens` from every successful summariser call. When the next call would push past the cap, the handler short-circuits before invoking LiteLLM, writes a `status='skipped'` row, and emits the `plan_summary_ready` SSE event. The counter rolls over at the next UTC midnight automatically — no operator action is required for normal recovery.
+
+### Diagnosis
+
+1. **Confirm the budget actually exhausted** rather than a provider outage:
+   ```bash
+   kubectl exec -n <ns> <redis-pod> -- redis-cli GET "tp:ai_summary:budget:$(date -u +%Y%m%d)"
+   # Compare against the configured cap:
+   kubectl get configmap <release>-api-config -n <ns> -o jsonpath='{.data.config\.yaml}' \
+     | grep -A1 ai_summary | grep daily_token_budget
+   ```
+   If the Redis value is at or above the cap, the budget is the cause. If well below, look at `plan_summaries.error_message` for the actual reason.
+
+2. **Quantify the runaway** — query the last 24h of summaries:
+   ```sql
+   SELECT kind, status, count(*), sum(output_tokens) AS out_tokens
+   FROM plan_summaries
+   WHERE created_at > now() - interval '24 hours'
+   GROUP BY kind, status ORDER BY out_tokens DESC;
+   ```
+   Look for a workspace or kind disproportionately consuming tokens (e.g. a flapping VCS workspace re-summarising the same plan many times).
+
+### Resolution
+
+- **Wait for UTC midnight reset.** If the spend is in line with normal usage and you just hit the cap because of a busy day, do nothing — the next plan after 00:00 UTC summarises again.
+- **Bump the cap and `helm upgrade`** if the cap is too tight for legitimate steady-state use:
+  ```yaml
+  api:
+    config:
+      ai_summary:
+        daily_token_budget: 10000000  # was 5000000
+  ```
+- **Set `daily_token_budget: 0`** for unlimited. Do this only if you have a separate cost guardrail upstream (provider-side spend limit, gateway quota, etc.).
+- **Force-reset the counter** as an emergency measure (e.g. a runaway workspace already fixed):
+  ```bash
+  kubectl exec -n <ns> <redis-pod> -- redis-cli DEL "tp:ai_summary:budget:$(date -u +%Y%m%d)"
+  ```
+  The counter rebuilds from the next successful summary. Reset doesn't replay missed summaries — they stay `status='skipped'` for the historical runs.
+
+### Verification
+
+- Redis `tp:ai_summary:budget:<date>` is below the configured cap.
+- New plans land with `plan_summaries.status='ready'` rather than `skipped`.
+- The run-detail UI panel re-renders with markdown content within ~30 seconds of the plan reaching `planned`.
+
+---
+
+## AI plan-summary provider outage / credential failure
+
+**Symptom**: AI summary panels show "Summariser failed" with an upstream error (HTTP 401 / 403 / 5xx, timeout, or model-not-found). The `plan_summaries` table accumulates rows with `status='errored'` and `error_message` carrying the LiteLLM exception. The run lifecycle is unaffected.
+
+**Why**: the summariser's failure path is best-effort by design — every exception from `litellm.acompletion()` is caught, logged, and recorded as an `errored` row. The trigger handler never raises into the scheduler, so a sustained provider outage does NOT block plans, applies, VCS comments, or any other run state. Only the summary surface goes red.
+
+### Diagnosis
+
+1. **Inspect the most recent failure messages** to identify the upstream issue:
+   ```sql
+   SELECT kind, error_message, count(*)
+   FROM plan_summaries
+   WHERE status = 'errored' AND created_at > now() - interval '1 hour'
+   GROUP BY kind, error_message ORDER BY count DESC;
+   ```
+   The error text comes straight from LiteLLM — Bedrock IAM, OpenAI 429, Anthropic 401, etc. each present distinctively.
+
+2. **Confirm the provider isn't degraded** (Bedrock service health dashboard, OpenAI status, Anthropic status). Provider-side incidents auto-clear once upstream stabilises; no operator action is needed.
+
+3. **For Bedrock IAM failures** specifically — verify the API pod's IRSA identity is still admitted by the cross-account trust policy on the `ai_summary.auth.aws_role_arn`:
+   ```bash
+   kubectl exec -n <ns> <api-pod> -- aws sts get-caller-identity
+   kubectl exec -n <ns> <api-pod> -- aws sts assume-role \
+     --role-arn "$(grep aws_role_arn /etc/terrapod/config.yaml | awk '{print $2}' | tr -d '"')" \
+     --role-session-name diag
+   ```
+
+### Resolution
+
+- **Provider outage**: no action; summaries auto-recover when upstream stabilises. The run-detail UI shows the latest errored row's message so reviewers see what's failing.
+- **Credential / scope issue** (API key revoked, IRSA trust policy edited, cross-account role deleted): fix at the source. If using the bearer path, rotate the secret value:
+  ```bash
+  kubectl edit secret terrapod-ai-summary-credentials -n <ns>
+  # update TERRAPOD_AI_SUMMARY__AUTH__API_KEY, save
+  kubectl rollout restart deployment/<release>-api -n <ns>
+  ```
+- **Emergency disable** if the provider is down for an extended period and the red panels are visible to many reviewers, flip the global toggle off without restart-required code changes:
+  ```yaml
+  api:
+    config:
+      ai_summary:
+        enabled: false
+  ```
+  followed by `helm upgrade ...`. The API pod re-reads its config on rollout and the trigger handler stops registering. All subsequent plans go through without ever attempting to summarise — no `plan_summaries` row is written at all (the handler short-circuits before the DB write). Re-enable when the upstream is healthy.
+
+### Verification
+
+- Errored rows stop accumulating: `SELECT count(*) FROM plan_summaries WHERE status='errored' AND created_at > now() - interval '15 minutes';` returns 0.
+- The run-detail UI panel renders summaries with `status='ready'` (after re-enable + a new plan).
+- If you emergency-disabled, no `plan_summaries` row appears for new runs and the UI panel doesn't render at all.
+
+---
+
+## Offboarding a User — Revoking Their Tokens
+
+When a person leaves or must be cut off from Terrapod, their **personal (`interactive`) and `service_bound`** API tokens must stop working. There are two layers — an automatic one and an immediate one.
+
+### Symptoms / Trigger
+
+- A user account is disabled at the IdP, or HR/security requests immediate revocation.
+- You need to confirm that an ex-user's CI/automation tokens can no longer authenticate.
+
+### Diagnosis
+
+1. **List the user's bound tokens** (admin):
+   ```bash
+   curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+     "https://<terrapod>/api/terrapod/v1/admin/authentication-tokens" \
+   | jq '.data[] | select(.attributes."bound-to"=="<email>") | {id, kind, "expires-at": .attributes."expires-at"}'
+   ```
+2. **Check their last login** — bound tokens are auto-rejected after the idle window:
+   ```bash
+   # The Redis marker that arms the idle guard (TTL = auth.bound_token_idle_days)
+   redis-cli --scan --pattern 'tp:user_seen:<email>'
+   ```
+   If the key is **absent**, the user is already past the idle window and all their bound tokens are already being rejected.
+
+### Resolution
+
+**Automatic (no action needed):** a `service_bound`/`interactive` token is rejected once its owner hasn't logged in for `auth.bound_token_idle_days` (default 7). Disabling the user at the IdP — so they can no longer complete SSO — is sufficient for the token to lapse within that window. This is the "they can't use a token weeks after offboarding" guarantee, and it requires no operator cleanup.
+
+**Immediate (urgent cut-off):** when you can't wait out the idle window, revoke every token bound to the identity in one call:
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://<terrapod>/api/terrapod/v1/admin/authentication-tokens/actions/revoke-all" \
+  -d '{"email": "<email>"}'
+# -> {"data": {"email": "<email>", "revoked": N}}
+```
+
+This deletes all bound tokens immediately and busts the user's cached role resolution. **Detached (`service_detached`) tokens are unbound and are intentionally NOT affected** — they belong to automation, not the person. If the leaver was the only human who knew a detached token's secret, **rotate** that token instead:
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "https://<terrapod>/api/terrapod/v1/authentication-tokens/<token-id>/actions/rotate"
+```
+
+### Verification
+
+- `revoke-all` returned a `revoked` count matching the diagnosis list.
+- Re-running the diagnosis list query returns no tokens for the email.
+- An attempt to use one of the revoked tokens returns `401`.
+- For the idle path: with the `tp:user_seen:<email>` key absent, a previously-working bound token now returns `401`.

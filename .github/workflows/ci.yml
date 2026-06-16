@@ -222,15 +222,85 @@ jobs:
         run: go test ./... -v -count=1 -timeout 120s
         working-directory: migrate
 
-  # ── Python Test ────────────────────────────────────────
-  python-test:
-    name: Python Test
+  # ── Publish Lint ──────────────────────────────────────
+  # terrapod-publish lives in publish/ with its own go.mod (pulls the
+  # ProtonMail OpenPGP libs that the SDK doesn't). Mirrors migrate's shape.
+  publish-lint:
+    name: Publish Lint
     needs: prepare
     if: needs.prepare.outputs.images_exist != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - run: scripts/test.sh python
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: publish/go.mod
+          cache-dependency-path: publish/go.sum
+      - name: Vet
+        run: go vet ./...
+        working-directory: publish
+      - name: Build
+        run: go build ./...
+        working-directory: publish
+
+  # ── Publish Test ──────────────────────────────────────
+  publish-test:
+    name: Publish Test
+    needs: prepare
+    if: needs.prepare.outputs.images_exist != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: publish/go.mod
+          cache-dependency-path: publish/go.sum
+      - name: Test
+        run: go test ./... -v -count=1 -timeout 120s
+        working-directory: publish
+
+  # ── Python Test ────────────────────────────────────────
+  python-test:
+    # Sharded by directory so each shard gets its own Postgres /
+    # Redis / LocalStack stack via docker-compose.test.yml. Integration
+    # tests hit a real DB and are race-prone under pytest-xdist within
+    # one job; runner-level shards avoid that.
+    #
+    # Slice 1 — fast unit-ish (mock-based; no DB)
+    # Slice 2 — services + api (mock-based; the bulk)
+    # Slice 3 — integration (real Postgres; the slowest 12s tests live here)
+    #
+    # On a v0.35.0 main-run reference: combined 310s serial →
+    # split slowest-shard ~75s (integration), others sub-60s.
+    name: Python Test (${{ matrix.slice.name }})
+    needs: prepare
+    if: needs.prepare.outputs.images_exist != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        slice:
+          # pytest-xdist `-n auto` is enabled for the two mock-heavy
+          # shards. Local bench (Apple M-series; CI ~50-60% of this):
+          #   unit         90s serial → 13s parallel (1495 → 492 tests)
+          #   services-api 138s serial → 30s parallel
+          # The integration shard stays serial — its
+          # session-scoped Postgres table-creation fixture races
+          # under xdist workers (each worker would try to create
+          # the same tables) and the suite is small enough that
+          # serial is fine.
+          - name: unit
+            paths: tests/auth tests/runner tests/storage tests/test_logging_config.py tests/test_dependency_pins.py
+            pytest_args: -n auto
+          - name: services-api
+            paths: tests/services tests/api
+            pytest_args: -n auto
+          - name: integration
+            paths: tests/integration
+            pytest_args: ""
+    steps:
+      - uses: actions/checkout@v6
+      - run: scripts/test.sh python -- ${{ matrix.slice.pytest_args }} ${{ matrix.slice.paths }}
 
   # ── Dependency Audit (Python) ─────────────────────────
   python-audit:
@@ -238,7 +308,7 @@ jobs:
     needs: prepare
     if: needs.prepare.outputs.images_exist != 'true'
     runs-on: ubuntu-latest
-    container: python:3.14-slim
+    container: python:3.13-slim
     steps:
       - uses: actions/checkout@v6
       - name: Install Poetry and export plugin
@@ -385,6 +455,7 @@ jobs:
               --exclude "reports" \
               --exclude-rule "python.lang.security.insecure-hash-algorithms-md5.insecure-hash-algorithm-md5" \
               --exclude-rule "python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure" \
+              --exclude-rule "python.flask.security.audit.directly-returned-format-string.directly-returned-format-string" \
               --sarif \
               --output "/src/semgrep-results.sarif"
 
@@ -438,54 +509,100 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: linux/${{ matrix.arch }}
-          push: true
+          # On PRs we do NOT push to GHCR. Fork PRs get a read-only
+          # GITHUB_TOKEN (no package:write), so a push fails outright — and
+          # even same-repo PRs gain nothing from a registry round-trip. The
+          # built image is loaded into the local Docker daemon and handed to
+          # the scan/e2e jobs as a workflow artifact instead. Pushes happen
+          # only on branch/tag builds, which run from the main repo and have
+          # the write token. `is_pr` (not fork-status) is the discriminator,
+          # so fork and same-repo PRs take the identical artifact path.
+          push: ${{ needs.prepare.outputs.is_pr != 'true' }}
+          load: ${{ needs.prepare.outputs.is_pr == 'true' && matrix.arch == 'amd64' }}
           tags: ${{ env.REGISTRY }}/${{ matrix.image }}:sha-${{ needs.prepare.outputs.sha_short }}-${{ matrix.arch }}
           cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}
 
+      # PR builds: persist the loaded image as an artifact for scan/e2e.
+      # amd64 only — that's the arch those jobs consume; the arm64 PR build
+      # is a "does it still build on arm" check and needs no artifact.
+      - name: Export image artifact
+        if: needs.prepare.outputs.is_pr == 'true' && matrix.arch == 'amd64'
+        run: |
+          docker save "$REGISTRY/${{ matrix.image }}:sha-${{ needs.prepare.outputs.sha_short }}-amd64" \
+            | gzip > "/tmp/${{ matrix.image }}-amd64.tar.gz"
+
+      - name: Upload image artifact
+        if: needs.prepare.outputs.is_pr == 'true' && matrix.arch == 'amd64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: image-${{ matrix.image }}-amd64
+          path: /tmp/${{ matrix.image }}-amd64.tar.gz
+          retention-days: 1
+
   # ── E2E Tests (Playwright) ─────────────────────────────
   e2e-test:
-    name: E2E Tests
+    # Sharded across 2 GitHub runners using Playwright's built-in
+    # --shard=k/N. Each shard boots its own docker-compose stack
+    # (~30s overhead) so they're independent. We initially tried 4
+    # shards but the per-shard boot cost dominated — 4 shards × 30s
+    # in parallel wasted 90s vs 60s for 2 shards. As the suite grows
+    # past the current 13 spec files, revisit shard count.
+    name: E2E Tests (${{ matrix.shard }}/${{ strategy.job-total }})
     needs: [prepare, build-images]
     if: |
       always()
       && needs.build-images.result == 'success'
       && needs.prepare.outputs.images_exist != 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     # Whole-job upper bound. Default is GitHub's 360 min, which lets a
-    # wedged step (most commonly Playwright browser install) run for
-    # six hours before anyone notices. 25 min covers a cold-runner
-    # worst-case (image pull + stack boot + node setup + browser
-    # install + test suite) with headroom; anything past that is
-    # genuinely broken, not slow.
-    timeout-minutes: 25
-    env:
-      # Pin Playwright's browser install location to /tmp so both the
-      # downloaded zip (which lands in /tmp/playwright-download-*)
-      # and the extracted browser tree end up on the same directory
-      # path. Default would extract to ~/.cache/ms-playwright/, which
-      # we've seen wedge silently mid-extract — likely because the
-      # final post-extract rename/move spans directories and triggers
-      # extra I/O on the Azure-backed runner disk. Job-scoped so both
-      # the install step and the test run step see the same path.
-      PLAYWRIGHT_BROWSERS_PATH: /tmp/ms-playwright
+    # wedged step run for six hours before anyone notices. 15 min covers
+    # a cold-runner worst-case (image pull + stack boot + test suite)
+    # with headroom; anything past that is genuinely broken, not slow.
+    timeout-minutes: 15
     permissions:
       contents: read
       packages: read
     steps:
       - uses: actions/checkout@v6
 
+      # Branch/tag builds pull the images from GHCR; PR builds load them
+      # from the build-images artifacts (no registry push on PRs). Either
+      # way the stack runs off the `<image>:local` tags.
       - name: Log in to GHCR
+        if: needs.prepare.outputs.is_pr != 'true'
         uses: ./.github/actions/ghcr-login
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           username: ${{ github.actor }}
 
-      - name: Pull images
+      - name: Pull images (branch/tag)
+        if: needs.prepare.outputs.is_pr != 'true'
         run: |
           sha_short="${{ needs.prepare.outputs.sha_short }}"
           for image in terrapod-api terrapod-web terrapod-migrations; do
             docker pull "$REGISTRY/$image:sha-${sha_short}-amd64"
+            docker tag "$REGISTRY/$image:sha-${sha_short}-amd64" "$image:local"
+          done
+
+      - name: Download image artifacts (PR)
+        if: needs.prepare.outputs.is_pr == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-*-amd64
+          path: /tmp/images
+          merge-multiple: true
+
+      - name: Load images (PR)
+        if: needs.prepare.outputs.is_pr == 'true'
+        run: |
+          sha_short="${{ needs.prepare.outputs.sha_short }}"
+          for image in terrapod-api terrapod-web terrapod-migrations; do
+            gunzip -c "/tmp/images/$image-amd64.tar.gz" | docker load
             docker tag "$REGISTRY/$image:sha-${sha_short}-amd64" "$image:local"
           done
 
@@ -507,46 +624,39 @@ jobs:
           done
           echo "Stack healthy (${elapsed}s)"
 
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: e2e/package-lock.json
-
-      - name: Install dependencies
-        run: npm ci --ignore-scripts
-        working-directory: e2e
-        # Cold npm caches rarely take more than a minute; 5 fails fast.
-        timeout-minutes: 5
-
-      - name: Install Playwright browsers
-        run: npx playwright install chromium --with-deps
-        working-directory: e2e
-        env:
-          # Diagnostic: this step has wedged at ~100% download with no
-          # further output, leaving us to guess which post-download
-          # phase (extract / chmod / metadata-write) is stuck. pw:install
-          # logs each phase, so the next failure shows the actual
-          # wedge site instead of a silent timeout.
-          DEBUG: pw:install
-        # Normal install is 60-90s; 5 min lets a cold runner finish
-        # but kills a wedge fast enough to recover the job.
-        timeout-minutes: 5
-
+      # Run npm ci + tests inside the official Playwright image. The
+      # image bundles Node + Chromium + all OS deps, eliminating the
+      # `playwright install` step that has repeatedly wedged at the
+      # extract phase on the Azure-backed runner disk (167 MiB → ~600
+      # MiB unpack across many small files takes >5 min consistently).
+      #
+      # `--network host` lets the container reach the docker-compose
+      # stack on localhost. `--ipc=host` is the Playwright-recommended
+      # setting to avoid Chromium running out of memory in shared /dev/shm.
+      # Image tag MUST track the pinned `@playwright/test` version in
+      # e2e/package-lock.json — version skew between client and bundled
+      # browsers causes runtime failures.
       - name: Run Playwright tests
-        run: npx playwright test
-        working-directory: e2e
-        env:
-          CI: true
-        # Playwright has per-test timeouts of its own, but a hung
-        # worker can outlast them; this is the outer safety net.
+        run: |
+          docker run --rm \
+            --network=host \
+            --ipc=host \
+            -v "${{ github.workspace }}/e2e:/work" \
+            -w /work \
+            -e CI=true \
+            -e HOME=/tmp \
+            mcr.microsoft.com/playwright:v1.58.2-noble \
+            sh -c "npm ci --ignore-scripts && npx playwright test --shard=${{ matrix.shard }}/${{ strategy.job-total }}"
+        # Playwright has per-test timeouts of its own; this is the
+        # outer safety net. npm ci inside the container is ~10 s for
+        # this tree (only @playwright/test + typescript).
         timeout-minutes: 10
 
       - name: Upload test report
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: playwright-report
+          name: playwright-report-shard-${{ matrix.shard }}
           path: e2e/playwright-report/
           retention-days: 14
 
@@ -574,11 +684,27 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # On branch/tag builds the image lives in GHCR — log in and let Trivy
+      # pull it. On PRs nothing was pushed; the image arrives as an artifact
+      # from build-images and is loaded into the local daemon below, where
+      # Trivy finds it by the same tag without any registry access.
       - name: Log in to GHCR
+        if: needs.prepare.outputs.is_pr != 'true'
         uses: ./.github/actions/ghcr-login
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           username: ${{ github.actor }}
+
+      - name: Download image artifact (PR)
+        if: needs.prepare.outputs.is_pr == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: image-${{ matrix.image }}-amd64
+          path: /tmp
+
+      - name: Load image (PR)
+        if: needs.prepare.outputs.is_pr == 'true'
+        run: gunzip -c "/tmp/${{ matrix.image }}-amd64.tar.gz" | docker load
 
       # Human-readable findings step. Always prints the table of CVEs
       # Trivy would gate on to the action log — so a failure in the
@@ -657,8 +783,32 @@ jobs:
             "$REGISTRY/${{ matrix.image }}:sha-${sha_short}-arm64"
 
   # ── Release ────────────────────────────────────────────
-  release:
-    name: Release
+  # The release stage is five jobs — a tiny pre-create that owns the
+  # Release object and four branches that all upload into it in
+  # parallel:
+  #
+  #   release-create   — pre-creates an empty GitHub Release for the tag
+  #                      with a placeholder title. Owning Release
+  #                      creation here means provider AND migrate can
+  #                      both run in append mode at the same time
+  #                      instead of provider gating migrate (#435 had
+  #                      provider create the Release → migrate append).
+  #   release-images   — image retag + Helm push + SBOM generation.
+  #                      Saves chart + SBOMs + checksums as a workflow
+  #                      artifact for release-finalize to upload.
+  #   release-provider — GoReleaser provider, append mode.
+  #   release-migrate  — GoReleaser migrate, append mode.
+  #   release-publish  — GoReleaser terrapod-publish, append mode.
+  #   release-finalize — joins all five; sets real title + release notes
+  #                      and uploads the workflow artifact from
+  #                      release-images.
+  #
+  # Both goreleaser invocations also pass `--parallelism 6` so each
+  # process saturates the runner's cores when crunching its own
+  # platform matrix.
+
+  release-create:
+    name: Release — Create empty GitHub Release
     needs: [prepare, create-manifests]
     if: |
       always()
@@ -668,11 +818,41 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Create empty Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${{ needs.prepare.outputs.version }}"
+
+          # Idempotent: if the Release already exists (e.g. this job
+          # is being re-run), skip. release-finalize will set the
+          # real title/notes; we just need the Release object so the
+          # append-mode goreleaser runs have somewhere to upload to.
+          if gh release view "$version" >/dev/null 2>&1; then
+            echo "Release $version already exists; skipping create"
+            exit 0
+          fi
+          gh release create "$version" \
+            --title "$version (in progress)" \
+            --notes "Release in progress — assets are being attached by parallel CI jobs."
+
+  release-images:
+    name: Release — Images, Helm, SBOMs
+    needs: [prepare, create-manifests]
+    if: |
+      always()
+      && needs.prepare.outputs.is_tag == 'true'
+      && needs.prepare.result == 'success'
+      && (needs.create-manifests.result == 'success' || needs.create-manifests.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
       packages: write
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
 
       - name: Install Helm
         uses: azure/setup-helm@v5
@@ -711,6 +891,47 @@ jobs:
           .github/scripts/with-retry.sh "helm push" -- \
             helm push "dist/terrapod-${chart_version}.tgz" "oci://$REGISTRY"
 
+      - name: Generate SBOMs
+        run: |
+          version="${{ needs.prepare.outputs.version }}"
+
+          # Install syft
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
+          for image in terrapod-api terrapod-web terrapod-runner terrapod-listener terrapod-migrations; do
+            echo "Generating SBOM for $image:$version"
+            syft "$REGISTRY/$image:$version" -o spdx-json="dist/sbom-${image}.spdx.json"
+          done
+
+      - name: Generate checksums
+        run: |
+          (cd dist && sha256sum -- *.tgz *.spdx.json > checksums.txt)
+
+      - name: Upload artifact for release-finalize
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-images-assets
+          path: dist/
+          retention-days: 1
+
+  release-provider:
+    name: Release — Provider (GoReleaser)
+    # Both goreleaser jobs depend only on release-create — they no
+    # longer gate on each other. provider/.goreleaser.yml is
+    # release.mode=append.
+    needs: [prepare, release-create]
+    if: |
+      always()
+      && needs.prepare.outputs.is_tag == 'true'
+      && needs.release-create.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - uses: actions/setup-go@v6
         with:
           go-version-file: provider/go.mod
@@ -728,31 +949,125 @@ jobs:
         with:
           distribution: goreleaser
           version: latest
-          args: release --clean
+          # --parallelism saturates the runner's 4 vCPUs across the
+          # 8-platform build matrix (slightly oversubscribed because
+          # part of each build is I/O — module download, GPG signing).
+          args: release --clean --parallelism 6
           workdir: provider
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GPG_FINGERPRINT: ${{ steps.gpg.outputs.fingerprint }}
 
-      # Build terrapod-migrate binaries and append them to the release
-      # created by the provider's GoReleaser run. Linux/Windows ship as
-      # per-arch zips; macOS ships as a single Universal 2 binary built
-      # by lipo-merging darwin/amd64 + darwin/arm64. See
-      # migrate/.goreleaser.yml — release.mode=append keeps this step
-      # from trying to create a duplicate GitHub Release for the same tag.
+  release-migrate:
+    name: Release — Migrate tool (GoReleaser)
+    # Parallel with release-provider — both append to the Release that
+    # release-create made.
+    needs: [prepare, release-create]
+    if: |
+      always()
+      && needs.prepare.outputs.is_tag == 'true'
+      && needs.release-create.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: migrate/go.mod
+          cache-dependency-path: migrate/go.sum
+
+      - name: Import GPG signing key
+        id: gpg
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          fingerprint=$(gpg --with-colons --import-options show-only --import <<< "${{ secrets.GPG_PRIVATE_KEY }}" | awk -F: '/^fpr:/{print $10; exit}')
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+
+      # Linux/Windows ship as per-arch zips; macOS ships as a single
+      # Universal 2 binary built by lipo-merging darwin/amd64 +
+      # darwin/arm64. See migrate/.goreleaser.yml.
       - name: Build migrate-tool binaries with GoReleaser
         uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
           version: latest
-          args: release --clean
+          # See note on release-provider — same parallelism rationale.
+          args: release --clean --parallelism 6
           workdir: migrate
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GPG_FINGERPRINT: ${{ steps.gpg.outputs.fingerprint }}
 
+  release-publish:
+    name: Release — Publish tool (GoReleaser)
+    # Parallel with release-provider / release-migrate — all append to the
+    # Release that release-create made.
+    needs: [prepare, release-create]
+    if: |
+      always()
+      && needs.prepare.outputs.is_tag == 'true'
+      && needs.release-create.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: publish/go.mod
+          cache-dependency-path: publish/go.sum
+
+      - name: Import GPG signing key
+        id: gpg
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          fingerprint=$(gpg --with-colons --import-options show-only --import <<< "${{ secrets.GPG_PRIVATE_KEY }}" | awk -F: '/^fpr:/{print $10; exit}')
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+
+      - name: Build terrapod-publish binaries with GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean --parallelism 6
+          workdir: publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPG_FINGERPRINT: ${{ steps.gpg.outputs.fingerprint }}
+
+  release-finalize:
+    name: Release — Finalize (notes + chart + SBOMs)
+    needs: [prepare, release-create, release-images, release-provider, release-migrate, release-publish]
+    if: |
+      always()
+      && needs.prepare.outputs.is_tag == 'true'
+      && needs.release-create.result == 'success'
+      && needs.release-images.result == 'success'
+      && needs.release-provider.result == 'success'
+      && needs.release-migrate.result == 'success'
+      && needs.release-publish.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download release-images artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-images-assets
+          path: dist/
+
       - name: Generate release notes
-        id: notes
         run: |
           version="${{ needs.prepare.outputs.version }}"
 
@@ -796,27 +1111,12 @@ jobs:
           # Write to file to preserve newlines
           echo "$notes" > /tmp/release-notes.md
 
-      - name: Generate SBOMs
-        run: |
-          version="${{ needs.prepare.outputs.version }}"
-
-          # Install syft
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
-
-          for image in terrapod-api terrapod-web terrapod-runner terrapod-listener terrapod-migrations; do
-            echo "Generating SBOM for $image:$version"
-            syft "$REGISTRY/$image:$version" -o spdx-json="dist/sbom-${image}.spdx.json"
-          done
-
-      - name: Upload release assets
+      - name: Edit Release title/notes + upload chart, SBOMs, checksums
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           version="${{ needs.prepare.outputs.version }}"
           chart_version="${version#v}"
-
-          # Generate checksums
-          (cd dist && sha256sum -- *.tgz *.spdx.json > checksums.txt)
 
           # GoReleaser already created the release with provider binaries.
           # Update title/notes and upload remaining assets.
@@ -837,11 +1137,11 @@ jobs:
   # ── Cleanup Tag on Failure ─────────────────────────────
   cleanup-tag:
     name: Cleanup Tag
-    needs: [prepare, build-images, scan-images, create-manifests, release]
+    needs: [prepare, build-images, scan-images, create-manifests, release-create, release-images, release-provider, release-migrate, release-publish, release-finalize]
     if: |
       always()
       && needs.prepare.outputs.is_tag == 'true'
-      && (needs.build-images.result == 'failure' || needs.scan-images.result == 'failure' || needs.create-manifests.result == 'failure' || needs.release.result == 'failure')
+      && (needs.build-images.result == 'failure' || needs.scan-images.result == 'failure' || needs.create-manifests.result == 'failure' || needs.release-create.result == 'failure' || needs.release-images.result == 'failure' || needs.release-provider.result == 'failure' || needs.release-migrate.result == 'failure' || needs.release-publish.result == 'failure' || needs.release-finalize.result == 'failure')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -872,6 +1172,8 @@ jobs:
       - go-terrapod-test
       - migrate-lint
       - migrate-test
+      - publish-lint
+      - publish-test
       - python-test
       - python-audit
       - npm-audit
@@ -884,7 +1186,12 @@ jobs:
       - scan-images
       - e2e-test
       - create-manifests
-      - release
+      - release-create
+      - release-images
+      - release-provider
+      - release-migrate
+      - release-publish
+      - release-finalize
     runs-on: ubuntu-latest
     steps:
       - name: Check results
@@ -899,6 +1206,8 @@ jobs:
             "${{ needs.go-terrapod-test.result }}"
             "${{ needs.migrate-lint.result }}"
             "${{ needs.migrate-test.result }}"
+            "${{ needs.publish-lint.result }}"
+            "${{ needs.publish-test.result }}"
             "${{ needs.python-test.result }}"
             "${{ needs.python-audit.result }}"
             "${{ needs.npm-audit.result }}"
@@ -911,7 +1220,12 @@ jobs:
             "${{ needs.scan-images.result }}"
             "${{ needs.e2e-test.result }}"
             "${{ needs.create-manifests.result }}"
-            "${{ needs.release.result }}"
+            "${{ needs.release-create.result }}"
+            "${{ needs.release-images.result }}"
+            "${{ needs.release-provider.result }}"
+            "${{ needs.release-migrate.result }}"
+            "${{ needs.release-publish.result }}"
+            "${{ needs.release-finalize.result }}"
           )
 
           for r in "${results[@]}"; do

@@ -129,6 +129,11 @@ def _mock_run(
     run.resource_destructions = None
     run.resource_replacements = None
     run.resource_imports = None
+    run.peak_memory_bytes = None
+    run.peak_cpu_usec = None
+    run.runner_exit_code = None
+    run.runner_exit_reason = ""
+    run.runner_exit_status = ""
     return run
 
 
@@ -151,7 +156,7 @@ class TestRunJsonModuleOverrides:
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
     @patch("terrapod.api.routers.runs.run_service.get_run")
-    @patch("terrapod.api.routers.runs.resolve_workspace_permission")
+    @patch("terrapod.api.routers.runs.resolve_workspace_permission_for")
     async def test_run_json_includes_module_overrides(self, mock_resolve, mock_get_run, *mocks):
         overrides = {"default/eks/aws": "module_overrides/abc123/default/eks/aws.tar.gz"}
         run = _mock_run(module_overrides=overrides, source="module-test")
@@ -260,7 +265,7 @@ class TestRetryRunCopiesOverrides:
     @patch("terrapod.api.routers.runs.run_service.queue_run")
     @patch("terrapod.api.routers.runs.run_service.create_run")
     @patch("terrapod.api.routers.runs.run_service.get_run")
-    @patch("terrapod.api.routers.runs.resolve_workspace_permission")
+    @patch("terrapod.api.routers.runs.resolve_workspace_permission_for")
     async def test_retry_copies_module_overrides(
         self, mock_resolve, mock_get_run, mock_create_run, mock_queue, *mocks
     ):
@@ -299,7 +304,7 @@ class TestWorkspaceLinkCRUD:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.registry_modules.resolve_registry_permission")
+    @patch("terrapod.api.routers.registry_modules.resolve_registry_permission_for")
     @patch("terrapod.api.routers.registry_modules.get_module")
     async def test_list_workspace_links(self, mock_get_module, mock_resolve, *mocks):
         module = _mock_module()
@@ -328,7 +333,7 @@ class TestWorkspaceLinkCRUD:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.registry_modules.resolve_registry_permission")
+    @patch("terrapod.api.routers.registry_modules.resolve_registry_permission_for")
     @patch("terrapod.api.routers.registry_modules.get_module")
     async def test_create_workspace_link_requires_admin(
         self, mock_get_module, mock_resolve, *mocks

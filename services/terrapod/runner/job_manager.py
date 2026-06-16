@@ -5,6 +5,7 @@ Uses the kubernetes Python client to interact with the K8s API.
 
 import asyncio
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 from kubernetes import client, config
@@ -235,6 +236,130 @@ async def get_job_status(job_name: str, namespace: str = "") -> str | None:
         raise
 
 
+async def get_pod_terminated_info(
+    job_name: str, namespace: str = ""
+) -> dict[str, int | str] | None:
+    """Return the runner container's terminated info for a Failed Job (#430).
+
+    Lists the Job's pods, picks the most-recently-terminated one with a
+    `runner` container in a terminated state, and returns:
+        { "exit_code": <int>, "reason": <str> }
+
+    Returns None if no terminated runner container is found (job still
+    running, pod GC'd, container not yet observed, etc.).
+
+    `reason` is the K8s container.state.terminated.reason — most commonly
+    "OOMKilled" / "Error" / "Completed". The API maps this to the typed
+    `runner_exit_status` bucket on the run.
+
+    Never raises; on any K8s API error or unexpected shape, returns None.
+    The reconciler falls back to its launch_timeout for those cases.
+    """
+    if not namespace:
+        namespace = _default_namespace()
+
+    core_api = _get_core_api()
+
+    try:
+        loop = asyncio.get_event_loop()
+        pods = await loop.run_in_executor(
+            _executor,
+            lambda: core_api.list_namespaced_pod(
+                namespace=namespace,
+                label_selector=f"job-name={job_name}",
+            ),
+        )
+        core_api.api_client.last_response = None
+    except ApiException:
+        return None
+
+    if not pods.items:
+        return None
+
+    # Most-recently-terminated pod first — same selection the K8s Job
+    # controller uses when deciding whether to mark itself Failed.
+    def _terminated_at(p: object) -> str:
+        for c in getattr(p.status, "container_statuses", None) or []:
+            term = getattr(c.state, "terminated", None)
+            if term and term.finished_at:
+                return str(term.finished_at)
+        return ""
+
+    pods_sorted = sorted(pods.items, key=_terminated_at, reverse=True)
+
+    for pod in pods_sorted:
+        for c in getattr(pod.status, "container_statuses", None) or []:
+            if c.name != "runner":
+                continue
+            term = getattr(c.state, "terminated", None)
+            if term is None:
+                continue
+            return {
+                "exit_code": int(term.exit_code) if term.exit_code is not None else -1,
+                "reason": term.reason or "",
+            }
+
+    return None
+
+
+async def get_job_failure_info(job_name: str, namespace: str = "") -> dict[str, int | str] | None:
+    """Fallback to `get_pod_terminated_info` when the pod has been GC'd.
+
+    When the listener observes Job=failed but the pod is already gone
+    (eviction by taint-eviction-controller, TTL controller, manual
+    cleanup, etc.), pod-level terminated state is unreadable.
+
+    The Job itself still records the failure cause in
+    `status.conditions[?].reason == "PodFailurePolicy"`. The condition's
+    `message` field contains the exit code that triggered the
+    FailJob rule, e.g.:
+
+        Container runner for pod terrapod/tprun-...-lx72v failed
+        with exit code 137 matching FailJob rule at index 0
+
+    Parse the exit code out and return it so the listener can still
+    typify the failure (`runner_exit_status = "killed"` for exit 137
+    without OOMKilled reason) rather than leaving an empty status that
+    the reconciler renders as a generic "Job failed".
+
+    Returns the same shape as get_pod_terminated_info:
+        { "exit_code": <int>, "reason": <str> }
+    Reason is left empty because the Job-controller event doesn't
+    carry the K8s container terminated.reason — only the exit code.
+    The API's typed-bucket mapping handles `reason=""` + `exit_code=137`
+    correctly (→ "killed").
+
+    Returns None if no PodFailurePolicy condition is present or the
+    message can't be parsed. Never raises.
+    """
+    if not namespace:
+        namespace = _default_namespace()
+
+    batch_api = _get_batch_api()
+
+    try:
+        loop = asyncio.get_event_loop()
+        job = await loop.run_in_executor(
+            None,
+            lambda: batch_api.read_namespaced_job(name=job_name, namespace=namespace),
+        )
+    except ApiException:
+        return None
+
+    conditions = getattr(getattr(job, "status", None), "conditions", None) or []
+    for cond in conditions:
+        if getattr(cond, "reason", None) != "PodFailurePolicy":
+            continue
+        msg = getattr(cond, "message", "") or ""
+        # Format: "... failed with exit code <N> matching FailJob rule ..."
+        m = re.search(r"exit code (\d+)", msg)
+        if not m:
+            continue
+        return {"exit_code": int(m.group(1)), "reason": ""}
+
+    return None
+
+
 async def get_job_uid(job_name: str, namespace: str = "") -> str:
     """Get the UID of a Job. Used for ownerReference on auth Secrets."""
     if not namespace:
@@ -285,12 +410,24 @@ async def get_pod_logs(
         if limit_bytes is not None:
             log_kwargs["limit_bytes"] = limit_bytes
 
-        logs = await loop.run_in_executor(
+        # _preload_content=False so the kubernetes client returns the raw
+        # urllib3 HTTPResponse instead of round-tripping through its
+        # broken text-response deserializer (which calls str(bytes_obj),
+        # producing literal `b'...'`-prefixed garbage in the streaming
+        # log view — see #449 / v0.33.0 smoke).
+        log_kwargs["_preload_content"] = False
+        resp = await loop.run_in_executor(
             _executor,
             lambda: core_api.read_namespaced_pod_log(**log_kwargs),
         )
-        # Clear last_response to release the raw log string from K8s client memory
-        core_api.api_client.last_response = None
-        return logs
+        try:
+            data = resp.data
+            return data.decode("utf-8", errors="replace") if isinstance(data, bytes) else data
+        finally:
+            try:
+                resp.release_conn()
+            except Exception:
+                pass
+            core_api.api_client.last_response = None
     except ApiException:
         return ""

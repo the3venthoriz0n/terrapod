@@ -101,7 +101,7 @@ docker_build(
     dockerfile='docker/Dockerfile.migrations',
 )
 
-# Runner Job image (Alpine + curl/tar/jq, signal-forwarding entrypoint)
+# Runner Job image (python:3.13-slim, pure-Python orchestrator).
 # Built as a local_resource (not docker_build) because the runner image is
 # referenced in the runners.yaml ConfigMap, not in a pod spec — Tilt's image
 # injection doesn't apply.  values-local.yaml sets terrapod-runner:local with
@@ -109,7 +109,18 @@ docker_build(
 local_resource(
     'build-runner-image',
     cmd='docker build -f docker/Dockerfile.runner -t terrapod-runner:local .',
-    deps=['docker/Dockerfile.runner', 'docker/runner-entrypoint.sh'],
+    deps=[
+        'docker/Dockerfile.runner',
+        'services/pyproject-runner.toml',
+        'services/terrapod/runner/__init__.py',
+        'services/terrapod/runner/runner_config.py',
+        'services/terrapod/runner/download.py',
+        'services/terrapod/runner/exec_subprocess.py',
+        'services/terrapod/runner/lock_extender.py',
+        'services/terrapod/runner/plan_artifacts.py',
+        'services/terrapod/runner/job_entrypoint.py',
+        'services/terrapod/runner/phases',
+    ],
     labels=['build'],
 )
 
@@ -364,4 +375,15 @@ local_resource(
     labels=['tests'],
     auto_init=False,
     trigger_mode=TRIGGER_MODE_MANUAL,
+)
+
+# Dev-only: reset migrations when switching branches.
+# Stamps the DB to the latest revision found in alembic/versions/ on disk,
+# then deletes the failed job so Tilt recreates it.
+local_resource(
+    'reset-migrations',
+    cmd="HEAD=$(grep -rh '^revision' alembic/versions/*.py | tail -1 | sed 's/.*\"\\(.*\\)\"/\\1/') && kubectl exec -n terrapod deploy/terrapod-postgresql -- psql -U terrapod -d terrapod -c \"UPDATE alembic_version SET version_num = '${HEAD}';\" && kubectl delete job -n terrapod -l app.kubernetes.io/component=migrations 2>/dev/null; true",
+    auto_init=False,
+    trigger_mode=TRIGGER_MODE_MANUAL,
+    labels=['infra'],
 )

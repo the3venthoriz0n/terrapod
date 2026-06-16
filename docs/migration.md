@@ -6,8 +6,10 @@ platforms are supported:
 
 - **HCP Terraform / Terraform Enterprise (TFE)** — one TFE organization
   maps to one Terrapod deployment (Terrapod is single-org).
-- **Atlantis** — `atlantis.yaml` v3 schema; one or more repos map to
-  Terrapod workspaces or autodiscovery rules.
+- **Atlantis** — `atlantis.yaml` v3 schema, or autodiscovery mode
+  (no `atlantis.yaml` — use `--workspace` for direct per-workspace
+  state migration); one or more repos map to Terrapod workspaces or
+  autodiscovery rules.
 
 The CLI is a Go binary distributed alongside the Terrapod provider on
 every Terrapod release. Each release publishes:
@@ -130,6 +132,27 @@ for ad-hoc rewriting without a migration record.
 - **`terragrunt` projects** — Terrapod doesn't run terragrunt. Detected
   and listed in the skipped-items report.
 - **PR comment history** — out of scope.
+
+### Autodiscovery mode (no `atlantis.yaml`)
+
+Many Atlantis deployments run in autodiscovery mode — Atlantis discovers
+terraform directories automatically without an `atlantis.yaml` file. For
+these setups, use the `--workspace` flag to target an existing Terrapod
+workspace directly:
+
+```
+terrapod-migrate apply \
+  --source=atlantis \
+  --source-dir /path/to/terraform/project \
+  --workspace my-workspace-name \
+  --target https://terrapod.example.com \
+  --apply
+```
+
+This bypasses `atlantis.yaml` parsing entirely. The tool detects the
+backend from HCL in `--source-dir`, reads state from that backend, and
+pushes it to the named Terrapod workspace. The workspace must already
+exist (created via Terrapod's autodiscovery rules, the UI, or the API).
 
 ### State migration
 

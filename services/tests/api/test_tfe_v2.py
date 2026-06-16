@@ -102,12 +102,15 @@ class TestAccountDetails:
     async def test_account_details_api_token_is_service_account(
         self, mock_init_db, mock_init_redis, mock_init_storage
     ):
+        # A service-kind token (service_bound/service_detached) is a service
+        # account; an interactive token (terraform login) is not (#495).
         user = AuthenticatedUser(
             email="bot@example.com",
             display_name=None,
             roles=[],
             provider_name="api_token",
             auth_method="api_token",
+            kind="service_bound",
         )
         app = _make_app_with_auth(user)
 
@@ -157,8 +160,12 @@ class TestTokenCRUD:
         mock_token.id = "at-abc123"
         mock_token.description = "my token"
         mock_token.token_type = "user"
-        mock_token.user_email = "test@example.com"
+        mock_token.kind = "interactive"
+        mock_token.bound_to = "test@example.com"
+        mock_token.created_by = "test@example.com"
+        mock_token.pinned_roles = None
         mock_token.created_at = datetime(2026, 1, 1, tzinfo=UTC)
+        mock_token.rotated_at = None
         mock_token.last_used_at = None
         mock_token.lifespan_hours = None
         mock_create.return_value = (mock_token, "raw.tpod.secret")
@@ -208,8 +215,12 @@ class TestTokenCRUD:
         mock_token.id = "at-abc123"
         mock_token.description = "test"
         mock_token.token_type = "user"
-        mock_token.user_email = "test@example.com"
+        mock_token.kind = "interactive"
+        mock_token.bound_to = "test@example.com"
+        mock_token.created_by = "test@example.com"
+        mock_token.pinned_roles = None
         mock_token.created_at = datetime(2026, 1, 1, tzinfo=UTC)
+        mock_token.rotated_at = None
         mock_token.last_used_at = None
         mock_token.lifespan_hours = None
         mock_list.return_value = [mock_token]
@@ -251,7 +262,7 @@ class TestTokenCRUD:
     ):
         mock_token = MagicMock()
         mock_token.id = "at-abc123"
-        mock_token.user_email = "test@example.com"
+        mock_token.bound_to = "test@example.com"
         mock_get_token.return_value = mock_token
         mock_revoke.return_value = True
 
@@ -285,7 +296,7 @@ class TestTokenCRUD:
     ):
         mock_token = MagicMock()
         mock_token.id = "at-abc123"
-        mock_token.user_email = "other@example.com"
+        mock_token.bound_to = "other@example.com"
         mock_get_token.return_value = mock_token
 
         user = AuthenticatedUser(

@@ -8,6 +8,13 @@ updates:
     labels: [dependencies, python]
     commit-message:
       prefix: "deps(python):"
+    ignore:
+      # fastapi 0.137 pulls starlette 1.x (major) — it refactors
+      # include_router (the new _IncludedRouter matcher) and shifts
+      # several Starlette behaviours. Hold until a dedicated migration
+      # PR with a full smoke pass; revisit then.
+      - dependency-name: fastapi
+        versions: [">=0.137"]
 
   - package-ecosystem: npm
     directory: /web
@@ -21,6 +28,14 @@ updates:
       # eslint-plugin-react (via eslint-config-next) doesn't support ESLint 10 yet
       - dependency-name: eslint
         versions: [">=10"]
+      # The @zxcvbn-ts v4 line ships compressed dictionaries and must move
+      # as a SET (core + language-common + dictionary-compression) with
+      # code changes in admin/users; core is pinned at ^3.0.4. Ignore the
+      # whole scope at v4 — a per-package ignore just lets dependabot
+      # propose the other halves separately (it split this into
+      # language-common and core PRs). Lift when doing the coordinated v4 upgrade.
+      - dependency-name: "@zxcvbn-ts/*"
+        versions: [">=4"]
 
   - package-ecosystem: docker
     directory: /docker
@@ -33,6 +48,12 @@ updates:
     ignore:
       - dependency-name: node
         versions: ["23.x", "25.x", "27.x", "29.x", "31.x"]
+      # Python 3.14+ — pinned at 3.13 deliberately (v0.32.0 downgrade
+      # cleared CVEs and several runtime deps aren't 3.14-ready). Until
+      # the ecosystem catches up we don't want dependabot re-suggesting
+      # the bump every week.
+      - dependency-name: python
+        versions: ["3.14.x", "3.15.x"]
 
   - package-ecosystem: github-actions
     directory: /

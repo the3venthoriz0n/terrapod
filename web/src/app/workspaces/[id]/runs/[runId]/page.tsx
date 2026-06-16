@@ -9,6 +9,8 @@ import { PageHeader } from '@/components/page-header'
 import { LoadingSpinner } from '@/components/loading-spinner'
 import { ErrorBanner } from '@/components/error-banner'
 import { PlanSummaryBadges } from '@/components/plan-summary-badges'
+import { PlanAiSummary } from '@/components/plan-ai-summary'
+import { ResourceUsage } from '@/components/resource-usage'
 import { getAuthState, isAdmin } from '@/lib/auth'
 import { apiFetch } from '@/lib/api'
 import { useRunEvents } from '@/lib/use-run-events'
@@ -52,6 +54,13 @@ interface RunAttrs {
   'module-overrides': Record<string, string> | null
   'status-timestamps': Record<string, string>
   'created-by': string
+  'resource-cpu': string
+  'resource-memory': string
+  'peak-memory-bytes': number | null
+  'peak-cpu-usec': number | null
+  'runner-exit-code': number | null
+  'runner-exit-reason': string
+  'runner-exit-status': string
   actions: RunActions
   permissions: Record<string, boolean>
 }
@@ -119,6 +128,7 @@ function LogPanel({
 }) {
   const [colorMode, setColorMode] = useState(true)
   const [following, setFollowing] = useState(true)
+  const [copied, setCopied] = useState(false)
   const preRef = useRef<HTMLPreElement>(null)
 
   const cleanLog = useMemo(() => (log ? stripStxEtx(log) : null), [log])
@@ -248,6 +258,19 @@ function LogPanel({
             <ChevronsUp className="w-3 h-3" />
             Top
           </button>
+          {plainContent && (
+            <button
+              onClick={() => {
+                navigator.clipboard.writeText(plainContent)
+                setCopied(true)
+                setTimeout(() => setCopied(false), 2000)
+              }}
+              className="px-2.5 py-1 text-xs rounded font-medium bg-slate-700 text-slate-400 hover:text-slate-200 transition-colors"
+              title="Copy plain text to clipboard"
+            >
+              {copied ? 'Copied!' : 'Copy'}
+            </button>
+          )}
           <button
             onClick={() => downloadFile(cleanLog!, `${shortId}-${phase}.log`)}
             className="px-2.5 py-1 text-xs rounded font-medium bg-slate-700 text-slate-400 hover:text-slate-200 transition-colors"
@@ -302,6 +325,10 @@ export default function RunDetailPage() {
   const [applyHtml, setApplyHtml] = useState('')
   const [planLogLoading, setPlanLogLoading] = useState(false)
   const [applyLogLoading, setApplyLogLoading] = useState(false)
+  // Bumped when the SSE `plan_summary_ready` event arrives so the
+  // PlanAiSummary component refetches without forcing the whole run to
+  // reload.
+  const [aiSummaryRefresh, setAiSummaryRefresh] = useState(0)
 
   // Offset tracking for incremental log fetching (byte position in raw log data)
   const planLogOffset = useRef(0)
@@ -354,16 +381,30 @@ export default function RunDetailPage() {
       if (event.phase === 'plan') loadPlanLog()
       else if (event.phase === 'apply') loadApplyLog()
     }
+    // Any of the summary-lifecycle events should trigger a refetch
+    // (pending, ready, errored, skipped, message_posted). The
+    // component handles rendering for each status.
+    if (
+      [
+        'plan_summary_ready',
+        'plan_summary_pending',
+        'plan_summary_errored',
+        'plan_summary_skipped',
+        'plan_summary_message_posted',
+      ].includes(event.event) && event.run_id === bareId
+    ) {
+      setAiSummaryRefresh((n) => n + 1)
+    }
   }, [runId, loadRun]))
 
   useEffect(() => {
     if (!run) return
     const status = run.attributes.status
-    if (['planning', 'planned', 'confirmed', 'applying', 'applied', 'errored', 'canceled', 'discarded'].includes(status)) {
+    if (['planning', 'planned', 'confirmed', 'applying', 'canceling', 'applied', 'errored', 'canceled', 'discarded'].includes(status)) {
       setPlanLogLoading(prev => planLog === null ? true : prev)
       loadPlanLog(true).finally(() => setPlanLogLoading(false))
     }
-    if (['applying', 'applied', 'errored'].includes(status) && !run.attributes['plan-only']) {
+    if (['applying', 'canceling', 'applied', 'errored'].includes(status) && !run.attributes['plan-only']) {
       setApplyLogLoading(prev => applyLog === null ? true : prev)
       loadApplyLog(true).finally(() => setApplyLogLoading(false))
     }
@@ -500,7 +541,7 @@ export default function RunDetailPage() {
     switch (status) {
       case 'applied': return 'bg-green-900/50 text-green-300'
       case 'planned': case 'confirmed': return 'bg-blue-900/50 text-blue-300'
-      case 'planning': case 'applying': case 'queued': return 'bg-yellow-900/50 text-yellow-300'
+      case 'planning': case 'applying': case 'canceling': case 'queued': return 'bg-yellow-900/50 text-yellow-300'
       case 'errored': return 'bg-red-900/50 text-red-300'
       case 'canceled': case 'discarded': return 'bg-slate-700 text-slate-400'
       case 'pending': return 'bg-slate-700 text-slate-300'
@@ -598,6 +639,20 @@ export default function RunDetailPage() {
           </div>
         )}
 
+        {/* Resource usage panel (#430) — peak memory/CPU alongside the
+            workspace's requested/limit, plus an OOM tag when the
+            listener observed an OOMKilled / exit-137 termination. The
+            ResourceUsage component returns null when no peak data is
+            present (pre-#430 runs), so this block is safe to render
+            unconditionally for new runs. */}
+        <div className="mb-6">
+          <ResourceUsage
+            resourceMemory={attrs['resource-memory']}
+            peakMemoryBytes={attrs['peak-memory-bytes']}
+            runnerExitStatus={attrs['runner-exit-status']}
+          />
+        </div>
+
         {/* OPA policy evaluations (#343) */}
         <PolicyPanel runId={runId} runStatus={attrs.status} onChanged={loadRun} />
 
@@ -669,6 +724,10 @@ export default function RunDetailPage() {
             )}
           </div>
         )}
+
+        {/* AI plan summary / failure analysis (#401) — renders nothing
+            when the feature is off or no row exists for this plan. */}
+        <PlanAiSummary runId={runId.replace(/^run-/, '')} refreshKey={aiSummaryRefresh} />
 
         {/* Run metadata */}
         <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 p-6 mb-6">
@@ -1017,28 +1076,51 @@ function PolicyPanel({
                 )}
               </div>
               {a.result?.error && (
-                <p className="mt-2 text-xs text-amber-300 font-mono">{a.result.error}</p>
+                <div className="mt-2 p-2 bg-red-900/20 rounded border border-red-800/40">
+                  <p className="text-xs text-red-300 font-mono whitespace-pre-wrap">{a.result.error}</p>
+                </div>
               )}
-              {policies
-                .filter((p) => !p.passed || p.warnings.length > 0)
-                .map((p) => (
-                  <div key={p.policy} className="mt-2 text-xs">
-                    <span className="text-slate-300 font-medium">{p.policy}</span>
-                    {p.error && <span className="text-amber-300 font-mono"> — {p.error}</span>}
-                    <ul className="mt-1 ml-3 space-y-0.5">
-                      {p.violations.map((v, i) => (
-                        <li key={`v${i}`} className="text-red-300 font-mono">
-                          &bull; {v}
-                        </li>
-                      ))}
-                      {p.warnings.map((w, i) => (
-                        <li key={`w${i}`} className="text-amber-300 font-mono">
-                          &bull; {w}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                ))}
+              {policies.length > 0 && (
+                <div className="mt-3 space-y-2">
+                  {policies.map((p) => (
+                    <div key={p.policy} className="text-xs border-l-2 pl-3 py-1" style={{borderColor: p.passed ? '#4ade80' : p.error ? '#f59e0b' : '#f87171'}}>
+                      <div className="flex items-center gap-2">
+                        <span className={p.passed ? 'text-green-400' : p.error ? 'text-amber-400' : 'text-red-400'}>
+                          {p.passed ? '✓' : p.error ? '⚠' : '✗'}
+                        </span>
+                        <span className="text-slate-200 font-medium">{p.policy}</span>
+                        {p.passed && <span className="text-green-500">passed</span>}
+                      </div>
+                      {p.error && (
+                        <div className="mt-1 ml-5 p-2 bg-amber-900/20 rounded border border-amber-800/40">
+                          <p className="text-amber-300 font-mono whitespace-pre-wrap">{p.error}</p>
+                        </div>
+                      )}
+                      {!p.passed && !p.error && (!p.violations || p.violations.length === 0) && (
+                        <p className="mt-1 ml-5 text-slate-400 italic">Policy failed without producing a deny message or error output</p>
+                      )}
+                      {p.violations && p.violations.length > 0 && (
+                        <ul className="mt-1 ml-5 space-y-0.5">
+                          {p.violations.map((v: string, i: number) => (
+                            <li key={`v${i}`} className="text-red-300 font-mono">
+                              &bull; {v}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {p.warnings && p.warnings.length > 0 && (
+                        <ul className="mt-1 ml-5 space-y-0.5">
+                          {p.warnings.map((w: string, i: number) => (
+                            <li key={`w${i}`} className="text-amber-300 font-mono">
+                              &bull; {w}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )
         })}

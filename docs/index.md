@@ -82,14 +82,16 @@ See [Architecture](architecture.md) for the full breakdown.
 |---|---|
 | [Getting Started](getting-started.md) | Local development setup, first workspace, first plan/apply |
 | [Architecture](architecture.md) | System components, storage, runners, auth flows |
-| [Authentication](authentication.md) | Local auth, OIDC, SAML, terraform login, API tokens |
+| [Authentication](authentication.md) | Local auth, OIDC, SAML, terraform login, API tokens, scoped service tokens (bound/detached) + offboarding idle guard |
 | [RBAC](rbac.md) | Permission model, label-based access control, custom roles |
 | [VCS Integration](vcs-integration.md) | GitHub and GitLab setup, polling, webhooks |
 | [VCS Workflows](vcs-workflows.md) | merge_then_apply (default) vs apply_then_merge (Atlantis-style, opt-in) |
 | [Autodiscovery](autodiscovery.md) | Atlantis-style monorepo workspace autodiscovery |
 | [Drift Detection](drift-detection.md) | Scheduled plan-only runs to detect infrastructure drift |
+| [Drift Ignore Rules](drift-ignore-rules.md) | Per-workspace allowlist that suppresses known-noisy attributes from the drift signal (e.g. provider-rotated certs, externally co-managed replicas) |
 | [Run Triggers](run-triggers.md) | Cross-workspace dependency chains |
 | [Remote State](remote-state.md) | Cross-workspace `terraform_remote_state` composition with producer-controlled allowlist |
+| [AI Plan Summary](ai-plan-summary.md) | LLM-generated change summary + risk assessment on every plan; failure analysis on errored plans. Bedrock, OpenAI, Anthropic, Gemini, vLLM — any provider via LiteLLM |
 | [Notifications](notifications.md) | Webhook, Slack, and email alerts on run events |
 | [Run Tasks](run-tasks.md) | Pre/post-plan webhook hooks for external validation |
 | [Policy-as-Code](policies.md) | OPA/Rego policy sets, advisory/mandatory enforcement, label scoping |
@@ -98,6 +100,7 @@ See [Architecture](architecture.md) for the full breakdown.
 | [Runners](runners.md) | Custom runner images, private registries, Job configuration |
 | [Cloud Credentials](cloud-credentials.md) | AWS IRSA, GCP WIF, Azure WI setup |
 | [Registry](registry.md) | Private module/provider registry, caching layers |
+| [Registry Publishing](registry-publishing.md) | Publishing providers/modules with the `terrapod-publish` CLI and the client-signed publish protocol |
 | [Monitoring](monitoring.md) | Prometheus metrics, scraping, recommended alerts |
 | [Deployment](deployment.md) | Production Helm deployment, storage backends, scaling |
 | [Split-networking deployments](deployment-network-isolation.md) | Three-Ingress model: management / webhook / internal agent path, with split-hostname runner config |

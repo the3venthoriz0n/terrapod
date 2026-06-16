@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -79,6 +80,65 @@ projects:
 		if ws.VCSConnectionRef != connSourceID {
 			t.Errorf("workspace %q vcs ref = %q, want %q", ws.Name, ws.VCSConnectionRef, connSourceID)
 		}
+	}
+}
+
+func TestLoadDirectWorkspacePlan_Shape(t *testing.T) {
+	plan, stateReader, err := loadDirectWorkspacePlan("/tmp/fake", "my-workspace", atlantis.StateOptions{})
+	if err != nil {
+		t.Fatalf("loadDirectWorkspacePlan: %v", err)
+	}
+	if plan.Source != "atlantis" {
+		t.Errorf("plan.Source = %q, want %q", plan.Source, "atlantis")
+	}
+	if plan.SourceMetadata["mode"] != "direct-workspace" {
+		t.Errorf("metadata mode = %q", plan.SourceMetadata["mode"])
+	}
+	if plan.SourceMetadata["workspace"] != "my-workspace" {
+		t.Errorf("metadata workspace = %q", plan.SourceMetadata["workspace"])
+	}
+	if len(plan.Workspaces) != 1 {
+		t.Fatalf("expected 1 workspace, got %d", len(plan.Workspaces))
+	}
+	ws := plan.Workspaces[0]
+	if ws.SourceID != "direct:my-workspace" {
+		t.Errorf("SourceID = %q, want %q", ws.SourceID, "direct:my-workspace")
+	}
+	if ws.Name != "my-workspace" {
+		t.Errorf("Name = %q", ws.Name)
+	}
+	if stateReader == nil {
+		t.Fatal("stateReader is nil")
+	}
+}
+
+func TestLoadDirectWorkspacePlan_StateReaderCallsThrough(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "main.tf"), []byte("terraform {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	state := `{"version":4,"lineage":"direct-test-abc","serial":42,"terraform_version":"1.12.0","outputs":{},"resources":[]}`
+	if err := os.WriteFile(filepath.Join(dir, "terraform.tfstate"), []byte(state), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, stateReader, err := loadDirectWorkspacePlan(dir, "ws", atlantis.StateOptions{})
+	if err != nil {
+		t.Fatalf("loadDirectWorkspacePlan: %v", err)
+	}
+
+	raw, lineage, serial, err := stateReader(context.Background(), "ignored-source-id")
+	if err != nil {
+		t.Fatalf("stateReader: %v", err)
+	}
+	if string(raw) != state {
+		t.Errorf("raw mismatch")
+	}
+	if lineage != "direct-test-abc" {
+		t.Errorf("lineage = %q", lineage)
+	}
+	if serial != 42 {
+		t.Errorf("serial = %d", serial)
 	}
 }
 

@@ -126,6 +126,8 @@
         "tokenTTLSeconds": { "type": "integer", "minimum": 1 },
         "maxTokenTTLSeconds": { "type": "integer", "minimum": 1 },
         "staleTimeoutSeconds": { "type": "integer", "minimum": 60 },
+        "driftMaxDurationSeconds": { "type": "integer", "minimum": 0 },
+        "planArtifactsMaxBytes": { "type": "integer", "minimum": 10240 },
         "serviceAccount": { "$ref": "#/$defs/serviceAccountSpec" },
         "azureWorkloadIdentity": { "type": "boolean" }
       }
@@ -505,6 +507,10 @@
             "callback_base_url": { "type": "string" },
             "session_ttl_hours": { "type": "integer", "minimum": 1 },
             "api_token_max_ttl_hours": { "type": "integer", "minimum": 0 },
+            "login_token_ttl_hours": { "type": "integer", "minimum": 0 },
+            "service_token_max_ttl_hours": { "type": "integer", "minimum": 0 },
+            "token_expiry_warning_days": { "type": "integer", "minimum": 0 },
+            "bound_token_idle_days": { "type": "integer", "minimum": 0 },
             "require_external_sso_for_roles": {
               "type": "array",
               "items": { "type": "string" }
@@ -593,6 +599,13 @@
                   "enum": ["none", "rc", "beta", "alpha", "dev"]
                 }
               }
+            },
+            "module_interface": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" }
+              }
             }
           }
         },
@@ -634,6 +647,44 @@
             },
             "default_join_token_ttl_seconds": {
               "oneOf": [{ "type": "integer", "minimum": 60 }, { "type": "null" }]
+            }
+          }
+        },
+
+        "ai_summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "model": { "type": "string" },
+            "api_base": { "type": "string" },
+            "max_output_tokens": { "type": "integer", "minimum": 1 },
+            "request_timeout_seconds": { "type": "integer", "minimum": 1 },
+            "daily_token_budget": { "type": "integer", "minimum": 0 },
+            "plan_json_max_bytes": { "type": "integer", "minimum": 0 },
+            "code_context_max_bytes": { "type": "integer", "minimum": 0 },
+            "code_diff_max_bytes": { "type": "integer", "minimum": 0 },
+            "followup_max_messages_per_run": { "type": "integer", "minimum": 0 },
+            "followup_max_output_tokens": { "type": "integer", "minimum": 1 },
+            "auth": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "api_key": { "type": "string" },
+                "aws_region": { "type": "string" },
+                "aws_role_arn": { "type": "string" },
+                "aws_session_name": { "type": "string" },
+                "aws_external_id": { "type": "string" }
+              }
+            },
+            "context": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "prompt_prefix": { "type": "string" },
+                "prompt_suffix": { "type": "string" },
+                "fleet_context": { "type": "string" }
+              }
             }
           }
         },

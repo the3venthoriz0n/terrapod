@@ -111,9 +111,8 @@ variable "x" {}
 	if b.Kind != BackendLocal {
 		t.Errorf("Kind = %q, want %q", b.Kind, BackendLocal)
 	}
-	wantPath := filepath.Join(dir, "terraform.tfstate")
-	if b.Settings["path"] != wantPath {
-		t.Errorf("Settings[path] = %q, want %q", b.Settings["path"], wantPath)
+	if b.Settings["path"] != "terraform.tfstate" {
+		t.Errorf("Settings[path] = %q, want %q", b.Settings["path"], "terraform.tfstate")
 	}
 	if b.SourceFile != "" {
 		t.Errorf("SourceFile should be empty for implicit local, got %q", b.SourceFile)

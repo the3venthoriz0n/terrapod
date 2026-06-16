@@ -1,6 +1,6 @@
 'use client'
 
-import { Suspense, useEffect, useRef, useState, useCallback, useMemo } from 'react'
+import { Suspense, useEffect, useRef, useState, useCallback, useMemo, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import NavBar from '@/components/nav-bar'
@@ -14,11 +14,13 @@ import { apiFetch } from '@/lib/api'
 import { useSortable } from '@/lib/use-sortable'
 import { useWorkspaceListEvents } from '@/lib/use-workspace-list-events'
 import {
+  hasLabelTerm,
   hasStatusTerm,
   matchWorkspace,
   parseFilterQuery,
   removeTerm,
   serializeFilter,
+  toggleLabelTerm,
   toggleStatusTerm,
 } from '@/lib/workspace-filter'
 import { WORKSPACE_STATUSES, resolveStatus } from '@/lib/workspace-status'
@@ -50,6 +52,7 @@ interface Workspace {
     'agent-pool-name': string | null
     'drift-detection-enabled': boolean
     'drift-status': string
+    'drift-latest-run-id': string | null
     'state-diverged': boolean
     'vcs-last-error': string | null
     'health-conditions': HealthCondition[]
@@ -99,18 +102,70 @@ function WorkspacesPageInner() {
     }
   }, [statusMenuOpen])
 
-  // Sync the input to the URL whenever the parsed filter changes.
+  // Label dropdown — same outside-click + Escape pattern as Status. The
+  // dropdown is a two-level picker: first pick a label key, then a value.
+  const [labelMenuOpen, setLabelMenuOpen] = useState(false)
+  const [labelMenuKey, setLabelMenuKey] = useState<string | null>(null)
+  const labelMenuRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!labelMenuOpen) return
+    const onClick = (e: MouseEvent) => {
+      if (labelMenuRef.current && !labelMenuRef.current.contains(e.target as Node)) {
+        setLabelMenuOpen(false)
+        setLabelMenuKey(null)
+      }
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (labelMenuKey !== null) setLabelMenuKey(null)
+        else setLabelMenuOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', onClick)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onClick)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [labelMenuOpen, labelMenuKey])
+
+  // Inline filter typeahead — AWS-style faceted suggestions popped under the
+  // free-text input as you type, while still letting you type anything. The
+  // dropdown suggests `key:value` labels, `status:…`, label keys (to drill),
+  // and matching workspace names; clicking one inserts the chip.
+  const [suggestOpen, setSuggestOpen] = useState(false)
+  // -1 = nothing highlighted. A suggestion is only applied on an explicit
+  // pick (click, or arrow-key to highlight + Enter); a bare Enter keeps the
+  // free text the user typed.
+  const [suggestIndex, setSuggestIndex] = useState(-1)
+  const filterInputRef = useRef<HTMLInputElement>(null)
+  const suggestWrapRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!suggestOpen) return
+    const onClick = (e: MouseEvent) => {
+      if (suggestWrapRef.current && !suggestWrapRef.current.contains(e.target as Node)) {
+        setSuggestOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', onClick)
+    return () => document.removeEventListener('mousedown', onClick)
+  }, [suggestOpen])
+
+  // Sync the input to the URL whenever the parsed filter changes — debounced.
+  //
+  // Each `router.replace` triggers a Next.js RSC prefetch for the new URL.
+  // Firing per-keystroke (e.g. typing "repo:data-pipelines") cascades
+  // ~20 prefetches in a few hundred ms, overwhelms Next's dev server with
+  // 503s, and can leave the address bar stuck on an early keystroke when
+  // a later prefetch wins the race. We debounce to a single replace once
+  // typing settles.
   //
   // Dedup via `lastSyncedQueryRef` — we track the last query string we
   // wrote and skip redundant `router.replace` calls. We deliberately do
   // NOT compare against `searchParams.get('q')`: `useSearchParams()` is
   // updated by Next.js asynchronously after `router.replace`, so its
   // value in the effect closure can be one render behind the URL we
-  // just wrote. That stale read was the cause of the workspaces filter
-  // sync being "hit and miss" — it would early-return on a comparison
-  // against an out-of-date `current`, leaving the address bar stuck.
-  // The ref is written-once-per-real-update and never reads back from
-  // the URL, so it can't go stale.
+  // just wrote.
   //
   // Initialised to the URL's current `q` so that mounting on a page
   // already loaded with `?q=...` (refresh, shared link) doesn't fire a
@@ -119,11 +174,14 @@ function WorkspacesPageInner() {
   useEffect(() => {
     const serialized = serializeFilter(parsedFilter)
     if (lastSyncedQueryRef.current === serialized) return
-    lastSyncedQueryRef.current = serialized
-    const url = serialized
-      ? `/workspaces?q=${encodeURIComponent(serialized)}`
-      : '/workspaces'
-    router.replace(url, { scroll: false })
+    const timer = setTimeout(() => {
+      lastSyncedQueryRef.current = serialized
+      const url = serialized
+        ? `/workspaces?q=${encodeURIComponent(serialized)}`
+        : '/workspaces'
+      router.replace(url, { scroll: false })
+    }, 250)
+    return () => clearTimeout(timer)
   }, [parsedFilter, router])
 
   const filteredWorkspaces = useMemo(() => {
@@ -180,6 +238,126 @@ function WorkspacesPageInner() {
     }
     return counts
   }, [workspaces])
+
+  // Distinct labels across the unfiltered list: key → sorted unique values
+  // with workspace counts. Drives the two-level "+ Label" picker. Computed
+  // once per workspace-list change so the menu render stays cheap.
+  const labelIndex = useMemo(() => {
+    const idx = new Map<string, Map<string, number>>()
+    for (const ws of workspaces) {
+      const labels = ws.attributes.labels || {}
+      for (const [k, v] of Object.entries(labels)) {
+        let values = idx.get(k)
+        if (!values) {
+          values = new Map<string, number>()
+          idx.set(k, values)
+        }
+        values.set(v, (values.get(v) || 0) + 1)
+      }
+    }
+    return idx
+  }, [workspaces])
+  const sortedLabelKeys = useMemo(
+    () => Array.from(labelIndex.keys()).sort(),
+    [labelIndex],
+  )
+
+  // The token being typed = text after the last space (filter tokens are
+  // space-separated). Suggestions are computed against just that token, so
+  // earlier chips in the box are left untouched.
+  const currentToken = useMemo(() => {
+    const parts = filterInput.split(' ')
+    return parts[parts.length - 1]
+  }, [filterInput])
+
+  interface FilterSuggestion {
+    kind: 'label' | 'label-key' | 'status' | 'name'
+    insert: string
+    display: string
+    hint: string
+    count?: number
+    dot?: string
+  }
+
+  const suggestions = useMemo<FilterSuggestion[]>(() => {
+    const tok = currentToken.trim()
+    if (!tok) return []
+    const lower = tok.toLowerCase()
+    const out: FilterSuggestion[] = []
+    const sepIdx = tok.search(/[:=]/)
+    if (sepIdx >= 0) {
+      // `key:partial` → suggest values for that key.
+      const key = tok.slice(0, sepIdx)
+      const partial = tok.slice(sepIdx + 1).toLowerCase()
+      if (key === 'status') {
+        for (const s of WORKSPACE_STATUSES) {
+          if (!partial || s.filter.toLowerCase().includes(partial) || s.label.toLowerCase().includes(partial))
+            out.push({ kind: 'status', insert: `status:${s.filter}`, display: `status:${s.filter}`, hint: 'status', dot: s.dot, count: statusCounts[s.filter] || 0 })
+        }
+      } else {
+        const values = labelIndex.get(key)
+        if (values) {
+          for (const [v, c] of values) {
+            if (!partial || v.toLowerCase().includes(partial))
+              out.push({ kind: 'label', insert: `${key}:${v}`, display: `${key}:${v}`, hint: 'label', count: c })
+          }
+        }
+      }
+    } else {
+      // Bare token → match label keys (drill), key:value pairs, statuses, names.
+      for (const k of sortedLabelKeys) {
+        if (k.toLowerCase().includes(lower))
+          out.push({ kind: 'label-key', insert: `${k}:`, display: `${k}:`, hint: 'label key' })
+      }
+      for (const k of sortedLabelKeys) {
+        for (const [v, c] of labelIndex.get(k)!) {
+          if (v.toLowerCase().includes(lower) || k.toLowerCase().includes(lower))
+            out.push({ kind: 'label', insert: `${k}:${v}`, display: `${k}:${v}`, hint: 'label', count: c })
+        }
+      }
+      for (const s of WORKSPACE_STATUSES) {
+        if (s.filter.toLowerCase().includes(lower) || s.label.toLowerCase().includes(lower))
+          out.push({ kind: 'status', insert: `status:${s.filter}`, display: `status:${s.filter}`, hint: 'status', dot: s.dot, count: statusCounts[s.filter] || 0 })
+      }
+      for (const ws of workspaces) {
+        const n = ws.attributes.name
+        if (n.toLowerCase().includes(lower))
+          out.push({ kind: 'name', insert: n, display: n, hint: 'name' })
+      }
+    }
+    // Dedup by inserted text; cap so the menu stays usable.
+    const seen = new Set<string>()
+    return out.filter(s => (seen.has(s.insert) ? false : (seen.add(s.insert), true))).slice(0, 12)
+  }, [currentToken, sortedLabelKeys, labelIndex, statusCounts, workspaces])
+
+  function applyFilterSuggestion(s: FilterSuggestion) {
+    const parts = filterInput.split(' ')
+    parts[parts.length - 1] = s.insert
+    // A label-key suggestion (`env:`) leaves the cursor mid-token so you keep
+    // typing/picking the value; everything else completes the chip + a space.
+    const drill = s.kind === 'label-key'
+    setFilterInput(parts.join(' ') + (drill ? '' : ' '))
+    setSuggestIndex(-1)
+    setSuggestOpen(drill)
+    filterInputRef.current?.focus()
+  }
+
+  function onFilterKeyDown(e: ReactKeyboardEvent<HTMLInputElement>) {
+    if (e.key === 'ArrowDown' && (!suggestOpen || suggestions.length === 0)) {
+      if (currentToken.trim()) { setSuggestOpen(true); setSuggestIndex(0) }
+      return
+    }
+    if (!suggestOpen || suggestions.length === 0) return
+    if (e.key === 'ArrowDown') { e.preventDefault(); setSuggestIndex(i => (i + 1) % suggestions.length) }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setSuggestIndex(i => (i <= 0 ? suggestions.length - 1 : i - 1)) }
+    else if (e.key === 'Enter') {
+      // Apply ONLY a suggestion the user explicitly highlighted with the
+      // arrow keys. A bare Enter (nothing highlighted) keeps the typed text.
+      if (suggestIndex >= 0) { e.preventDefault(); applyFilterSuggestion(suggestions[suggestIndex]); }
+      else setSuggestOpen(false)
+    }
+    else if (e.key === 'Escape') { e.preventDefault(); setSuggestOpen(false) }
+  }
 
   const badgeColors: Record<string, string> = {
     amber: 'bg-amber-900/50 text-amber-300',
@@ -244,7 +422,6 @@ function WorkspacesPageInner() {
   }, [showCreate, newBackend, versionsBackend])
 
   async function loadWorkspaces() {
-    setLoading(true)
     try {
       const res = await apiFetch('/api/v2/organizations/default/workspaces')
       if (!res.ok) throw new Error('Failed to load workspaces')
@@ -541,14 +718,60 @@ function WorkspacesPageInner() {
           return (
             <div className="mb-4">
               <div className="flex items-center gap-2">
-                <input
-                  type="text"
-                  value={filterInput}
-                  onChange={e => setFilterInput(e.target.value)}
-                  placeholder='Filter by name, label, or status — e.g. "eu1", "env:prod", "status:errored"'
-                  aria-label="Filter workspaces"
-                  className="flex-1 px-3 py-2 rounded-lg bg-slate-800/50 border border-slate-700/50 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-brand-500"
-                />
+                <div className="relative flex-1" ref={suggestWrapRef}>
+                  <input
+                    type="text"
+                    value={filterInput}
+                    onChange={e => { setFilterInput(e.target.value); setSuggestOpen(true); setSuggestIndex(-1) }}
+                    onFocus={() => { if (currentToken.trim()) setSuggestOpen(true) }}
+                    onKeyDown={onFilterKeyDown}
+                    ref={filterInputRef}
+                    placeholder='Filter by name, label, or status — e.g. "eu1", "env:prod", "status:errored"'
+                    aria-label="Filter workspaces"
+                    role="combobox"
+                    aria-expanded={suggestOpen && suggestions.length > 0}
+                    aria-autocomplete="list"
+                    autoComplete="off"
+                    className="w-full px-3 py-2 rounded-lg bg-slate-800/50 border border-slate-700/50 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-brand-500"
+                  />
+                  {suggestOpen && suggestions.length > 0 && (
+                    <div
+                      role="listbox"
+                      data-testid="filter-suggestions"
+                      className="absolute left-0 right-0 z-20 mt-1 rounded-lg bg-slate-800 border border-slate-700 shadow-xl py-1 max-h-72 overflow-y-auto"
+                    >
+                      {suggestions.map((s, i) => (
+                        <button
+                          key={`${s.kind}:${s.insert}`}
+                          type="button"
+                          role="option"
+                          aria-selected={i === suggestIndex}
+                          // onMouseDown (not onClick) so it fires before the input blur closes the menu.
+                          // Clicking applies THIS suggestion directly (independent of the
+                          // keyboard-highlight index), so a hover never hijacks a bare Enter.
+                          onMouseDown={e => { e.preventDefault(); applyFilterSuggestion(s) }}
+                          className={
+                            'w-full flex items-center gap-2 px-3 py-1.5 text-sm transition-colors text-left border-l-2 ' +
+                            (i === suggestIndex
+                              ? 'bg-brand-600/40 text-white border-brand-300 font-semibold ring-1 ring-inset ring-brand-400/60'
+                              : 'border-transparent text-slate-300 hover:bg-slate-700/40')
+                          }
+                        >
+                          {s.dot ? (
+                            <span className={'w-1.5 h-1.5 rounded-full ' + s.dot} />
+                          ) : (
+                            <span className="w-1.5" />
+                          )}
+                          <span className="flex-1 font-mono text-xs">{s.display}</span>
+                          {typeof s.count === 'number' && (
+                            <span className="text-[10px] text-slate-500">{s.count}</span>
+                          )}
+                          <span className="text-[10px] uppercase tracking-wide text-slate-500">{s.hint}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
                 {/* Status dropdown — single entry point for all status presets.
                     Picks any combination via toggle; the existing chips below
                     show what's active and let the user remove individually. */}
@@ -608,6 +831,99 @@ function WorkspacesPageInner() {
                       })}
                     </div>
                   )}
+                </div>
+                {/* Label dropdown — two-level picker for arbitrary label
+                    key/value pairs. First level lists distinct label keys
+                    in the visible workspaces; clicking a key drills into a
+                    second menu of distinct values for that key. */}
+                <div className="relative" ref={labelMenuRef}>
+                  {(() => {
+                    const activeLabelCount = parsedFilter.terms.filter(t => t.kind === 'label' && t.value !== null).length
+                    return (
+                      <>
+                        <button
+                          type="button"
+                          aria-haspopup="menu"
+                          aria-expanded={labelMenuOpen}
+                          onClick={() => {
+                            setLabelMenuOpen(o => !o)
+                            setLabelMenuKey(null)
+                          }}
+                          disabled={sortedLabelKeys.length === 0}
+                          className={
+                            'inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium border transition-colors disabled:opacity-50 disabled:cursor-not-allowed ' +
+                            (activeLabelCount > 0
+                              ? 'bg-slate-700/60 text-slate-100 border-slate-600'
+                              : 'bg-slate-800/50 text-slate-300 border-slate-700/50 hover:bg-slate-700/60')
+                          }
+                        >
+                          <span>Label</span>
+                          {activeLabelCount > 0 && (
+                            <span className="inline-flex items-center justify-center min-w-5 px-1.5 rounded-full text-[10px] font-semibold bg-brand-600 text-white">
+                              {activeLabelCount}
+                            </span>
+                          )}
+                          <svg className={'w-3 h-3 transition-transform ' + (labelMenuOpen ? 'rotate-180' : '')} viewBox="0 0 12 12" fill="currentColor" aria-hidden>
+                            <path d="M3 4.5l3 3 3-3" stroke="currentColor" strokeWidth="1.5" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        </button>
+                        {labelMenuOpen && labelMenuKey === null && (
+                          <div role="menu" className="absolute right-0 z-10 mt-1 w-64 rounded-lg bg-slate-800 border border-slate-700 shadow-xl py-1 max-h-96 overflow-y-auto">
+                            {sortedLabelKeys.map(k => (
+                              <button
+                                key={k}
+                                type="button"
+                                role="menuitem"
+                                onClick={() => setLabelMenuKey(k)}
+                                className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-slate-300 hover:bg-slate-700/40 transition-colors"
+                              >
+                                <span className="flex-1 text-left font-mono text-xs">{k}</span>
+                                <span className="text-xs text-slate-500">{labelIndex.get(k)?.size || 0} value{(labelIndex.get(k)?.size || 0) === 1 ? '' : 's'}</span>
+                                <span aria-hidden className="text-slate-500">›</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                        {labelMenuOpen && labelMenuKey !== null && (
+                          <div role="menu" className="absolute right-0 z-10 mt-1 w-64 rounded-lg bg-slate-800 border border-slate-700 shadow-xl py-1 max-h-96 overflow-y-auto">
+                            <button
+                              type="button"
+                              onClick={() => setLabelMenuKey(null)}
+                              className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-slate-400 hover:bg-slate-700/40 transition-colors border-b border-slate-700/50"
+                            >
+                              <span aria-hidden>‹</span>
+                              <span>back</span>
+                              <span className="ml-auto font-mono text-slate-500">{labelMenuKey}</span>
+                            </button>
+                            {Array.from(labelIndex.get(labelMenuKey)?.entries() || [])
+                              .sort(([a], [b]) => a.localeCompare(b))
+                              .map(([v, count]) => {
+                                const active = hasLabelTerm(parsedFilter, labelMenuKey, v)
+                                return (
+                                  <button
+                                    key={v}
+                                    type="button"
+                                    role="menuitemcheckbox"
+                                    aria-checked={active}
+                                    onClick={() => {
+                                      setFilterInput(serializeFilter(toggleLabelTerm(parsedFilter, labelMenuKey, v)))
+                                    }}
+                                    className={
+                                      'w-full flex items-center gap-2 px-3 py-1.5 text-sm transition-colors ' +
+                                      (active ? 'bg-slate-700/60 text-slate-100' : 'text-slate-300 hover:bg-slate-700/40')
+                                    }
+                                  >
+                                    <span className="w-3 inline-flex justify-center text-brand-400">{active ? '✓' : ''}</span>
+                                    <span className="flex-1 text-left font-mono text-xs">{v}</span>
+                                    <span className="text-xs text-slate-500">{count}</span>
+                                  </button>
+                                )
+                              })}
+                          </div>
+                        )}
+                      </>
+                    )
+                  })()}
                 </div>
                 {parsedFilter.terms.length > 0 && (
                   <button
@@ -677,12 +993,38 @@ function WorkspacesPageInner() {
                   return (
                   <tr key={ws.id} className="hover:bg-slate-700/20 transition-colors">
                     <td className="px-4 py-3">
-                      <Link
-                        href={`/workspaces/${ws.id}`}
-                        className="text-sm font-medium text-brand-400 hover:text-brand-300"
-                      >
-                        {ws.attributes.name}
-                      </Link>
+                      <div className="flex flex-col gap-1.5">
+                        <Link
+                          href={`/workspaces/${ws.id}`}
+                          className="text-sm font-medium text-brand-400 hover:text-brand-300"
+                        >
+                          {ws.attributes.name}
+                        </Link>
+                        {ws.attributes.labels && Object.keys(ws.attributes.labels).length > 0 && (
+                          <div className="flex flex-wrap gap-1">
+                            {Object.entries(ws.attributes.labels).map(([k, v]) => {
+                              const active = hasLabelTerm(parsedFilter, k, v)
+                              return (
+                                <button
+                                  key={`${k}=${v}`}
+                                  type="button"
+                                  onClick={() => setFilterInput(serializeFilter(toggleLabelTerm(parsedFilter, k, v)))}
+                                  className={
+                                    'inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-mono transition-colors ' +
+                                    (active
+                                      ? 'bg-brand-700/60 text-brand-100 hover:bg-brand-700'
+                                      : 'bg-slate-700/40 text-slate-400 hover:bg-slate-700/80 hover:text-slate-200')
+                                  }
+                                  title={active ? 'Click to remove from filter' : 'Click to filter by this label'}
+                                >
+                                  <span className="text-slate-500">{k}:</span>
+                                  <span className="ml-0.5">{v}</span>
+                                </button>
+                              )
+                            })}
+                          </div>
+                        )}
+                      </div>
                     </td>
                     <td className="px-4 py-3 hidden sm:table-cell">
                       <span className="text-xs text-slate-400">{ws.attributes['execution-mode']}</span>
@@ -704,22 +1046,22 @@ function WorkspacesPageInner() {
                         ) : runId ? (
                           <Link
                             href={`/workspaces/${ws.id}/runs/${runId}`}
-                            className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium hover:opacity-80 transition-opacity ${badgeColors[def.color]}`}
+                            className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium whitespace-nowrap hover:opacity-80 transition-opacity ${badgeColors[def.color]}`}
                           >
                             {def.label}
                           </Link>
                         ) : (
-                          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${badgeColors[def.color]}`}>
+                          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium whitespace-nowrap ${badgeColors[def.color]}`}>
                             {def.label}
                           </span>
                         )}
                         {ws.attributes['lifecycle-state'] === 'pending_deletion' && (
-                          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${badgeColors.amber}`}>
+                          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium whitespace-nowrap ${badgeColors.amber}`}>
                             Pending deletion
                           </span>
                         )}
                         {ws.attributes['lifecycle-state'] === 'archived' && (
-                          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${badgeColors.slate}`}>
+                          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium whitespace-nowrap ${badgeColors.slate}`}>
                             Archived
                           </span>
                         )}

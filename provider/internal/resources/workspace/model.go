@@ -26,6 +26,7 @@
 //	"vcs-branch"                        → vcs_branch          (string, optional)
 //	"agent-pool-id"                     → agent_pool_id       (string, optional)
 //	"var-files"                         → var_files           (list,   optional)
+//	"trigger-prefixes"                  → trigger_prefixes    (list,   optional)
 //	"drift-detection-enabled"           → drift_detection_enabled (bool, optional)
 //	"drift-detection-interval-seconds"  → drift_detection_interval_seconds (int, optional)
 //
@@ -71,8 +72,12 @@ type workspaceModel struct {
 	AutoMergeStrategy             types.String `tfsdk:"auto_merge_strategy"`
 	AgentPoolID                   types.String `tfsdk:"agent_pool_id"`
 	VarFiles                      types.List   `tfsdk:"var_files"`
+	TriggerPrefixes               types.List   `tfsdk:"trigger_prefixes"`
+	DriftIgnoreRules              types.List   `tfsdk:"drift_ignore_rules"`
 	DriftDetectionEnabled         types.Bool   `tfsdk:"drift_detection_enabled"`
 	DriftDetectionIntervalSeconds types.Int64  `tfsdk:"drift_detection_interval_seconds"`
+	AISummaryMode                 types.String `tfsdk:"ai_summary_mode"`
+	AISummaryContext              types.String `tfsdk:"ai_summary_context"`
 
 	// Set of workspace IDs authorized to read this workspace's state
 	// via `terraform_remote_state` (#344). Producer-controlled
@@ -86,6 +91,15 @@ type workspaceModel struct {
 	OwnerEmail         types.String `tfsdk:"owner_email"`
 	DriftStatus        types.String `tfsdk:"drift_status"`
 	DriftLastCheckedAt types.String `tfsdk:"drift_last_checked_at"`
+	DriftLatestRunID   types.String `tfsdk:"drift_latest_run_id"`
+	StateDiverged      types.Bool   `tfsdk:"state_diverged"`
+	LifecycleState     types.String `tfsdk:"lifecycle_state"`
+	LifecycleReason    types.String `tfsdk:"lifecycle_reason"`
+	VCSLastPolledAt    types.String `tfsdk:"vcs_last_polled_at"`
+	VCSLastError       types.String `tfsdk:"vcs_last_error"`
+	VCSLastErrorAt     types.String `tfsdk:"vcs_last_error_at"`
+	AgentPoolName      types.String `tfsdk:"agent_pool_name"`
+	VCSConnectionName  types.String `tfsdk:"vcs_connection_name"`
 	Locked             types.Bool   `tfsdk:"locked"`
 	CreatedAt          types.String `tfsdk:"created_at"`
 	UpdatedAt          types.String `tfsdk:"updated_at"`

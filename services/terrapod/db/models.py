@@ -15,6 +15,7 @@ from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
@@ -102,6 +103,9 @@ class Role(Base):
     pool_permission: Mapped[str] = mapped_column(
         String(20), nullable=False, default="read", server_default="read"
     )  # read, write, admin
+    registry_permission: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="read", server_default="read"
+    )  # read, write, admin — modules + providers share this
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=now_utc, nullable=False
@@ -160,17 +164,31 @@ class APIToken(Base):
     id: Mapped[str] = mapped_column(String(63), primary_key=True)  # "at-{uuid7}"
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     description: Mapped[str] = mapped_column(String(255), nullable=False, default="")
-    user_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    token_type: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="user"
-    )  # "user", "organization"
+    # Token kind (#495): interactive (terraform login / UI), service_bound
+    # (user-bound automation; perms = min(pinned, owner live)), service_detached
+    # (admin-managed M2M; absolute pinned perms; exempt from idle-login rejection).
+    kind: Mapped[str] = mapped_column(String(20), nullable=False, default="interactive")
+    # Owning identity. NULL <=> detached (no user binding). Bare email string,
+    # NOT an FK: SSO users have no `users` row (sso_service: "SSO users are NOT
+    # stored in the users table"), so an FK would reject their tokens. Integrity
+    # via live role-intersection + idle-login window + local is_active check.
+    bound_to: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The minter (audit). Always set, even for detached (its only creator record).
+    created_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    # Token's own pinned role set (service tokens). Resolved through label-RBAC.
+    pinned_roles: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    # Legacy TFE-shaped field, superseded by `kind`. Retained (unread) for
+    # response back-compat; dropped in a later release.
+    token_type: Mapped[str] = mapped_column(String(20), nullable=False, default="user")
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=now_utc, nullable=False
     )
+    # Set by the rotate action; expiry basis = rotated_at or created_at.
+    rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     lifespan_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    __table_args__ = (Index("ix_api_tokens_user_email", "user_email"),)
+    __table_args__ = (Index("ix_api_tokens_bound_to", "bound_to"),)
 
 
 class AgentPool(Base):
@@ -340,9 +358,43 @@ class Workspace(Base):
     drift_status: Mapped[str] = mapped_column(
         String(20), nullable=False, default=""
     )  # "", "no_drift", "drifted", "errored"
+    # The run that produced the current `drift_status`. Lets the workspace-list
+    # UI link the Drifted / Errored badge straight to the run, instead of the
+    # operator hunting through the runs list. Plain nullable UUID, no FK — a
+    # later artifact-retention sweep may delete the run row, and we don't want
+    # that to break workspace deletion via cascade. The UI handles a 404 on the
+    # click-through gracefully.
+    drift_latest_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # Per-workspace allowlist of resource-address + attribute-path glob
+    # patterns (#482). When a drift run reports `has_changes=True`, every
+    # changed attribute is matched against this list before drift_status
+    # is computed. If every change matches a rule → drift_status=no_drift.
+    # Empty list (default) means classic behaviour: every change counts
+    # as drift. Examples:
+    #   "aws_iam_role.foo.tags.Environment"   (single attr on one resource)
+    #   "module.eks*.argocd_cluster.*.config.tls_client_config.ca_data"
+    #   "aws_autoscaling_group.workers[*]"   (any change to any workers[i])
+    drift_ignore_rules: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, server_default="[]", default=list
+    )
 
     # State divergence — set when an apply Job succeeds but state upload fails
     state_diverged: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+
+    # AI plan summary (#401). `ai_summary_mode` is a three-state opt-in:
+    # - "default": follow the global ai_summary.enabled toggle
+    # - "enabled": always summarise (no-op if global is disabled — the UI
+    #   does not offer this state when global is off)
+    # - "disabled": never summarise, even when global is enabled
+    # `ai_summary_context` is workspace-specific facts added as the last
+    # layer of context before the plan JSON; it is ADDITIVE to the global
+    # fleet_context rather than replacing it.
+    ai_summary_mode: Mapped[str] = mapped_column(
+        String(10), nullable=False, server_default="default", default="default"
+    )
+    ai_summary_context: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="", default=""
+    )
 
     # Autodiscovery lifecycle (#314). lifecycle_state: active (normal) |
     # pending_deletion (origin dir/PR gone — needs explicit operator
@@ -500,6 +552,9 @@ class RegistryModuleVersion(Base):
     upload_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     vcs_commit_sha: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     vcs_tag: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+
+    inputs: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    outputs: Mapped[list | None] = mapped_column(JSONB, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=now_utc, nullable=False
@@ -665,6 +720,7 @@ class RegistryProviderPlatform(Base):
     shasum: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     filename: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     upload_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    h1_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=now_utc, nullable=False
@@ -1177,6 +1233,22 @@ class Run(Base):
         nullable=True,
     )
     error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    # Runner resource profile + OOM detection (#430).
+    # peak_memory_bytes / peak_cpu_usec — captured by the runner at exit
+    #   (cgroup v2 /sys/fs/cgroup/memory.peak + cpu.stat usage_usec).
+    # runner_exit_code / runner_exit_reason — set by the listener when
+    #   the K8s Job terminates (exit code + container.state.terminated.reason).
+    # runner_exit_status — Terrapod-side typed bucket distinguishing
+    #   "" (unset / pre-feature run), "clean" (runner exited 0),
+    #   "oom" (OOMKilled), "killed" (other SIGKILL), "error" (nonzero exit).
+    #   Lets the run UX and AI summary gate behave consistently regardless
+    #   of which signal (cgroup vs K8s) actually triggered detection.
+    peak_memory_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    peak_cpu_usec: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    runner_exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    runner_exit_reason: Mapped[str] = mapped_column(String(50), nullable=False, default="")
+    runner_exit_status: Mapped[str] = mapped_column(String(20), nullable=False, default="")
 
     # Run options (CLI flags)
     target_addrs: Mapped[list[str] | None] = mapped_column(ARRAY(Text), nullable=True)
@@ -1711,4 +1783,135 @@ class PolicyEvaluation(Base):
         sa.UniqueConstraint("run_id", "policy_set_id", name="uq_policy_evaluations_run_set"),
         Index("ix_policy_evaluations_run_id", "run_id"),
         Index("ix_policy_evaluations_policy_set_id", "policy_set_id"),
+    )
+
+
+class PlanSummary(Base):
+    """LLM-generated summary attached to a plan (#401).
+
+    One-to-one with Run, keyed by (run_id). The summariser fires once
+    when the plan phase reaches a terminal state and stores the result
+    here, then emits a `plan_summary_ready` SSE event. Stored separately
+    from `runs` so the column footprint of a 50-million-row table
+    doesn't grow for a feature only some deployments enable, and so the
+    (potentially large) description text doesn't bloat cold reads.
+
+    `kind` distinguishes two skills the API runs:
+      - "plan_summary": successful plan → describe proposed changes
+        and rate risk. Input: PLAN_JSON + code.
+      - "failure_analysis": errored plan → explain why it failed and
+        suggest fixes. Input: plan log + code.
+
+    Field reuse across kinds:
+      - description: change summary OR failure explanation.
+      - risk_level: change-risk severity OR failure severity.
+      - risk_factors: discrete risks ({severity,title,detail,address})
+        OR suggested fixes (same shape — severity = "how critical to
+        apply this fix"). The UI renders them differently per kind.
+
+    Status values:
+      - "pending": handler started, no result yet (transient)
+      - "ready": model returned a parseable structured response
+      - "skipped": daily budget hit, or workspace mode == "disabled"
+      - "errored": model call failed (HTTP / parse / refusal)
+
+    The handler upserts on (run_id) so retries on the same run are
+    idempotent — a "ready" row is never overwritten by a later errored
+    attempt for the same plan.
+    """
+
+    __tablename__ = "plan_summaries"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=generate_uuid7
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    kind: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="plan_summary", default="plan_summary"
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+
+    # Model fields — populated when status == "ready"
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    risk_level: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=""
+    )  # "low", "medium", "high", "critical", "" for non-ready
+    risk_factors: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list, nullable=False)
+
+    # Telemetry / debugging
+    model: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now_utc, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now_utc, onupdate=now_utc, nullable=False
+    )
+
+    __table_args__ = (sa.UniqueConstraint("run_id", name="uq_plan_summaries_run"),)
+
+
+class PlanSummaryMessage(Base):
+    """One turn in the AI plan-summary chat thread (#463).
+
+    Attached to a PlanSummary; the initial structured summary stays on
+    the parent `PlanSummary` row (description + risk_factors). This
+    table only stores conversational follow-ups — user questions and
+    assistant replies — that build on top of that initial summary.
+
+    Roles:
+      - "user": operator follow-up question
+      - "assistant": model reply
+
+    Each assistant row carries its own telemetry (model, token counts,
+    error) so the daily-budget gate debits per turn and an operator
+    can audit cost across the thread. User rows have zero tokens; the
+    columns exist so the table shape is uniform.
+
+    Ordering is by `(plan_summary_id, created_at)` — the SDK / API
+    returns rows in chronological order. uuid7 IDs are time-ordered
+    too, so PK order matches `created_at` order for any sane clock.
+    """
+
+    __tablename__ = "plan_summary_messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=generate_uuid7
+    )
+    plan_summary_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("plan_summaries.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    # Telemetry — meaningful on assistant rows, zero on user rows.
+    model: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now_utc, nullable=False
+    )
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            "role IN ('user', 'assistant')",
+            name="ck_plan_summary_messages_role",
+        ),
+        sa.Index(
+            "ix_plan_summary_messages_plan_created",
+            "plan_summary_id",
+            "created_at",
+        ),
     )

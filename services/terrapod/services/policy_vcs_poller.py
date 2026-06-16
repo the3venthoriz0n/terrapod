@@ -100,6 +100,22 @@ def _extract_rego_files(archive_bytes: bytes, policy_path: str) -> dict[str, str
     return policies
 
 
+<<<<<<< HEAD
+=======
+def _resolve_tmpdir() -> str | None:
+    """Reuse the VCS tmpdir setting — same PVC, same sweep behaviour
+    as vcs_archive_cache / cv_diff / provider_cache. On the API pod
+    `/tmp` is tmpfs (RAM); the PVC mounted here is real disk so
+    multi-hundred-MB downloads don't blow the memory budget."""
+    from terrapod.config import settings
+
+    configured = settings.vcs.tmpdir
+    if configured and os.path.isdir(configured):
+        return configured
+    return None
+
+
+>>>>>>> main
 async def _download_archive(conn: VCSConnection, owner: str, repo: str, ref: str) -> bytes:
     """Download archive via streaming with a size cap enforced before memory load.
 
@@ -108,8 +124,16 @@ async def _download_archive(conn: VCSConnection, owner: str, repo: str, ref: str
     OOM the API replica. After the streamed download completes, the total
     byte count is checked BEFORE reading into memory. Only archives under
     the cap are loaded for tarfile extraction.
+<<<<<<< HEAD
     """
     with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+=======
+
+    Tempfile lands on the CSP-attached PVC (`settings.vcs.tmpdir`) rather
+    than node tmpfs — see `_resolve_tmpdir`.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False, dir=_resolve_tmpdir()) as tmp:
+>>>>>>> main
         tmp_path = tmp.name
 
     try:

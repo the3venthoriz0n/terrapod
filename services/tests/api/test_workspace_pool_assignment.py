@@ -51,6 +51,7 @@ def _mock_workspace(ws_id=None, pool_id=None):
     ws.vcs_last_error_at = None
     ws.var_files = []
     ws.trigger_prefixes = []
+    ws.drift_ignore_rules = []
     ws.drift_detection_enabled = False
     ws.drift_detection_interval_seconds = 86400
     ws.drift_last_checked_at = None
@@ -62,6 +63,8 @@ def _mock_workspace(ws_id=None, pool_id=None):
     ws.lifecycle_state = "active"
     ws.lifecycle_reason = ""
     ws.autodiscovery_pr_number = None
+    ws.ai_summary_mode = "default"
+    ws.ai_summary_context = ""
     ws.created_at = datetime(2026, 1, 1, tzinfo=UTC)
     ws.updated_at = datetime(2026, 1, 1, tzinfo=UTC)
     return ws
@@ -90,7 +93,7 @@ class TestWorkspacePoolAssignment:
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
     @patch(
-        "terrapod.api.routers.tfe_v2.resolve_pool_permission",
+        "terrapod.api.routers.tfe_v2.resolve_pool_permission_for",
         new_callable=AsyncMock,
     )
     @patch("terrapod.api.routers.tfe_v2._agent_pool_service.get_pool", new_callable=AsyncMock)
@@ -138,7 +141,7 @@ class TestWorkspacePoolAssignment:
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
     @patch(
-        "terrapod.api.routers.tfe_v2.resolve_pool_permission",
+        "terrapod.api.routers.tfe_v2.resolve_pool_permission_for",
         new_callable=AsyncMock,
     )
     @patch("terrapod.api.routers.tfe_v2._agent_pool_service.get_pool", new_callable=AsyncMock)
@@ -221,7 +224,7 @@ class TestWorkspacePoolAssignment:
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
     @patch(
-        "terrapod.api.routers.tfe_v2.resolve_pool_permission",
+        "terrapod.api.routers.tfe_v2.resolve_pool_permission_for",
         new_callable=AsyncMock,
     )
     @patch("terrapod.api.routers.tfe_v2._agent_pool_service.get_pool", new_callable=AsyncMock)

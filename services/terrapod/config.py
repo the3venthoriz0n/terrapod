@@ -85,6 +85,22 @@ class RunnerConfig(BaseModel):
             "failure signal, whereas a long-running Job with no status is not."
         ),
     )
+    drift_max_duration_seconds: int = Field(
+        default=1800,
+        description=(
+            "Maximum wall-clock seconds a drift-detection run may spend in "
+            "`planning` before the reconciler errors it out and frees the "
+            "workspace for the next drift cycle. Distinct from stale_timeout: "
+            "stale_timeout protects against listeners that stop reporting; "
+            "this protects against terraform legitimately running for hours "
+            "(e.g. a github provider refresh on a workspace with hundreds of "
+            "rate-limited reads) and blocking drift indefinitely for that "
+            "workspace. Drift runs are background-priority and plan-only — "
+            "a 30 min cap is a generous SLO for 'just tell me if there's "
+            "drift'. Set higher for deployments with genuinely large plans "
+            "you still want drift on; set to 0 to disable the cap."
+        ),
+    )
 
 
 def load_runner_config(path: str = "/etc/terrapod/runners.yaml") -> RunnerConfig:
@@ -283,8 +299,33 @@ class AuthConfig(BaseSettings):
     )
     api_token_max_ttl_hours: int = Field(
         default=8760,
-        description="Maximum API token lifetime in hours (default: 8760 = 1 year). "
-        "0 = no limit. Computed at validation time as created_at + this value.",
+        description="Maximum interactive API token lifetime in hours (default: 8760 = 1 year). "
+        "0 = no limit. Expiry = (rotated_at or created_at) + this value.",
+    )
+    service_token_max_ttl_hours: int = Field(
+        default=8760,
+        description="Maximum service-token (service_bound/service_detached) lifetime in hours "
+        "(default: 8760 = 1 year). Separate from the interactive cap. Service tokens ALWAYS "
+        "expire: this is never treated as unbounded even if set to 0 (#495).",
+    )
+    token_expiry_warning_days: int = Field(
+        default=14,
+        description="How many days ahead to surface in-app warnings for service tokens nearing "
+        "expiry (#495).",
+    )
+    bound_token_idle_days: int = Field(
+        default=7,
+        description="Idle-login window in days for user-bound tokens (interactive + service_bound): "
+        "a bound token is rejected if its owner has not logged in within this window. Also the TTL "
+        "of the tp:user_seen marker. 0 disables idle rejection. Detached tokens are exempt (#495). "
+        "ON by default — convert existing automation tokens to detached before upgrade.",
+    )
+    login_token_ttl_hours: int = Field(
+        default=12,
+        description="Lifespan in hours of the API token minted by `terraform login` (default: 12). "
+        "These are short-lived interactive credentials for a human's CLI session, distinct from the "
+        "api_token_max_ttl_hours cap (which is the upper bound on any token). Still clamped to that "
+        "cap. 0 = no per-login lifespan (falls back to the cap).",
     )
     require_external_sso_for_roles: list[str] = Field(
         default_factory=list,
@@ -360,6 +401,12 @@ class BinaryCacheConfig(BaseModel):
     )
 
 
+class ModuleInterfaceConfig(BaseModel):
+    """Module interface extraction (inputs/outputs from HCL)."""
+
+    enabled: bool = Field(default=True)
+
+
 class RegistryConfig(BaseModel):
     """Private registry and caching configuration."""
 
@@ -373,6 +420,7 @@ class RegistryConfig(BaseModel):
     )
     provider_cache: ProviderCacheConfig = Field(default_factory=ProviderCacheConfig)
     binary_cache: BinaryCacheConfig = Field(default_factory=BinaryCacheConfig)
+    module_interface: ModuleInterfaceConfig = Field(default_factory=ModuleInterfaceConfig)
 
 
 # --- VCS Configuration ---
@@ -609,12 +657,268 @@ class ArtifactRetentionConfig(BaseModel):
     )
 
 
+class RunnerArtifactsConfig(BaseModel):
+    """API-side limits for runner artifact uploads.
+
+    Distinct from `RunnerConfig` (which lives in `runners.yaml` and
+    configures the listener / runner Jobs). These knobs control the
+    API endpoints that runners upload artifacts to.
+    """
+
+    plan_artifacts_max_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        ge=10240,
+        description=(
+            "Maximum size (bytes) of the plan-phase workspace-diff "
+            "tarball that the runner uploads at end of plan and "
+            "downloads at start of apply. Restores plan-time generated "
+            "artifacts (data.archive_file outputs, etc.) that would "
+            "otherwise be missing across the plan→apply Job boundary. "
+            "Uploads exceeding this size are rejected with 413; the "
+            "runner logs the rejection, apply proceeds without the "
+            "restore, and any resource that depended on a plan-time "
+            "generated file will fail at apply with a clear error. "
+            "Default 256 MiB. Minimum 10240 bytes — the size of an "
+            "empty tar with Python's default 20-block padding, which "
+            "every run uploads even when plan produced no new files."
+        ),
+    )
+
+
 class MetricsConfig(BaseModel):
     """Prometheus metrics configuration."""
 
     enabled: bool = Field(
         default=True, description="Expose /metrics endpoint and instrument requests"
     )
+
+
+# --- AI Plan Summary Configuration ---
+
+
+class AISummaryAuthConfig(BaseModel):
+    """Auth configuration for the AI summariser.
+
+    LiteLLM picks the right auth path per provider automatically: bearer
+    for OpenAI/Anthropic/Gemini/Azure/vLLM (read from the relevant env
+    var or this config), AWS credential chain for Bedrock (boto3 inherits
+    the pod's IRSA creds and optionally hops through sts:AssumeRole).
+    No mode switch — the model string's prefix (``bedrock/``,
+    ``openai/``, ``anthropic/``, ``gemini/``, etc.) is what selects the
+    underlying auth path.
+    """
+
+    api_key: str = Field(
+        default="",
+        description=(
+            "Bearer API key for non-AWS providers (OpenAI, Anthropic "
+            "direct, Gemini, Azure OpenAI, vLLM gateway, etc.). Inject "
+            "from a K8s Secret via env var (TERRAPOD_AI_SUMMARY__AUTH__API_KEY) "
+            "rather than committing to values.yaml. Ignored when the "
+            "model string targets a provider LiteLLM authenticates "
+            "another way (e.g. ``bedrock/...`` uses the AWS credential "
+            "chain instead)."
+        ),
+    )
+    aws_region: str = Field(
+        default="us-east-1",
+        description=(
+            "AWS region for Bedrock invocation. Used only when the "
+            "model string starts with ``bedrock/``. Passed through to "
+            "LiteLLM as ``aws_region_name``."
+        ),
+    )
+    aws_role_arn: str = Field(
+        default="",
+        description=(
+            "Cross-account IAM role to assume for Bedrock access. Empty "
+            "means use the pod's ambient credentials (IRSA / env-var / "
+            "shared credentials file) directly. When set, LiteLLM calls "
+            "sts:AssumeRole and caches the temporary credentials, "
+            "refreshing them before expiry. Passed to LiteLLM as "
+            "``aws_role_name``."
+        ),
+    )
+    aws_session_name: str = Field(
+        default="terrapod-ai-summary",
+        description=(
+            "STS AssumeRole session name (visible in CloudTrail). Only "
+            "used when ``aws_role_arn`` is set."
+        ),
+    )
+    aws_external_id: str = Field(
+        default="",
+        description=(
+            "Optional ExternalId for the AssumeRole call. Set when the "
+            "destination role's trust policy requires it."
+        ),
+    )
+
+
+class AISummaryContextConfig(BaseModel):
+    """Layered context injected into the model prompt.
+
+    Layers (rendered top-to-bottom in the request):
+      1. In-code skill prompt — owns the JSON output contract, NOT
+         operator-overridable. Lives in `summariser_prompt.py`.
+      2. `prompt_prefix` (this block) — free-text prepended.
+      3. `fleet_context` — facts about this Terrapod deployment.
+      4. `prompt_suffix` — free-text appended.
+      5. Per-workspace `ai_summary_context` column — workspace-specific.
+
+    Layers 2 and 4 are escape hatches for tone/emphasis tweaks; do not
+    use them to change the output schema (it is wired to the DB schema
+    and the SSE/UI contract).
+    """
+
+    prompt_prefix: str = Field(
+        default="",
+        description=(
+            "Free-text prepended before the skill prompt. Use for tone "
+            "or emphasis tweaks ('be terse'). Do not change the output "
+            "schema instructions here — that breaks the UI contract."
+        ),
+    )
+    fleet_context: str = Field(
+        default="",
+        description=(
+            "Static deployment-wide facts about the infrastructure this "
+            "Terrapod instance manages (what runs here, naming "
+            "conventions, provider/action pairs to flag, etc.). Rendered "
+            "below the skill prompt and above the per-workspace context."
+        ),
+    )
+    prompt_suffix: str = Field(
+        default="",
+        description=(
+            "Free-text appended after fleet_context and before the "
+            "per-workspace context. Same caveats as prompt_prefix."
+        ),
+    )
+
+
+class AISummaryConfig(BaseModel):
+    """AI plan-summary configuration (#401).
+
+    When enabled, every successful plan triggers an asynchronous call to
+    an OpenAI-compatible Chat Completions endpoint. The model is given
+    the structured plan JSON plus optional code context and returns a
+    structured summary (human description + risk assessment). The
+    summary is stored in the plan_summaries table, surfaced in the run
+    UI, and (for VCS-driven runs) edited into the PR/MR comment in place.
+
+    All deployments default to disabled — enabling requires both an
+    auth secret AND explicit endpoint + model config.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Master switch. Off by default — no calls made.",
+    )
+    model: str = Field(
+        default="",
+        description=(
+            "LiteLLM model string. The prefix selects the provider and "
+            "auth path; the suffix names the model. Examples: "
+            "``bedrock/anthropic.claude-opus-4-8`` (AWS Bedrock + IAM), "
+            "``openai/gpt-5`` (OpenAI direct + api_key), "
+            "``anthropic/claude-opus-4-8`` (Anthropic direct + api_key), "
+            "``gemini/gemini-2.5-pro`` (Google AI Studio + api_key), "
+            "``azure/<deployment-name>`` (Azure OpenAI). For self-hosted "
+            "OpenAI-compat endpoints (vLLM, LiteLLM proxy), use "
+            "``openai/<model>`` with ``api_base`` set below."
+        ),
+    )
+    api_base: str = Field(
+        default="",
+        description=(
+            "Override the upstream base URL. Only needed for "
+            "self-hosted OpenAI-compat endpoints (vLLM, a deployed "
+            "LiteLLM proxy, etc.) or to pin a specific Azure OpenAI "
+            "instance. Leave empty for vendor providers — LiteLLM "
+            "knows the default URLs."
+        ),
+    )
+    max_output_tokens: int = Field(
+        default=16384,
+        description=(
+            "Upper bound on model response tokens. Must accommodate the "
+            "full JSON object: ~600 words of description + a risk-factor "
+            "list whose size scales with the plan. This is a CAP, not a "
+            "target — the model only emits what it needs and stops on a "
+            "natural stop token; only oversized plans approach it. 1024 "
+            "was undersized for medium plans and caused finish_reason="
+            "'length' truncation; 16384 leaves comfortable headroom for "
+            "very large plans (100+ resource changes with detailed risk "
+            "listings) while staying well under Opus's 32K output limit."
+        ),
+    )
+    request_timeout_seconds: int = Field(
+        default=60,
+        description="HTTP timeout for a single summariser call.",
+    )
+    daily_token_budget: int = Field(
+        default=0,
+        description=(
+            "Cap on output tokens spent per UTC day across all summaries. "
+            "0 = unlimited. Counter is maintained in Redis; calls past "
+            "the cap are skipped (with a log entry, no run failure)."
+        ),
+    )
+    code_context_max_bytes: int = Field(
+        default=200_000,
+        description=(
+            "Max bytes of .tf source attached as context alongside the "
+            "plan JSON. The runner already uploads the config tarball; "
+            "summariser reads it from object storage and concatenates "
+            "the .tf files (truncated to this cap). 0 disables code "
+            "context entirely (plan JSON only — terser, cheaper, less "
+            "accurate)."
+        ),
+    )
+    plan_json_max_bytes: int = Field(
+        default=500_000,
+        description=(
+            "Max bytes of plan JSON attached. The runner-uploaded "
+            "plan JSON is truncated to this cap (keeping resource_changes "
+            "intact via best-effort structural truncation). Defends "
+            "against pathological monorepos producing 50MB plan files."
+        ),
+    )
+    code_diff_max_bytes: int = Field(
+        default=100_000,
+        description=(
+            "Max bytes of CODE_DIFF (unified diff of *.tf / *.tfvars "
+            "between this run's config version and the previously-applied "
+            "config version) attached to the request. The diff is computed "
+            "via `git diff --no-index` between the two tarballs. 0 disables "
+            "CODE_DIFF entirely. Diffs are usually tiny; this cap is a "
+            "safety net for monorepo-scale refactors."
+        ),
+    )
+    followup_max_messages_per_run: int = Field(
+        default=20,
+        description=(
+            "Cap on user-posted follow-up messages per run (#463). "
+            "The UI disables the chat input once a run reaches this "
+            "many user turns. 0 disables the chat feature entirely "
+            "(initial summary still fires). Counts user rows in "
+            "`plan_summary_messages` for the run — assistant rows "
+            "don't count against the cap."
+        ),
+    )
+    followup_max_output_tokens: int = Field(
+        default=2048,
+        description=(
+            "Upper bound on follow-up reply tokens (#463). Smaller "
+            "than `max_output_tokens` because follow-ups are "
+            "conversational text-in / text-out, not a full structured "
+            "re-summary. Bumped only when operators report routinely "
+            "hitting `finish_reason=length` on detailed answers."
+        ),
+    )
+    auth: AISummaryAuthConfig = Field(default_factory=AISummaryAuthConfig)
+    context: AISummaryContextConfig = Field(default_factory=AISummaryContextConfig)
 
 
 class DatabaseConfig(BaseModel):
@@ -740,6 +1044,12 @@ class Settings(BaseSettings):
 
     # Artifact Retention
     artifact_retention: ArtifactRetentionConfig = Field(default_factory=ArtifactRetentionConfig)
+
+    # Runner artifact upload limits (API-side enforcement)
+    runner_artifacts: RunnerArtifactsConfig = Field(default_factory=RunnerArtifactsConfig)
+
+    # AI Plan Summary (#401)
+    ai_summary: AISummaryConfig = Field(default_factory=AISummaryConfig)
 
     # Workspace defaults
     default_execution_backend: str = Field(

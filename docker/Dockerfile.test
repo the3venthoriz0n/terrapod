@@ -1,7 +1,7 @@
 # Terrapod API test runner
 # Includes all dev dependencies (pytest, ruff, mypy)
 
-FROM python:3.14-slim
+FROM python:3.13-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
@@ -20,11 +20,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # pin and verify the same OPA_VERSION + SHA256 so a bump in one without
 # the other can't silently land an unverified binary in either image.
 ARG TARGETARCH
-ARG OPA_VERSION=1.16.2
+ARG OPA_VERSION=1.17.0
 RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
     && BASE="https://github.com/open-policy-agent/opa/releases/download/v${OPA_VERSION}" \
-    && curl -fsSL -o /usr/local/bin/opa "${BASE}/opa_linux_${ARCH}_static" \
-    && curl -fsSL -o /tmp/opa.sha256 "${BASE}/opa_linux_${ARCH}_static.sha256" \
+    && curl -fsSL --retry 6 --retry-delay 4 --retry-all-errors -o /usr/local/bin/opa "${BASE}/opa_linux_${ARCH}_static" \
+    && curl -fsSL --retry 6 --retry-delay 4 --retry-all-errors -o /tmp/opa.sha256 "${BASE}/opa_linux_${ARCH}_static.sha256" \
     && echo "$(cut -d' ' -f1 /tmp/opa.sha256)  /usr/local/bin/opa" | sha256sum -c - \
     && rm /tmp/opa.sha256 \
     && chmod 0755 /usr/local/bin/opa \
@@ -44,11 +44,12 @@ RUN poetry config virtualenvs.create false \
 COPY services/terrapod ./terrapod
 COPY services/tests ./tests
 
-# Copy the runner entrypoint so tests can exercise its real shell logic
-# as a fixture (e.g. the backend-override + post-init backstop tests for
-# #346). The entrypoint itself isn't executed here — fragments are
-# extracted and run in isolation.
-COPY docker/runner-entrypoint.sh ./docker/runner-entrypoint.sh
+# Source for the API↔SDK↔provider contract test (tests/test_api_sdk_contract.py).
+# The test reads these files as raw text — no Go build is performed in the
+# Python image. Kept narrow (.go files only) so the image stays slim.
+COPY go-terrapod/*.go ./go-terrapod/
+COPY provider/internal/resources/workspace/*.go ./provider/internal/resources/workspace/
+COPY provider/internal/datasources/workspace/*.go ./provider/internal/datasources/workspace/
 
 # Storage data directory for tests
 RUN mkdir -p /var/lib/terrapod/storage

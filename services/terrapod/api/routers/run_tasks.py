@@ -38,7 +38,10 @@ from terrapod.services.run_task_service import (
     resolve_stage,
     verify_callback_token,
 )
-from terrapod.services.workspace_rbac_service import has_permission, resolve_workspace_permission
+from terrapod.services.workspace_rbac_service import (
+    has_permission,
+    resolve_workspace_permission_for,
+)
 
 router = APIRouter(prefix="/api/v2", tags=["run-tasks"])
 
@@ -153,7 +156,7 @@ async def _get_workspace(workspace_id: str, db: AsyncSession) -> Workspace:
 async def _require_ws_permission(
     ws: Workspace, required: str, user: AuthenticatedUser, db: AsyncSession
 ) -> None:
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if not has_permission(perm, required):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -224,6 +227,10 @@ async def create_run_task(
     await db.flush()
     await db.refresh(rt, attribute_names=["workspace"])
     await db.commit()
+
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(str(ws.id), "workspace_run_task_change")
 
     logger.info("Run task created", task_id=str(rt.id), workspace=ws.name, stage=stage)
 
@@ -315,6 +322,10 @@ async def update_run_task(
     await db.commit()
     await db.refresh(rt, attribute_names=["workspace"])
 
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(str(rt.workspace_id), "workspace_run_task_change")
+
     logger.info("Run task updated", task_id=str(rt.id))
 
     return JSONResponse(content={"data": _run_task_json(rt)})
@@ -330,8 +341,14 @@ async def delete_run_task(
     rt = await _get_run_task(rt_id, db)
     await _require_ws_permission(rt.workspace, "admin", user, db)
 
+    rt_ws_id = str(rt.workspace_id)
+
     await db.delete(rt)
     await db.commit()
+
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(rt_ws_id, "workspace_run_task_change")
 
     logger.info("Run task deleted", task_id=rt_id)
 
@@ -357,7 +374,7 @@ async def list_task_stages(
     if ws is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if not has_permission(perm, "read"):
         raise HTTPException(status_code=403, detail="Requires read permission on workspace")
 
@@ -388,7 +405,7 @@ async def show_task_stage(
     if ws is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if not has_permission(perm, "read"):
         raise HTTPException(status_code=403, detail="Requires read permission on workspace")
 
@@ -417,7 +434,7 @@ async def override_task_stage(
     if ws is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if not has_permission(perm, "admin"):
         raise HTTPException(status_code=403, detail="Requires admin permission on workspace")
 

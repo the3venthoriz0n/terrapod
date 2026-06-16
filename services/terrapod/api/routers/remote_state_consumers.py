@@ -34,7 +34,10 @@ from terrapod.api.dependencies import AuthenticatedUser, get_current_user
 from terrapod.db.models import Workspace, WorkspaceRemoteStateConsumer
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
-from terrapod.services.workspace_rbac_service import has_permission, resolve_workspace_permission
+from terrapod.services.workspace_rbac_service import (
+    has_permission,
+    resolve_workspace_permission_for,
+)
 
 router = APIRouter(tags=["remote-state-consumers"])
 logger = get_logger(__name__)
@@ -97,7 +100,7 @@ async def _get_workspace(workspace_id: str, db: AsyncSession) -> Workspace:
 async def _require_ws_permission(
     ws: Workspace, required: str, user: AuthenticatedUser, db: AsyncSession
 ) -> None:
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if not has_permission(perm, required):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -171,6 +174,13 @@ async def create_remote_state_consumer(
     await db.flush()
     await db.refresh(row, attribute_names=["producer_workspace", "consumer_workspace"])
     await db.commit()
+
+    # Live-update both Sharing tabs: the producer gets a new outbound consumer,
+    # the consumer a new inbound producer it may now read from.
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(str(producer.id), "remote_state_consumer_change")
+    await publish_workspace_event(str(consumer.id), "remote_state_consumer_change")
 
     logger.info(
         "Remote-state consumer authorized",
@@ -372,11 +382,20 @@ async def delete_remote_state_consumer(
 
     await _require_ws_permission(row.producer_workspace, "admin", user, db)
 
+    producer_id = str(row.producer_workspace_id)
+    consumer_id = str(row.consumer_workspace_id)
+    revoked_edge_id = str(row.id)
+
     await db.delete(row)
     await db.commit()
 
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(producer_id, "remote_state_consumer_change")
+    await publish_workspace_event(consumer_id, "remote_state_consumer_change")
+
     logger.info(
         "Remote-state consumer revoked",
-        edge_id=str(row.id),
+        edge_id=revoked_edge_id,
         by=user.email,
     )

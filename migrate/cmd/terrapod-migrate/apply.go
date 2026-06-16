@@ -35,6 +35,7 @@ func applyCmd(args []string) int {
 		source       = fs.String("source", "", "Source platform: 'atlantis' or 'tfe' (required)")
 		sourceDir    = fs.String("source-dir", "", "Local atlantis-repo clone (required when --source=atlantis)")
 		atlantisYAML = fs.String("atlantis-yaml-path", "", "Override path to atlantis.yaml (default: <source-dir>/atlantis.yaml)")
+		workspace    = fs.String("workspace", "", "Target an existing Terrapod workspace directly (state-push only, no atlantis.yaml needed)")
 		tfeAddress   = fs.String("tfe-address", os.Getenv("TFE_ADDRESS"), "TFE API address (or TFE_ADDRESS; default: https://app.terraform.io)")
 		tfeToken     = fs.String("tfe-token", os.Getenv("TFE_TOKEN"), "TFE API token (or TFE_TOKEN; org-owner preferred for sensitive-variable visibility)")
 		tfeOrg       = fs.String("tfe-org", os.Getenv("TFE_ORG"), "TFE organisation to migrate (or TFE_ORG)")
@@ -84,11 +85,24 @@ func applyCmd(args []string) int {
 			fmt.Fprintln(os.Stderr, "apply: --source-dir is required for --source=atlantis")
 			return 2
 		}
-		plan, stateReader, err = loadAtlantisPlan(*sourceDir, *atlantisYAML, atlantis.StateOptions{
-			S3Endpoint:       *s3Endpoint,
-			S3ForcePathStyle: *s3PathStyle,
-			S3Region:         *s3Region,
-		})
+		if *workspace != "" {
+			// Direct state-push mode: target an existing workspace,
+			// skip atlantis.yaml parsing entirely. The workspace must
+			// already exist in Terrapod (created via UI, API, or
+			// autodiscovery). We just detect the backend from HCL in
+			// source-dir and push the state.
+			plan, stateReader, err = loadDirectWorkspacePlan(*sourceDir, *workspace, atlantis.StateOptions{
+				S3Endpoint:       *s3Endpoint,
+				S3ForcePathStyle: *s3PathStyle,
+				S3Region:         *s3Region,
+			})
+		} else {
+			plan, stateReader, err = loadAtlantisPlan(*sourceDir, *atlantisYAML, atlantis.StateOptions{
+				S3Endpoint:       *s3Endpoint,
+				S3ForcePathStyle: *s3PathStyle,
+				S3Region:         *s3Region,
+			})
+		}
 	case "tfe":
 		plan, stateReader, err = loadTFEPlan(context.Background(), *tfeAddress, *tfeToken, *tfeOrg)
 	default:
@@ -121,6 +135,26 @@ func applyCmd(args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "apply: build terrapod client: %v\n", err)
 		return 1
+	}
+
+	// --workspace mode: pre-seed the state file with the existing
+	// workspace's Terrapod ID so the writer takes the "reused" path
+	// (state push only, no create attempt).
+	if *workspace != "" {
+		sourceID := "direct:" + *workspace
+		if state.WorkspaceBySourceID(sourceID) == nil {
+			existing, lookupErr := c.GetWorkspaceByName(context.Background(), *workspace)
+			if lookupErr != nil {
+				fmt.Fprintf(os.Stderr, "apply: --workspace %q not found in Terrapod: %v\n", *workspace, lookupErr)
+				return 1
+			}
+			state.Workspaces = append(state.Workspaces, framework.WorkspaceRecord{
+				SourceID:   sourceID,
+				SourceName: *workspace,
+				TerrapodID: existing.ID,
+				State:      "created",
+			})
+		}
 	}
 
 	// Resolve plan VCS connections to Terrapod-side connection IDs by
@@ -272,6 +306,34 @@ func loadAtlantisPlan(sourceDir, yamlPath string, stateOpts atlantis.StateOption
 		Skipped:    skipped,
 	}
 	return plan, src.StateReader(stateOpts), nil
+}
+
+// loadDirectWorkspacePlan builds a minimal Plan targeting a single,
+// already-existing Terrapod workspace. No atlantis.yaml needed — the
+// tool detects the backend from HCL in sourceDir and provides a state
+// reader. The workspace must already exist in Terrapod; the writer
+// pushes state to it by name match.
+func loadDirectWorkspacePlan(sourceDir, workspaceName string, stateOpts atlantis.StateOptions) (ir.Plan, writer.StateReader, error) {
+	plan := ir.Plan{
+		Source: "atlantis",
+		SourceMetadata: map[string]string{
+			"mode":       "direct-workspace",
+			"clone_path": sourceDir,
+			"workspace":  workspaceName,
+		},
+		Workspaces: []ir.Workspace{
+			{
+				SourceID: "direct:" + workspaceName,
+				Name:     workspaceName,
+			},
+		},
+	}
+
+	stateReader := func(ctx context.Context, _ string) ([]byte, string, int64, error) {
+		return atlantis.ReadStateFromDir(ctx, sourceDir, stateOpts)
+	}
+
+	return plan, stateReader, nil
 }
 
 func loadTFEPlan(ctx context.Context, address, token, org string) (ir.Plan, writer.StateReader, error) {

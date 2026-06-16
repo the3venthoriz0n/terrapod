@@ -33,7 +33,10 @@ from terrapod.services.notification_service import (
     deliver_notification,
     record_delivery_response,
 )
-from terrapod.services.workspace_rbac_service import has_permission, resolve_workspace_permission
+from terrapod.services.workspace_rbac_service import (
+    has_permission,
+    resolve_workspace_permission_for,
+)
 
 router = APIRouter(tags=["notification-configurations"])
 logger = get_logger(__name__)
@@ -87,7 +90,7 @@ async def _get_workspace(workspace_id: str, db: AsyncSession) -> Workspace:
 async def _require_ws_permission(
     ws: Workspace, required: str, user: AuthenticatedUser, db: AsyncSession
 ) -> None:
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
+    perm = await resolve_workspace_permission_for(db, user, ws)
     if not has_permission(perm, required):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -157,6 +160,10 @@ async def create_notification_configuration(
     # Eagerly load workspace for serialization
     await db.refresh(nc, attribute_names=["workspace"])
     await db.commit()
+
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(str(ws.id), "workspace_notification_change")
 
     logger.info(
         "Notification configuration created",
@@ -256,6 +263,10 @@ async def update_notification_configuration(
     # Reload for serialization
     await db.refresh(nc, attribute_names=["workspace"])
 
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(str(nc.workspace_id), "workspace_notification_change")
+
     logger.info("Notification configuration updated", nc_id=str(nc.id))
 
     return JSONResponse(content={"data": _nc_json(nc)})
@@ -271,8 +282,14 @@ async def delete_notification_configuration(
     nc = await _get_nc(nc_id, db)
     await _require_ws_permission(nc.workspace, "admin", user, db)
 
+    nc_ws_id = str(nc.workspace_id)
+
     await db.delete(nc)
     await db.commit()
+
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(nc_ws_id, "workspace_notification_change")
 
     logger.info("Notification configuration deleted", nc_id=nc_id)
 

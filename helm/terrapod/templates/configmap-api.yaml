@@ -90,6 +90,12 @@ data:
       {{- end }}
       session_ttl_hours: {{ .Values.api.config.auth.session_ttl_hours | default 12 }}
       api_token_max_ttl_hours: {{ .Values.api.config.auth.api_token_max_ttl_hours | default 8760 }}
+      {{- /* Rendered directly (no `| default`): 0 is meaningful for these and
+             Helm's `default` would silently rewrite a configured 0 to the default. */}}
+      login_token_ttl_hours: {{ .Values.api.config.auth.login_token_ttl_hours }}
+      service_token_max_ttl_hours: {{ .Values.api.config.auth.service_token_max_ttl_hours }}
+      token_expiry_warning_days: {{ .Values.api.config.auth.token_expiry_warning_days }}
+      bound_token_idle_days: {{ .Values.api.config.auth.bound_token_idle_days }}
       {{- if .Values.api.config.auth.require_external_sso_for_roles }}
       require_external_sso_for_roles:
         {{- range .Values.api.config.auth.require_external_sso_for_roles }}
@@ -238,6 +244,11 @@ data:
     metrics:
       enabled: {{ .Values.api.config.metrics.enabled }}
     {{- end }}
+    runner_artifacts:
+      # int64 cast keeps Helm from emitting YAML scientific notation
+      # for values above ~1M (Pydantic refuses to parse those as int).
+      # Default 256 MiB (256 * 1024 * 1024 = 268435456).
+      plan_artifacts_max_bytes: {{ .Values.runners.planArtifactsMaxBytes | default 268435456 | int64 }}
     {{- if .Values.api.config.artifact_retention }}
     artifact_retention:
       enabled: {{ .Values.api.config.artifact_retention.enabled }}
@@ -249,6 +260,46 @@ data:
       provider_cache_retention_days: {{ .Values.api.config.artifact_retention.provider_cache_retention_days | default 30 }}
       binary_cache_retention_days: {{ .Values.api.config.artifact_retention.binary_cache_retention_days | default 30 }}
       module_overrides_retention_days: {{ .Values.api.config.artifact_retention.module_overrides_retention_days | default 14 }}
+    {{- end }}
+    {{- if .Values.api.config.ai_summary }}
+    ai_summary:
+      enabled: {{ .Values.api.config.ai_summary.enabled | default false }}
+      {{- if .Values.api.config.ai_summary.model }}
+      model: {{ .Values.api.config.ai_summary.model | quote }}
+      {{- end }}
+      {{- if .Values.api.config.ai_summary.api_base }}
+      api_base: {{ .Values.api.config.ai_summary.api_base | quote }}
+      {{- end }}
+      max_output_tokens: {{ .Values.api.config.ai_summary.max_output_tokens | default 16384 | int64 }}
+      request_timeout_seconds: {{ .Values.api.config.ai_summary.request_timeout_seconds | default 60 | int64 }}
+      # int64 cast prevents Helm's default float formatter from emitting
+      # YAML scientific notation (e.g. `5e+06`) for values above ~1M,
+      # which Pydantic on the API side refuses to parse as an int.
+      daily_token_budget: {{ .Values.api.config.ai_summary.daily_token_budget | default 0 | int64 }}
+      plan_json_max_bytes: {{ .Values.api.config.ai_summary.plan_json_max_bytes | default 500000 | int64 }}
+      code_context_max_bytes: {{ .Values.api.config.ai_summary.code_context_max_bytes | default 200000 | int64 }}
+      code_diff_max_bytes: {{ .Values.api.config.ai_summary.code_diff_max_bytes | default 100000 | int64 }}
+      followup_max_messages_per_run: {{ .Values.api.config.ai_summary.followup_max_messages_per_run | default 20 | int64 }}
+      followup_max_output_tokens: {{ .Values.api.config.ai_summary.followup_max_output_tokens | default 2048 | int64 }}
+      {{- with .Values.api.config.ai_summary.auth }}
+      auth:
+        # api_key is injected via env var (TERRAPOD_AI_SUMMARY__AUTH__API_KEY)
+        # from a K8s Secret; never rendered into this ConfigMap.
+        aws_region: {{ .aws_region | default "us-east-1" | quote }}
+        {{- if .aws_role_arn }}
+        aws_role_arn: {{ .aws_role_arn | quote }}
+        {{- end }}
+        aws_session_name: {{ .aws_session_name | default "terrapod-ai-summary" | quote }}
+        {{- if .aws_external_id }}
+        aws_external_id: {{ .aws_external_id | quote }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.api.config.ai_summary.context }}
+      context:
+        prompt_prefix: {{ .prompt_prefix | default "" | quote }}
+        prompt_suffix: {{ .prompt_suffix | default "" | quote }}
+        fleet_context: {{ .fleet_context | default "" | quote }}
+      {{- end }}
     {{- end }}
     default_execution_backend: {{ .Values.api.config.default_execution_backend | default "tofu" | quote }}
     default_terraform_version: {{ .Values.api.config.default_terraform_version | default "1.12" | quote }}

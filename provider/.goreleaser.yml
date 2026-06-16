@@ -2,6 +2,12 @@ version: 2
 
 project_name: terraform-provider-terrapod
 
+# Build parallelism is set via the `--parallelism` CLI flag in
+# .github/workflows/ci.yml (goreleaser v2 has no project-level
+# `parallelism` field in the schema). ubuntu-latest has 4 vCPUs;
+# 6 oversubscribes slightly because part of each build is I/O
+# (go module download, GPG signing).
+
 builds:
   - env:
       - CGO_ENABLED=0
@@ -39,7 +45,12 @@ signs:
       - "${artifact}"
 
 release:
-  disable: false
+  # The GitHub Release for this tag is pre-created by the
+  # `release-create` CI job so that provider and migrate goreleaser
+  # runs can both upload to it in parallel. append-mode tells
+  # goreleaser to upload to the existing Release instead of trying
+  # to create a fresh one.
+  mode: append
   extra_files:
     - glob: signing-key.asc
 

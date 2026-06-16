@@ -337,6 +337,21 @@ Workspaces support the following drift detection attributes (settable on create 
 |---|---|---|---|
 | `drift-detection-enabled` | boolean | `true` (VCS) / `false` (non-VCS) | Enable or disable automatic drift detection. Auto-enabled when a VCS connection is set |
 | `drift-detection-interval-seconds` | integer | `86400` | How often to run drift detection checks (minimum: 3600 seconds / 1 hour) |
+| `drift-ignore-rules` | list[string] | `[]` | Glob-aware patterns silenced by the drift-result classifier (#482). Each rule is a Terraform address optionally suffixed with a dotted attribute path; `*` matches zero or more non-`.` chars (spans `[N]` indices), `[*]` matches any bracketed index. A bare address with no attribute suffix silences any change to that resource — including destroys — so use carefully. Max 50 entries, ≤ 500 chars each. Examples: `aws_iam_role.foo.tags.Environment`, `aws_autoscaling_group.workers[*].desired_capacity`, `module.eks*.argocd_cluster.*.config.tls_client_config.ca_data`. Affects drift-detection runs only — regular plan/apply is untouched. See [drift-ignore-rules.md](drift-ignore-rules.md) for the full grammar and recipes |
+
+### AI Plan Summary Attributes
+
+Workspaces carry two attributes that govern the optional AI plan-summary feature (settable on create and update). When the feature is globally disabled at the deployment level (`api.config.ai_summary.enabled: false`), these fields are stored but inert — no calls are made. See [docs/ai-plan-summary.md](ai-plan-summary.md) for the full operator guide.
+
+| Attribute | Type | Default | Description |
+|---|---|---|---|
+| `ai-summary-mode` | string | `"default"` | Per-workspace override. One of `"default"` (follow the global toggle), `"enabled"` (always summarise this workspace's plans), or `"disabled"` (never summarise this workspace — overrides global). |
+| `ai-summary-context` | string | `""` | Free text up to 4000 characters appended to the model's prompt as workspace-specific facts (e.g. "Fronts the vault for service X — destroying the KMS key causes a global outage."). Additive to the deployment-wide `fleet_context`. |
+
+422 errors:
+- `ai-summary-mode` outside the enum
+- `ai-summary-context` longer than 4000 characters
+- `ai-summary-context` not a string
 
 The following read-only attributes are included in workspace responses when drift detection is enabled:
 
@@ -344,6 +359,7 @@ The following read-only attributes are included in workspace responses when drif
 |---|---|---|
 | `drift-last-checked-at` | string (RFC3339) or null | Timestamp of the last completed drift detection check |
 | `drift-status` | string | Current drift status: `""` (never checked), `"no_drift"`, `"drifted"`, or `"errored"` |
+| `drift-latest-run-id` | string (run-…) or null | ID of the drift run that produced the current `drift-status`. Lets the workspace-list UI link the badge straight to the run that explains the status. Cleared on a successful (non-drift) apply because the previous drift run is no longer the canonical link. Null when drift detection has never run or when the column predates v0.35.3 |
 
 ### Lifecycle Attributes (Autodiscovery)
 
@@ -606,6 +622,29 @@ Run objects include the following drift detection attributes in responses:
 
 Drift detection runs are always plan-only and are not counted in the workspace's normal run queue.
 
+### Run Response Attributes (Resource Profile / OOM)
+
+Run objects include peak resource usage + an abnormal-exit signal so the UI (and external clients) can surface memory pressure without operators having to grep pod logs. All five attributes are `null` / `""` for runs that pre-date the feature or never started a Job.
+
+| Attribute | Type | Source | Description |
+|---|---|---|---|
+| `resource-cpu` | string | Workspace setting (snapshot) | CPU request applied to the Job (K8s quantity, e.g. `"1"`, `"500m"`). Limit is `2×` this |
+| `resource-memory` | string | Workspace setting (snapshot) | Memory request applied to the Job (K8s quantity, e.g. `"2Gi"`). Limit is `2×` this |
+| `peak-memory-bytes` | integer or null | Runner (cgroup v2) | Peak resident memory observed during the run — `/sys/fs/cgroup/memory.peak` |
+| `peak-cpu-usec` | integer or null | Runner (cgroup v2) | Cumulative CPU time consumed by the run, microseconds — `usage_usec` from `/sys/fs/cgroup/cpu.stat`. **Captured but not surfaced in the UI** — see note below |
+| `runner-exit-code` | integer or null | Runner | Runner script's exit code captured at exit. `null` if the trap didn't fire (e.g. SIGKILL) |
+| `runner-exit-reason` | string | Listener (K8s) | Raw K8s `container.state.terminated.reason` (e.g. `"OOMKilled"`, `"Error"`, `"Completed"`). `""` if not observed |
+| `runner-exit-status` | string | Reconciler (typed bucket) | Stable typed value: `""` (unknown / not yet observed), `"clean"`, `"oom"`, `"killed"`, `"error"`. The UI keys on this; reason is shown for context |
+
+Two independent capture paths feed these fields:
+
+- **Runner path** — `POST /api/terrapod/v1/runs/{run_id}/resource-profile` from the runner's EXIT trap with `peak_memory_bytes` / `peak_cpu_usec` / `exit_code`. Fires for any catchable exit (success, plan errored, OPA failed, SIGTERM during apply).
+- **Listener path** — when a Job fails, the listener reads `container.state.terminated.{reason, exit_code}` and POSTs them on the job-status report. The reconciler maps them to `runner_exit_status`.
+
+OOM (`exit 137 + reason "OOMKilled"`) is uncatchable, so the runner path never fires on OOM — the listener path is the only signal. Both paths converge on the same five DB columns; whichever signal arrives wins. `runner-exit-status` is set **only** by the reconciler (single source of truth for typed bucketing) and is what drives the UI's OOM badge + the typed error message ("Runner OOM-killed (peak memory N.NN Gi). Workspace resource_memory is …. Increase resource_memory + retry.").
+
+See [runners.md — Memory Pressure & OOM Visibility](runners.md#memory-pressure--oom-visibility-430) for the operator-facing tuning workflow.
+
 ### Show Run
 
 ```
@@ -668,8 +707,13 @@ Server-Sent Events stream for real-time workspace updates. The stream emits even
 | `workspace_lock_change` | Workspace is locked or unlocked (includes `locked` boolean) |
 | `workspace_updated` | Workspace settings are modified |
 | `state_version_created` | New state version is uploaded |
+| `workspace_variable_change` | A workspace variable is created, updated, or deleted |
+| `workspace_notification_change` | A notification configuration is created, updated, or deleted |
+| `workspace_run_task_change` | A run task is created, updated, or deleted |
+| `run_trigger_change` | A run trigger to/from this workspace is added or removed (published to **both** the source and destination workspace channels, so inbound edges appear live) |
+| `remote_state_consumer_change` | A remote-state consumer grant to/from this workspace is added or removed (published to **both** the producer and consumer channels) |
 
-The stream sends `: keepalive` comments every ~1 second. Events are JSON-encoded in `data:` fields.
+The stream sends `: keepalive` comments every ~1 second. Events are JSON-encoded in `data:` fields. The web UI workspace detail page re-fetches the active tab on receipt of its corresponding event.
 
 **Required permission:** `read` on the workspace.
 
@@ -700,6 +744,169 @@ GET /api/v2/plans/{plan_id}/json-output
 Returns the structured JSON representation of the plan, as produced by `terraform show -json tfplan`. Useful for downstream tooling that wants to consume the resource changes without parsing the human-readable log. Responds **302** to a presigned object-storage URL.
 
 The endpoint is mounted at `/api/v2/` because `go-tfe` and Terraform's `cloud` block expect it there. Returns **404** if the runner never uploaded the JSON output (older runs, runs that errored before the plan completed).
+
+### Plan Summary
+
+```
+GET /api/v2/plans/{plan_id}/summary
+```
+
+Returns the AI-generated plan summary (or failure analysis on errored plans) when the optional `ai_summary` feature is enabled and a summary has been produced for the run. See [docs/ai-plan-summary.md](ai-plan-summary.md) for the operator-side setup.
+
+**Required permission:** `read` on the workspace.
+
+`plan_id` accepts either `plan-{uuid}` (the canonical form, matching what's returned in the `plans` relationship of a Run) or a bare run UUID.
+
+**Responses:**
+- **200 OK** — the workspace has a summary row for this run. See response shape below.
+- **404 Not Found** — no summary row exists. Either the feature is globally disabled, the workspace opted out (`ai-summary-mode: disabled`), or the summariser hasn't run yet. The UI treats 404 as "no AI surface" and renders nothing.
+
+**Response shape:**
+
+```json
+{
+  "data": {
+    "id": "plan-summary-<uuid>",
+    "type": "plan-summaries",
+    "attributes": {
+      "kind": "plan_summary",
+      "status": "ready",
+      "description": "Adds a single root-level output named `marker` ...",
+      "risk-level": "low",
+      "risk-factors": [
+        {
+          "severity": "low",
+          "title": "Output-only addition",
+          "detail": "The plan only introduces the `marker` output ...",
+          "resource_address": "output.marker"
+        }
+      ],
+      "model": "bedrock/us.anthropic.claude-opus-4-8",
+      "input-tokens": 1335,
+      "output-tokens": 171,
+      "error-message": "",
+      "created-at": "2026-06-01T12:00:00Z",
+      "updated-at": "2026-06-01T12:00:30Z"
+    },
+    "relationships": {
+      "plan": { "data": { "id": "plan-<uuid>", "type": "plans" } },
+      "run":  { "data": { "id": "run-<uuid>",  "type": "runs"  } }
+    }
+  }
+}
+```
+
+**Attribute reference:**
+
+| Attribute | Type | Description |
+|---|---|---|
+| `kind` | string | `"plan_summary"` (successful plan → change description + risk assessment) or `"failure_analysis"` (plan-phase errored → root-cause + suggested fixes). |
+| `status` | string | `"pending"` (handler running), `"ready"` (model returned a parseable response), `"skipped"` (workspace disabled or daily budget hit — see `error-message`), or `"errored"` (model call failed — see `error-message`). |
+| `description` | string | Markdown body. For `kind=plan_summary`, ~600 words describing the proposed changes. For `kind=failure_analysis`, root-cause explanation. |
+| `risk-level` | string | One of `"low"`, `"medium"`, `"high"`, `"critical"`. Reflects blast radius + reversibility, not novelty. |
+| `risk-factors` | array of object | Each item carries `severity` (same enum as `risk-level`), `title` (max 120 chars), `detail` (max 600 chars), and optional `resource_address` (terraform address). For `kind=failure_analysis` these are suggested fixes ordered most-likely-to-resolve first. |
+| `model` | string | LiteLLM model string used for this summary (e.g. `bedrock/us.anthropic.claude-opus-4-8`). |
+| `input-tokens` / `output-tokens` | integer | Telemetry counts reported by the upstream provider. |
+| `error-message` | string | Populated only for `status=errored` or `status=skipped`. Empty for `ready`. |
+
+**Real-time updates:** the per-workspace SSE channel (`GET /api/terrapod/v1/workspaces/{id}/runs/events`) emits one of five lifecycle events as the summary progresses (#463):
+
+| Event | Fires when |
+|---|---|
+| `plan_summary_pending` | Handler dispatched (or operator clicked Regenerate). UI shows a placeholder. |
+| `plan_summary_ready` | Initial summary landed; refetch to render. |
+| `plan_summary_errored` | Handler/model failure; refetch to render the error. |
+| `plan_summary_skipped` | Runner died abnormally / workspace opted out / daily budget hit. |
+| `plan_summary_message_posted` | A chat follow-up turn landed (carries `message_id`). Refetch the transcript. |
+
+All five payloads carry `{run_id, workspace_id}` at minimum. The UI re-fetches the summary on any of them. For VCS-driven runs, the per-workspace PR/MR status comment is edited in place to include the summary content when it lands.
+
+### Regenerate Plan Summary
+
+```
+POST /api/terrapod/v1/runs/{run_id}/plan-summary/regenerate
+```
+
+Re-fires the AI summary handler for a run. Anyone with workspace `read` can regenerate — the call doesn't mutate infrastructure. Bypasses the 5-minute auto-dedup so operator clicks always go through; budget gating still applies handler-side.
+
+**Required permission:** `read` on the workspace.
+
+**Responses:**
+- **202 Accepted** — pending row upserted and trigger enqueued. Response shape matches the GET above with `status=pending`.
+- **409 Conflict** — run is in a state with no summarisable output yet (still planning, or apply-phase errored).
+- **503 Service Unavailable** — AI summary is globally disabled (`api.config.ai_summary.enabled: false`).
+
+### List Plan-Summary Chat Messages
+
+```
+GET /api/terrapod/v1/runs/{run_id}/plan-summary/messages
+```
+
+Full transcript of the AI plan-summary chat thread in chronological order. The initial structured summary lives on the parent `PlanSummary` row (`description` + `risk-factors`); this endpoint returns ONLY the conversational follow-ups. The UI renders `message[0]` from the parent summary and appends these.
+
+**Required permission:** `read` on the workspace.
+
+**Responses:**
+- **200 OK** with an array (possibly empty) of `plan-summary-messages` resources.
+- **404 Not Found** — no initial summary exists for this run.
+- **409 Conflict** — the initial summary is still `pending` or `errored`. Can't chat against an unready summary.
+
+```json
+{
+  "data": [
+    {
+      "id": "plan-summary-message-<uuid>",
+      "type": "plan-summary-messages",
+      "attributes": {
+        "role": "user",
+        "content": "How long will the RDS update take?",
+        "model": "",
+        "input-tokens": 0,
+        "output-tokens": 0,
+        "error-message": "",
+        "created-at": "2026-06-01T12:01:00Z"
+      }
+    },
+    {
+      "id": "plan-summary-message-<uuid>",
+      "type": "plan-summary-messages",
+      "attributes": {
+        "role": "assistant",
+        "content": "An in-place RDS modify with `apply_immediately = false` typically completes during the next maintenance window…",
+        "model": "bedrock/us.anthropic.claude-sonnet-4-6",
+        "input-tokens": 14823,
+        "output-tokens": 412,
+        "error-message": "",
+        "created-at": "2026-06-01T12:01:14Z"
+      }
+    }
+  ],
+  "meta": { "count": 2 }
+}
+```
+
+### Post Plan-Summary Chat Message
+
+```
+POST /api/terrapod/v1/runs/{run_id}/plan-summary/messages
+Content-Type: application/vnd.api+json
+
+{ "data": { "attributes": { "content": "..." } } }
+```
+
+Posts a user follow-up + returns the synchronous assistant reply. Authorisation is read-on-workspace — anyone who can see the run can chat in the thread (GitHub PR conversation semantics, not per-user threads).
+
+**Required permission:** `read` on the workspace.
+
+**Responses:**
+- **201 Created** — the response body is the assistant turn (same shape as the GET list entries). The persisted user turn is visible via the next GET call.
+- **400 Bad Request** — empty body or body > 32 KiB.
+- **409 Conflict** — initial summary not `ready`, or this run already has `followup_max_messages_per_run` user turns. The user-turn counter is **server-tracked, not advisory**.
+- **429 Too Many Requests** — daily AI token budget exhausted.
+- **503 Service Unavailable** — chat globally disabled (`followup_max_messages_per_run: 0`) or workspace opted out.
+- **502 Bad Gateway** — model HTTP / parse failure. The user turn is still persisted in the transcript, and a separate errored assistant row is recorded — so a reload shows the failure cleanly.
+
+The model call uses the same cacheable prefix as the initial summary (provider prompt caching serves the prefix hit). See [docs/ai-plan-summary.md#follow-up-chat-463](ai-plan-summary.md#follow-up-chat-463) for the operator-side caps + provider matrix.
 
 ### Apply Details
 
@@ -1212,7 +1419,7 @@ GET  /api/terrapod/v1/registry-modules
 POST /api/terrapod/v1/registry-modules
 GET  /api/terrapod/v1/registry-modules/private/default/{name}/{provider}
 DELETE /api/terrapod/v1/registry-modules/private/default/{name}/{provider}
-POST /api/terrapod/v1/registry-modules/private/default/{name}/{provider}/versions
+PUT  /api/terrapod/v1/registry-modules/private/default/{name}/{provider}/versions/{version}/upload
 DELETE /api/terrapod/v1/registry-modules/private/default/{name}/{provider}/versions/{version}
 ```
 
@@ -1240,9 +1447,27 @@ All module responses (show and list) include a `permissions` object:
 }
 ```
 
-### Version Upload
+### Version Upload (Streamed)
 
-Create a version, then upload the tarball to the presigned URL returned in the response.
+```
+PUT /api/terrapod/v1/registry-modules/private/default/{name}/{provider}/versions/{version}/upload
+```
+
+A single streamed `PUT` of the gzipped module source tarball. The version
+is created **implicitly on upload** — there is no separate create step and
+no presigned URL. The server extracts the module interface (inputs and
+outputs) and triggers impact runs on any linked workspaces (see
+[Module Impact Analysis](#registry----modules) and the workspace-links
+section below).
+
+**Required permission:** `write` on the module (the owner has `admin`).
+
+**Tooling:** the [`terrapod-publish`](registry-publishing.md) CLI packages
+the source directory and performs this upload.
+
+> **Removed in the client-signed model:** the previous
+> `POST .../versions` create-then-upload-to-presigned-URL flow has been
+> **removed** in favour of the single streamed `PUT` above.
 
 ### Workspace Links (Module Impact Analysis)
 
@@ -1267,6 +1492,11 @@ GET /api/v2/registry/providers/{namespace}/{type}/versions
 GET /api/v2/registry/providers/{namespace}/{type}/{version}/download/{os}/{arch}
 ```
 
+The download response advertises the **publisher's own** GPG public key
+in `signing_keys.gpg_public_keys`. Terrapod never re-signs a provider — the
+signature `terraform init` verifies is the one the publisher produced at
+publish time (see [Publishing a Version](#publishing-a-version-client-signed)).
+
 ### TFE V2 Management API
 
 ```
@@ -1274,11 +1504,52 @@ GET  /api/terrapod/v1/registry-providers
 POST /api/terrapod/v1/registry-providers
 GET  /api/terrapod/v1/registry-providers/private/default/{name}
 DELETE /api/terrapod/v1/registry-providers/private/default/{name}
-POST /api/terrapod/v1/registry-providers/private/default/{name}/versions
 GET  /api/terrapod/v1/registry-providers/private/default/{name}/versions
 DELETE /api/terrapod/v1/registry-providers/private/default/{name}/versions/{version}
-POST /api/terrapod/v1/registry-providers/private/default/{name}/versions/{version}/platforms
 ```
+
+### Publishing a Version (Client-Signed)
+
+Provider publishing is **client-signed, direct, and streamed**. The
+publisher computes `SHA256SUMS` over the platform zips and GPG-signs it
+with its own key; the server verifies that signature against a
+**registered** GPG public key and never re-signs. The version is created
+**implicitly on the first upload** — there is no separate create-version
+or finalize step.
+
+Uploads must happen in this exact order:
+
+```
+PUT /api/terrapod/v1/registry-providers/private/default/{name}/versions/{version}/shasums
+PUT /api/terrapod/v1/registry-providers/private/default/{name}/versions/{version}/shasums.sig
+PUT /api/terrapod/v1/registry-providers/private/default/{name}/versions/{version}/platforms/{os}/{arch}
+```
+
+1. **`PUT .../shasums`** — the raw `SHA256SUMS` manifest (one
+   `{sha}  {zipname}` line per platform).
+2. **`PUT .../shasums.sig`** — the detached GPG signature over the
+   manifest. **The server verifies it against a registered GPG key here
+   (the trust gate).** Returns **422** if the key isn't registered or the
+   signature doesn't verify. Binaries are refused until this succeeds.
+3. **`PUT .../platforms/{os}/{arch}`** (one per platform) — each zip is
+   streamed to disk and its SHA checked against the signed manifest.
+   Returns **422** on a SHA mismatch, or if the signature has not yet been
+   verified.
+
+**Required permission:** `write` on the provider (the owner has `admin`).
+
+**Tooling:** the [`terrapod-publish`](registry-publishing.md) CLI performs
+these three uploads (in order) and does all packaging, hashing, and GPG
+signing client-side. The server never re-signs — the
+[download response](#cli-protocol-for-terraform-init) advertises the
+publisher's own public key in `signing_keys.gpg_public_keys`.
+
+> **Removed in the client-signed model:** the previous presigned-URL
+> flow — `POST .../versions` (create version) and
+> `POST .../versions/{version}/platforms` (create platform, returning a
+> presigned upload URL) — has been **removed**. There is no
+> server-side re-signing and no presigned-URL or finalize step for
+> provider versions. Use the three streamed `PUT` endpoints above.
 
 ### Update Provider
 
@@ -1312,6 +1583,11 @@ POST   /api/terrapod/v1/gpg-keys
 GET    /api/terrapod/v1/gpg-keys/{namespace}/{key_id}
 DELETE /api/terrapod/v1/gpg-keys/{namespace}/{key_id}
 ```
+
+The **public** key registered here is the trust anchor for client-signed
+provider publishing: `PUT .../shasums.sig` is verified against it. Register
+a key before publishing a provider (or use the `terrapod_gpg_key` provider
+resource). See [Publishing to the Private Registry](registry-publishing.md).
 
 ---
 
@@ -1743,6 +2019,8 @@ POST /api/terrapod/v1/roles
       "name": "developer",
       "description": "Development workspace access",
       "workspace-permission": "write",
+      "pool-permission": "read",
+      "registry-permission": "read",
       "allow-labels": {"env": "dev"},
       "allow-names": [],
       "deny-labels": {},
@@ -1751,6 +2029,8 @@ POST /api/terrapod/v1/roles
   }
 }
 ```
+
+A role carries three independent permission scalars: `workspace-permission` (`read`/`plan`/`write`/`admin`), `pool-permission` (`read`/`write`/`admin`), and `registry-permission` (`read`/`write`/`admin`, covering both modules and providers). All default to `read`. `registry-permission` is independent of `workspace-permission`, so a role can grant registry write (e.g. provider-publish CI) without any workspace access.
 
 **Required permission:** Platform `admin`.
 
@@ -1818,23 +2098,79 @@ DELETE /api/terrapod/v1/role-assignments/{provider}/{email}/{role}
 
 ## Authentication Tokens
 
+Authentication tokens come in three **kinds** (`kind` attribute):
+
+| Kind | Who creates | Effective permissions | Bound to |
+|---|---|---|---|
+| `interactive` | anyone (default) | the owner's full live roles | the owner |
+| `service_bound` | anyone | **intersection** of the token's `pinned-roles` and the owner's live roles, per resource | the owner — and the token is **rejected if the owner hasn't logged in within `auth.bound_token_idle_days`** (default 7) |
+| `service_detached` | admins only | the token's `pinned-roles` as an **absolute** scope | nobody (unbound) — survives any single person leaving |
+
+A `service_bound` token can never exceed its owner's access (the intersection caps it) and stops working when the owner is offboarded — see [authentication.md](authentication.md) and the offboarding runbook in [runbooks.md](runbooks.md). `service_detached` is the path for critical machine-to-machine automation.
+
+**Response attributes**: `description`, `kind`, `bound-to` (null for detached), `created-by`, `pinned-roles` (service tokens only; null for interactive), `token-type`, `created-at`, `rotated-at`, `last-used-at`, `expires-at`, `lifespan-hours`, and `token` (the raw secret — present only in create/rotate responses). Service tokens always carry an expiry, capped by `auth.service_token_max_ttl_hours` (default 8760 / 1 year).
+
 ### Create Token
 
 ```
 POST /api/terrapod/v1/users/{user_id}/authentication-tokens
 ```
 
-### List Tokens
+Request attributes: `description`, `kind` (default `interactive`), `lifespan_hours`, `pinned_roles` (service kinds). `service_detached` is admin-only (`403` otherwise) and is created unbound regardless of `{user_id}`.
+
+### List Own Tokens
 
 ```
 GET /api/terrapod/v1/users/{user_id}/authentication-tokens
 ```
+
+Never includes detached tokens (they are unbound).
+
+### List All Tokens (admin)
+
+```
+GET /api/terrapod/v1/admin/authentication-tokens[?kind={kind}]
+```
+
+Admin-only. Optional `kind` filter (`interactive` / `service_bound` / `service_detached`); a valid-but-empty kind returns `[]`, not an error.
 
 ### Show Token
 
 ```
 GET /api/terrapod/v1/authentication-tokens/{id}
 ```
+
+### Re-tag Token (change kind)
+
+```
+PATCH /api/terrapod/v1/authentication-tokens/{id}
+```
+
+`interactive` ↔ `service_bound` is owner-or-admin. Converting **to/from** `service_detached` is admin-only and unbinds/rebinds the token. Request attributes: `kind`, `pinned_roles`.
+
+### Rotate Token
+
+```
+POST /api/terrapod/v1/authentication-tokens/{id}/actions/rotate
+```
+
+Mints a fresh secret (returned once in `token`) and resets the expiry clock; the old secret stops working immediately. Surfaced as a "Rotate" action on service tokens in the UI.
+
+### List Expiring Service Tokens
+
+```
+GET /api/terrapod/v1/authentication-tokens/expiring
+```
+
+Service tokens within `auth.token_expiry_warning_days` (default 14) of expiry, **scoped to the caller**: own bound service tokens for everyone, plus all detached tokens for admins. Drives the in-app expiry banner — no user is warned about another user's bound tokens.
+
+### Revoke All Tokens for a User (admin)
+
+```
+POST /api/terrapod/v1/admin/authentication-tokens/actions/revoke-all
+```
+
+Admin-only urgent-offboarding lever. Body `{"email": "..."}`; revokes every token bound to that identity and returns `{"data": {"email": ..., "revoked": N}}`. Detached tokens are unbound and unaffected.
 
 ### Delete Token
 
@@ -1907,6 +2243,57 @@ Content-Type: application/octet-stream
 ```
 
 Upload new state after apply. Returns 204 on success.
+
+### Download Plan Artifacts
+
+```
+GET /api/terrapod/v1/runs/{run_id}/artifacts/plan-artifacts
+```
+
+Returns 302 redirect to presigned storage URL for the plan-phase workspace-diff tarball. Used by the apply phase to restore files generated during plan (e.g. `data.archive_file` outputs, `null_resource` local-exec scratch) into the apply Job's fresh workspace. Returns 404 if the run was produced by a pre-v0.34.0 runner (no plan-artifacts uploaded). The apply phase tolerates 404 — it logs an error and proceeds.
+
+### Upload Plan Artifacts
+
+```
+PUT /api/terrapod/v1/runs/{run_id}/artifacts/plan-artifacts
+Content-Type: application/x-tar
+Content-Length: <bytes>
+```
+
+Upload the plan-phase workspace-diff tarball. The body is the diff (`post_plan - post_init`) of files plan created, excluding `tfplan`, `.terraform.lock.hcl`, and `.terraform/terraform.tfstate` (handled by other endpoints). An empty tar is always uploaded — even when plan generated no new files — so the apply-side contract is "404 means upload genuinely failed", not "no new files".
+
+The body is streamed to an ephemeral tempfile on the API pod's PVC and forwarded to object storage; nothing is fully buffered in RAM. Maximum tarball size is `runners.planArtifactsMaxBytes` (default 256 MiB; minimum 10240 bytes). Both the `Content-Length` header and the streamed length are enforced — oversize uploads receive HTTP 413.
+
+Returns 204 on success.
+
+### Record Resource Profile
+
+```
+POST /api/terrapod/v1/runs/{run_id}/resource-profile
+Content-Type: application/json
+```
+
+Called by the runner entrypoint at exit (EXIT trap, fires on every catchable termination — clean success, plan errored, OPA failed, SIGTERM during apply). Captures cgroup-v2 peak memory + cumulative CPU + the runner script's exit code.
+
+Body (all fields optional — the runner sends whatever it could read):
+
+```json
+{
+  "peak_memory_bytes": 1500000000,
+  "peak_cpu_usec": 42000000,
+  "exit_code": 0
+}
+```
+
+- `peak_memory_bytes` — from `/sys/fs/cgroup/memory.peak`
+- `peak_cpu_usec` — `usage_usec` from `/sys/fs/cgroup/cpu.stat`
+- `exit_code` — script's actual exit status
+
+Negative values, non-integers, or booleans return `400`. Missing fields are not clobbered (existing values preserved).
+
+Note: **SIGKILL is uncatchable**, so this endpoint never fires on OOM-killed runs. Those are covered by the listener's K8s-terminated-state report on the job-status path; `runner-exit-status` ends up `"oom"` either way. See [Run Response Attributes (Resource Profile / OOM)](#run-response-attributes-resource-profile--oom) for the full signal flow.
+
+Returns 204 on success.
 
 ---
 
