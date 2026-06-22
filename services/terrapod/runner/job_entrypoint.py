@@ -48,6 +48,7 @@ from terrapod.runner.phases import (
     plan_apply,
     resource_profile,
     setup_script,
+    terragrunt,
     tf_args,
     uploads,
     working_dir,
@@ -163,6 +164,12 @@ def _run_plan_phase(
     failure / OPA mandatory-set deny)."""
     log = structlog.get_logger("runner.job_entrypoint")
 
+    # The plan binary lives at strip_dir, which for non-terragrunt runs is
+    # the process CWD and for terragrunt is the resolved `.terragrunt-cache`
+    # working dir where tofu actually runs (so `-out`/`show`/upload all target
+    # the real file rather than the unit dir the process is chdir'd into).
+    plan_file = strip_dir / "tfplan"
+
     # Lock-file h1 splice (best-effort) and lock-file upload. Done
     # BEFORE plan invocation so the apply phase's lock-file download
     # picks up the splice. The lock file lives at strip_dir.
@@ -228,6 +235,7 @@ def _run_plan_phase(
         var_file_args=var_file_argv,
         log_file=str(_PLAN_LOG),
         child_grace_seconds=child_grace,
+        plan_file=str(plan_file),
     )
     _flush_stdio()
     if plan_result.exit_code != 0:
@@ -273,9 +281,9 @@ def _run_plan_phase(
 
     # Export show -json (for OPA + UI artifact). Best-effort.
     plan_show_ok = False
-    if Path("tfplan").exists():
+    if plan_file.exists():
         plan_show_ok = plan_apply.run_plan_show_json(
-            binary=binary, plan_file="tfplan", json_out=str(_PLAN_JSON)
+            binary=binary, plan_file=str(plan_file), json_out=str(_PLAN_JSON)
         )
 
     # OPA evaluation. Mandatory-set denials → non-zero exit.
@@ -296,9 +304,9 @@ def _run_plan_phase(
         log.warning("plan-result raised (non-fatal)", err=str(exc))
 
     # Plan binary upload (skip for plan-only).
-    if Path("tfplan").exists() and not cfg.plan_only:
+    if plan_file.exists() and not cfg.plan_only:
         try:
-            uploads.upload_plan_file(cfg, Path("tfplan"))
+            uploads.upload_plan_file(cfg, plan_file)
         except Exception as exc:  # noqa: BLE001
             log.warning("plan-file upload raised (non-fatal)", err=str(exc))
 
@@ -437,6 +445,7 @@ def _run_apply_phase(
         log_file=str(_APPLY_LOG),
         has_plan_file=has_plan_file,
         child_grace_seconds=child_grace,
+        plan_file=str(plan_file),
     )
     _flush_stdio()
     if rc != 0:
@@ -500,6 +509,18 @@ def _run_body(cfg: RunnerConfig, work_dir: Path) -> int:
     binary_path = download_binary(cfg)
     binary = str(binary_path)
 
+    # 1b. Terragrunt (#534): wrap the cached tofu/terraform with terragrunt so
+    # every phase that invokes `binary` actually runs terragrunt. The tg-wrapper
+    # execs terragrunt with TG_TF_PATH pinned to the tf-wrapper, which drops the
+    # local-backend override into the tofu working dir (so Terrapod still owns
+    # state). Terragrunt copies the unit into a `.terragrunt-cache` subdir and
+    # runs tofu there; after init (step 9b) the orchestrator follows tofu into
+    # that dir for state + plan-file capture.
+    if cfg.terragrunt_enabled:
+        tg_bin = terragrunt.download_terragrunt(cfg)
+        binary = str(terragrunt.write_wrappers(terragrunt_bin=tg_bin, real_tf_bin=binary_path))
+        log.info("terragrunt enabled", tg_wrapper=binary)
+
     # 2. Configuration tarball.
     work_dir.mkdir(parents=True, exist_ok=True)
     config_result = download_configuration(cfg, work_dir=work_dir)
@@ -561,6 +582,22 @@ def _run_body(cfg: RunnerConfig, work_dir: Path) -> int:
         _flush_stdio()
         return exc.exit_code
     _flush_stdio()
+
+    # 9b. Terragrunt: after init, tofu's real working dir is the
+    # `.terragrunt-cache/<hash>/<hash>/` copy terragrunt makes of the unit —
+    # this happens for EVERY unit, not just `terraform { source = … }` ones.
+    # tofu reads/writes state and the plan file THERE, while the process stays
+    # chdir'd to the unit dir (where terragrunt.hcl lives, so terragrunt finds
+    # it). Relocate the state we downloaded into that cache dir and switch the
+    # orchestrator's working dir (`cwd`) to it, so the backend backstop, plan,
+    # apply, and state capture all target the directory tofu actually uses. If
+    # terragrunt ran tofu in place (no cache dir resolved), `cwd` is unchanged.
+    if cfg.terragrunt_enabled:
+        tg_work = terragrunt.resolve_working_dir(cwd)
+        if tg_work != cwd:
+            moved = terragrunt.relocate_state(src=cwd, dst=tg_work)
+            log.info("terragrunt working dir", work_dir=str(tg_work), state_moved=moved)
+            cwd = tg_work
 
     # 10. Backend backstop.
     try:
