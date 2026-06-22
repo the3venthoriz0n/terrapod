@@ -3,9 +3,40 @@
  * Uses the API port (8000) directly, bypassing the BFF.
  */
 import { createHash, randomBytes } from 'crypto';
+import fs from 'fs';
+import path from 'path';
 
 const API_URL = process.env.API_URL || 'http://localhost:8000';
 const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
+
+/**
+ * Read the session token out of a saved storageState file (e.g. admin.json),
+ * so a spec can drive the API directly with the same identity its browser
+ * context uses. Centralises the localStorage-extraction the specs used to
+ * inline.
+ */
+export function getStoredToken(authFileName = 'admin.json'): string {
+  const authPath = path.join(__dirname, '..', '.auth', authFileName);
+  const authData = JSON.parse(fs.readFileSync(authPath, 'utf-8'));
+  const origin = authData.origins?.find((o: { origin: string }) =>
+    o.origin.includes('localhost'),
+  );
+  const entry = origin?.localStorage?.find(
+    (e: { name: string }) => e.name === 'terrapod_auth',
+  );
+  return entry ? JSON.parse(entry.value).token : '';
+}
+
+/**
+ * A process-unique, human-readable suffix for test resources. Within a shard
+ * the workers share ONE stack/DB, so every test MUST name its resources
+ * uniquely to avoid collisions — see the Code ↔ E2E Tests Contract in
+ * CLAUDE.md. Combines a timestamp with random bytes so even same-millisecond
+ * calls across workers don't collide.
+ */
+export function uniqueName(prefix: string): string {
+  return `${prefix}-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`;
+}
 
 function generatePKCE() {
   const verifier = randomBytes(32).toString('base64url');
@@ -96,6 +127,36 @@ export async function createUser(
   if (!res.ok && res.status !== 409) {
     const body = await res.text();
     throw new Error(`Create user failed: ${res.status} ${body}`);
+  }
+}
+
+/**
+ * Set the platform/custom roles for a (provider, email) pair. Replaces any
+ * existing assignments. Used in global setup to grant the audit user the
+ * read-only `audit` role for RBAC negative tests.
+ */
+export async function setRoleAssignments(
+  adminToken: string,
+  email: string,
+  roles: string[],
+  providerName = 'local',
+): Promise<void> {
+  const res = await fetch(`${API_URL}/api/terrapod/v1/role-assignments`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/vnd.api+json',
+      Authorization: `Bearer ${adminToken}`,
+    },
+    body: JSON.stringify({
+      data: {
+        type: 'role-assignments',
+        attributes: { 'provider-name': providerName, email, roles },
+      },
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Set role assignments failed for ${email}: ${res.status} ${body}`);
   }
 }
 
