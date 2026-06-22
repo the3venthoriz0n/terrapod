@@ -31,7 +31,8 @@ Terrapod is **not** a fork of Terraform or OpenTofu. It orchestrates them.
 | RBAC | Implemented | Label-based role system with hierarchical workspace permissions (read/plan/write/admin) |
 | Private Module Registry | Implemented | Publish, version, and share modules internally |
 | Private Provider Registry | Implemented | Publish, version, and share providers with GPG signing and network mirror caching |
-| Binary Caching | Implemented | Pull-through cache for terraform/tofu CLI binaries |
+| Binary Caching | Implemented | Pull-through cache for terraform/tofu/terragrunt CLI binaries |
+| **Terragrunt** | **Implemented** | **Per-workspace Terragrunt support for agent-mode runs — a `terragrunt_enabled` flag + pinned version, pull-through binary cache for the terragrunt CLI, and transparent local-backend reconciliation so Terrapod still owns state. CLI-driven runs work with zero extra config. See [docs/terragrunt.md](docs/terragrunt.md).** |
 | Agent Pools | Implemented | Named groups of runner listeners; join token → certificate exchange for auth |
 | CLI-Driven Runs | Implemented | `terraform plan` / `apply` via cloud backend (both `terraform` and `tofu` verified) |
 | TFE V2 API | Implemented | JSON:API surface compatible with `go-tfe` / `terraform login` |
@@ -339,6 +340,7 @@ Reports are written to `reports/pentest/`. See [SECURITY.md](SECURITY.md) for th
 - **Monorepo autodiscovery** -- Atlantis-style auto-creation of workspaces from glob-matched directories on PRs (Terrakube has directory filtering, but not auto-creation).
 - **Run tasks** -- pre/post-plan external webhook validation hooks (not present in Terrakube).
 - **In-platform AI** -- plan summaries, failure analysis, and chat (Terrakube offers only an external MCP server).
+- **Native Terragrunt** -- a per-workspace flag wraps agent-mode runs in `terragrunt` (pull-through binary cache, local-backend reconciliation) while Terrapod keeps owning state and the run lifecycle; CLI-driven runs need no config. Something TFE/HCP Terraform never did. See [docs/terragrunt.md](docs/terragrunt.md).
 - Additionally: first-class OPA **policy sets** with mandatory/advisory enforcement, native multi-channel **notifications** (Slack/email/webhook), and cross-workspace **run triggers**.
 
 Net: Terrapod is not a "better general TFE replacement" -- Terrakube wins on maturity and multi-tenancy. Terrapod's defensible niche is **restricted-network, multi-cluster execution** (outbound-only runners, polling VCS, self-contained caching) with an AI-assisted review layer. Pick on that basis.
