@@ -101,6 +101,31 @@ class RunnerConfig(BaseModel):
             "you still want drift on; set to 0 to disable the cap."
         ),
     )
+    lifecycle_destroy_retries: int = Field(
+        default=2,
+        description=(
+            "How many times to automatically retry a FAILED platform-initiated "
+            "lifecycle destroy — a catalog instance destroy (source "
+            "`catalog-lifecycle`) or an autodiscovery directory destroy (source "
+            "`autodiscovery-lifecycle`) — before leaving it errored for an "
+            "operator. terraform destroy is commonly transiently flaky "
+            "(dependency-release ordering, eventual consistency, draining load "
+            "balancers / releasing ENIs / emptying buckets) and re-running is "
+            "safe because destroy is declarative and incremental. The workspace "
+            "is only archived on a SUCCESSFUL destroy, so retries never lose "
+            "data: they either eventually succeed and archive, or exhaust the "
+            "cap and stay errored. A user's own CLI `terraform destroy` is "
+            "never auto-retried. Set to 0 to disable. Default 2 (3 attempts)."
+        ),
+    )
+    lifecycle_destroy_retry_backoff_seconds: int = Field(
+        default=45,
+        description=(
+            "Seconds to wait after a lifecycle-destroy run errors before "
+            "queuing the next retry, giving transient dependencies time to "
+            "settle before terraform tries the teardown again."
+        ),
+    )
 
 
 def load_runner_config(path: str = "/etc/terrapod/runners.yaml") -> RunnerConfig:
@@ -428,6 +453,19 @@ class RegistryConfig(BaseModel):
     provider_cache: ProviderCacheConfig = Field(default_factory=ProviderCacheConfig)
     binary_cache: BinaryCacheConfig = Field(default_factory=BinaryCacheConfig)
     module_interface: ModuleInterfaceConfig = Field(default_factory=ModuleInterfaceConfig)
+
+
+class CatalogConfig(BaseModel):
+    """Service catalog: no-code self-service provisioning over the module
+    registry (#535).
+
+    On by default — it exposes the catalog RBAC axis (opt-in, default `none`,
+    so no user gains catalog access until granted), catalog-item and
+    provider-template management, and the provision flow. Set `enabled: false`
+    to hide the surface entirely (endpoints return 404).
+    """
+
+    enabled: bool = Field(default=True)
 
 
 # --- VCS Configuration ---
@@ -1027,6 +1065,9 @@ class Settings(BaseSettings):
 
     # Registry
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
+
+    # Service Catalog
+    catalog: CatalogConfig = Field(default_factory=CatalogConfig)
 
     # VCS
     vcs: VCSConfig = Field(default_factory=VCSConfig)
