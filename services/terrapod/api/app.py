@@ -230,6 +230,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         description="Drive run state transitions based on Job outcomes",
     )
 
+    # Bounded auto-retry for failed platform-initiated lifecycle destroys
+    # (catalog + autodiscovery). Cheap no-op when there are none; the handler
+    # self-gates to 0 retries / no eligible runs.
+    from terrapod.services.lifecycle_destroy_retry import lifecycle_destroy_retry_cycle
+
+    register_periodic_task(
+        "lifecycle_destroy_retry",
+        interval_seconds=30,
+        handler=lifecycle_destroy_retry_cycle,
+        description="Retry failed catalog/autodiscovery lifecycle destroy runs",
+    )
+
     # Audit log retention (daily)
     async def _audit_retention() -> None:
         from terrapod.services.audit_service import purge_old_entries
@@ -702,6 +714,13 @@ def create_application() -> FastAPI:
     from terrapod.api.routers.workspace_bulk import router as workspace_bulk_router
 
     app.include_router(workspace_bulk_router, prefix=TERRAPOD_PREFIX)
+
+    # Service catalog (#535): provider-template + catalog-item management +
+    # provision flow. The router self-gates on settings.catalog.enabled (404
+    # when disabled), so it is always mounted.
+    from terrapod.api.routers.catalog import router as catalog_router
+
+    app.include_router(catalog_router, prefix=TERRAPOD_PREFIX)
 
     # VCS webhook event receiver — Terrapod-specific.
     from terrapod.api.routers.vcs_events import router as vcs_events_router
