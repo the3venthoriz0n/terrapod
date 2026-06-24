@@ -31,6 +31,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response, 
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -280,11 +281,11 @@ async def create_module_endpoint(
         try:
             conn_id = _uuid.UUID(attrs.vcs_connection_id.removeprefix("vcs-"))
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail="Invalid vcs_connection_id") from exc
+            raise HTTPException(status_code=422, detail="Invalid vcs_connection_id") from exc
 
         result = await db.execute(sa_select(VCSConnection).where(VCSConnection.id == conn_id))
         if result.scalars().first() is None:
-            raise HTTPException(status_code=400, detail="VCS connection not found")
+            raise HTTPException(status_code=422, detail="VCS connection not found")
         module.vcs_connection_id = conn_id
         module.source = "vcs"
     if attrs.vcs_repo_url:
@@ -532,11 +533,11 @@ async def update_module_endpoint(
             try:
                 conn_id = _uuid.UUID(str(vcs_conn_val).removeprefix("vcs-"))
             except ValueError as exc:
-                raise HTTPException(status_code=400, detail="Invalid vcs_connection_id") from exc
+                raise HTTPException(status_code=422, detail="Invalid vcs_connection_id") from exc
 
             result = await db.execute(sa_select(VCSConnection).where(VCSConnection.id == conn_id))
             if result.scalars().first() is None:
-                raise HTTPException(status_code=400, detail="VCS connection not found")
+                raise HTTPException(status_code=422, detail="VCS connection not found")
             module.vcs_connection_id = conn_id
             module.source = "vcs"
         else:
@@ -581,8 +582,34 @@ async def create_module_version_endpoint(
         )
 
     version_str = body.data.attributes.version
-    mod_version, upload_url = await create_module_version(db, storage, module.id, version_str)
-    await db.commit()
+
+    # Pre-check for an existing version so a duplicate returns a clean 409
+    # instead of an IntegrityError on flush (which would otherwise abort the
+    # transaction after we'd already minted a presigned upload URL). The unique
+    # constraint on (module_id, version) is the backstop for the race.
+    existing = await db.execute(
+        select(RegistryModuleVersion).where(
+            RegistryModuleVersion.module_id == module.id,
+            RegistryModuleVersion.version == version_str,
+        )
+    )
+    if existing.scalars().first() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Version {version_str} already exists for this module",
+        )
+
+    try:
+        mod_version, upload_url = await create_module_version(db, storage, module.id, version_str)
+        await db.commit()
+    except IntegrityError:
+        # Race: a concurrent create inserted the same version between our
+        # pre-check and flush. Roll back and surface the same 409.
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Version {version_str} already exists for this module",
+        ) from None
 
     logger.info(
         "Module version created",
@@ -777,11 +804,11 @@ async def update_module_vcs_endpoint(
         try:
             conn_id = _uuid.UUID(attrs.vcs_connection_id.removeprefix("vcs-"))
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail="Invalid vcs_connection_id") from exc
+            raise HTTPException(status_code=422, detail="Invalid vcs_connection_id") from exc
 
         result = await db.execute(sa_select(VCSConnection).where(VCSConnection.id == conn_id))
         if result.scalars().first() is None:
-            raise HTTPException(status_code=400, detail="VCS connection not found")
+            raise HTTPException(status_code=422, detail="VCS connection not found")
         module.vcs_connection_id = conn_id
     else:
         module.vcs_connection_id = None

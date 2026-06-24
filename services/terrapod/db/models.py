@@ -487,7 +487,13 @@ class StateVersion(Base):
     )
     serial: Mapped[int] = mapped_column(Integer, nullable=False)
     lineage: Mapped[str] = mapped_column(String(63), nullable=False, default="")
+    # `md5` is part of the TFE/go-tfe state-version contract and is kept for
+    # compatibility. `sha256` is Terrapod-internal and is the hash used for
+    # the state-divergence equality check (an md5 collision must not be able
+    # to suppress a genuine divergence flag). Nullable/empty for rows written
+    # before the column existed — the divergence check falls back to md5 then.
     md5: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default="")
     state_size: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     run_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
@@ -932,7 +938,11 @@ class CertificateAuthorityModel(Base):
         UUID(as_uuid=True), primary_key=True, default=generate_uuid7
     )
     ca_cert: Mapped[str] = mapped_column(Text, nullable=False)
-    ca_key_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    # The CA private key as a PKCS8 PEM. This is NOT application-encrypted
+    # (the old column name `ca_key_encrypted` was misleading) — at-rest
+    # protection comes from database encryption (RDS/Azure/GCS-managed),
+    # the same model used for sensitive variables and VCS tokens.
+    ca_key_pem: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=now_utc, nullable=False
     )
@@ -974,6 +984,12 @@ class VCSConnection(Base):
     github_account_type: Mapped[str] = mapped_column(
         String(20), nullable=False, default=""
     )  # Organization, User (GitHub only)
+
+    # Per-connection webhook HMAC secret (GitHub). Optional: when set it is
+    # used to validate this connection's inbound webhooks, falling back to the
+    # global vcs.github.webhook_secret when null. Write-only via the API and
+    # protected at rest by database encryption (same as `token`).
+    webhook_secret: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="active"
