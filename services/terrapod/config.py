@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, PostgresDsn, RedisDsn, model_validator
+from pydantic import BaseModel, Field, PostgresDsn, RedisDsn, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -526,6 +526,56 @@ class NotificationsConfig(BaseModel):
 
 
 # --- Registry Configuration ---
+
+
+class WarmPlatform(BaseModel):
+    """A single os/arch target for cache pre-population."""
+
+    os: str
+    arch: str
+
+
+class WarmBinaryEntry(BaseModel):
+    """A declarative binary-cache pre-population entry.
+
+    Pulled into the cache by the post-install/upgrade warm Job and by the
+    bulk-warm admin endpoint. An empty `platforms` list falls back to the
+    default warm platforms (linux/amd64 + linux/arm64) so the common case is
+    just {tool, version}.
+    """
+
+    tool: Literal["terraform", "tofu", "terragrunt"] = "terraform"
+    version: str
+    platforms: list[WarmPlatform] = Field(default_factory=list)
+
+
+class WarmProviderEntry(BaseModel):
+    """A declarative provider-cache pre-population entry.
+
+    `source` is the provider address `hostname/namespace/type`
+    (e.g. `registry.terraform.io/hashicorp/aws`). An empty `platforms` list
+    falls back to `provider_cache.platforms`.
+    """
+
+    source: str
+    version: str
+    platforms: list[WarmPlatform] = Field(default_factory=list)
+
+    @field_validator("source")
+    @classmethod
+    def _validate_source(cls, v: str) -> str:
+        parts = v.split("/")
+        if len(parts) != 3 or not all(p.strip() for p in parts):
+            raise ValueError(
+                "provider warm source must be 'hostname/namespace/type' "
+                "(e.g. 'registry.terraform.io/hashicorp/aws')"
+            )
+        return v
+
+    @property
+    def coordinates(self) -> tuple[str, str, str]:
+        hostname, namespace, type_ = self.source.split("/")
+        return hostname, namespace, type_
 
 
 class ProviderCacheConfig(BaseModel):
