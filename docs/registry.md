@@ -793,7 +793,17 @@ api:
 
 ### Admin UI
 
-The web UI includes a cache admin page at `/admin/binary-cache` (admin-only) for viewing and purging cached CLI binaries and provider binaries.
+The web UI includes a cache admin page at `/admin/binary-cache` (admin-only) for viewing and purging cached CLI binaries and provider binaries, and a **Warm cache** panel for bulk pre-population.
+
+---
+
+## Cache pre-population
+
+Both caches normally fill on demand (a cache miss fetches from upstream), but you can also seed them ahead of time — essential for restricted-network deployments and useful anywhere you want the first run to be fast.
+
+`POST /api/terrapod/v1/admin/binary-cache/warm-bulk` warms many binaries and provider platforms in one call (see [API reference](api-reference.md#bulk-warm-cache-admin)). The same operation is available interactively in the **Warm cache** panel on the `/admin/binary-cache` page — one entry per line. Warming is resilient: each (entry, platform) is warmed independently and reported back with its own success/error, so one missing version never fails the batch.
+
+Warming honours the upstream-source overrides (`*_mirror_url`, `*_version_index_url`, `provider_cache.upstream_registries`), so it pulls from your internal mirror when one is configured.
 
 ---
 
