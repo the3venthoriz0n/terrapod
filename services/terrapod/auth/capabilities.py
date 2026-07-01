@@ -40,7 +40,7 @@ from __future__ import annotations
 # enumeration; new endpoints map onto an existing capability or add one here
 # deliberately. Net-new capabilities that no legacy preset grants until an admin
 # opts in (state:read-outputs / state:read-sensitive tier; the scoped platform:*
-# split #642; maker-checker #643) are introduced by their own follow-ups.
+# split #642) are introduced by their own follow-ups.
 
 # ── Workspace / runs — read tier ────────────────────────────────────────────
 # Per-resource read caps (each paired with a write/manage cap below, so an
@@ -234,6 +234,35 @@ def normalize_capabilities(caps: list[str] | set[str] | frozenset[str]) -> list[
     return sorted(out)
 
 
+_LEVEL_TO_AXES: dict[str, dict[str, str]] = {
+    "read": {"w": "read", "p": "read", "r": "read", "c": "read"},
+    "plan": {"w": "plan", "p": "read", "r": "read", "c": "read"},
+    "write": {"w": "write", "p": "write", "r": "write", "c": "use"},
+    "admin": {"w": "admin", "p": "admin", "r": "admin", "c": "admin"},
+    "use": {"c": "use"},
+    "none": {},
+}
+
+
+def caps_for_level(level: str | None) -> frozenset[str]:
+    """The capability set a legacy permission level maps to, unioned across all
+    four axes. A given axis's gate only checks its own axis's capability, so this
+    union is a faithful stand-in for any single-axis resolver at ``level`` (used
+    by tests that mock a resolver, and by UX that renders a preset's caps).
+    ``None`` / unknown → empty (no access)."""
+    if not level:
+        return frozenset()
+    m = _LEVEL_TO_AXES.get(level, {})
+    return frozenset(
+        expand_preset(
+            workspace_permission=m.get("w"),
+            pool_permission=m.get("p"),
+            registry_permission=m.get("r"),
+            catalog_permission=m.get("c"),
+        )
+    )
+
+
 def has_capability(caps: frozenset[str] | set[str], required: str) -> bool:
     """Canonical capability membership check (the enforcement primitive).
 
@@ -244,6 +273,28 @@ def has_capability(caps: frozenset[str] | set[str], required: str) -> bool:
     this feature removes. The faithfulness test asserts per-gate, not per-level.
     """
     return required in caps
+
+
+# Public per-axis level maps, keyed by short axis name — for the capability
+# resolver (union / read-floor / full-set per axis). Values are the SAME frozen
+# sets as the private maps above.
+AXIS_LEVEL_MAPS: dict[str, dict[str, frozenset[str]]] = {
+    "workspace": _WORKSPACE_LEVELS,
+    "pool": _POOL_LEVELS,
+    "registry": _REGISTRY_LEVELS,
+    "catalog": _CATALOG_LEVELS,
+}
+
+
+def axis_read_caps(axis: str) -> frozenset[str]:
+    """The read-floor capability set for an axis (empty for catalog — no floor)."""
+    return AXIS_LEVEL_MAPS[axis].get("read", frozenset())
+
+
+def axis_all_caps(axis: str) -> frozenset[str]:
+    """Every capability the axis can grant (its top preset)."""
+    levels = AXIS_LEVEL_MAPS[axis]
+    return frozenset().union(*levels.values()) if levels else frozenset()
 
 
 def expand_preset(
