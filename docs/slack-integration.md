@@ -62,6 +62,11 @@ setting so there's nothing to decide.
    (JSON tab) — the operator will send you this file, or grab it from the
    Terrapod repo. Review and **Create**.
 
+**Set the app icon** (recommended, so `@terrapod` posts are recognisable): the
+manifest can't carry an icon, so upload one in the UI — **Basic Information →
+Display Information → App icon** → upload [`images/slack-app-icon.png`](images/slack-app-icon.png)
+(the Terrapod mark, 512×512, shipped in the repo) → **Save Changes**.
+
 ### A2. Generate the three tokens
 
 All three come from the app you just created (left sidebar of the app's page):
@@ -154,6 +159,47 @@ also view/remove your links from the Terrapod web UI. Under the hood the connect
 link carries a Terrapod-signed, single-use token, so no one can forge a binding
 for someone else's Slack id.
 
+## Run notifications (opt-in, per workspace)
+
+Run notifications are **opt-in per workspace** — set the workspace's **Slack
+channel** (Workspace → Settings → *Slack notifications*, the `slack-channel` API
+attribute, or `slack_channel` on the `terrapod_workspace` resource) and that
+workspace posts to it. Leave it empty and the workspace stays silent. There is
+**no deployment-wide fan-out** — a channel receives traffic solely because
+someone pointed a workspace at it. The Slack app must already be a member of the
+channel (and needs the `files:write` scope to attach plan output — see
+Troubleshooting).
+
+Everything about one run lives in **one thread**, so the channel stays quiet:
+
+| Event | Message |
+|---|---|
+| **Needs approval** | A run reached `planned` and awaits a manual apply. Posts a **parent** message with interactive **Approve** / **Discard** buttons and the AI review (where enabled); the **plan output** (`.txt`) is attached as a threaded reply. |
+| **Approve / Discard clicked** | The parent is edited to drop the buttons and record **who acted** (*Approved by …*). |
+| **Applied / Errored** | The result threads **under** the approval message as a reply (so approvers get pinged) — with the AI failure analysis on errors. Auto-applied runs (no approval step) post a single standalone message instead. |
+| **Drift detected** | A standalone message with the plan threaded under it. |
+
+Speculative/PR plan-only runs, intermediate states, and drift-with-no-changes are
+deliberately suppressed to keep channels quiet. Deep links in every message use
+the external users' URL (`external_url`) only — never an internal machine-to-
+machine host — and are omitted if `external_url` is unset.
+
+**AI review timing:** where AI plan summaries are enabled, the *needs-approval*
+and *errored* messages **wait for the AI review to finish** before posting, so
+it's in the message from the first post rather than racing it. The wait is
+bounded by the model call's own timeout (the summary always settles), and if the
+model is disabled or fails the message still posts — just without the review.
+
+### Approving from Slack (RBAC)
+
+Clicking **Approve** / **Discard** carries no standing permission. Every click is
+authorised live: Terrapod resolves your linked identity → your **current**
+Terrapod roles → your capabilities on that workspace, and requires `run:apply`
+before it confirms or discards. If you haven't linked, you get an ephemeral nudge
+to `/terrapod link`; if you're linked but lack permission on that workspace, an
+ephemeral "no permission" — neither touches the run. On success the message is
+edited to record who approved, so a button can't be pressed twice.
+
 ## Reference
 
 **Helm values** (`api.config.slack`):
@@ -181,7 +227,8 @@ for someone else's Slack id.
 | Symptom | Likely cause |
 |---|---|
 | Bot shows offline; no `slack.socket_mode_connected` log | App-level token missing or lacks `connections:write`; `enabled` false; wrong Secret name. |
-| Connected, but no channel message | Bot not invited to the channel (`/invite @terrapod`), or `defaultChannel` wrong/empty. |
+| A workspace's run notifications never appear | The workspace's **Slack channel** is unset (notifications are opt-in per workspace), or the bot isn't in that channel (`/invite @terrapod`). |
+| Messages post but the plan `.txt` never attaches | The app is missing the **`files:write`** bot scope. Add it under **OAuth & Permissions → Scopes**, then **Reinstall** the app (scope changes require reinstall). Apps created from the current manifest already include it. |
 | `not_in_channel` / `channel_not_found` in logs | Invite the bot to the channel, or use a channel the bot can post to (`chat:write.public` covers public channels). |
 | `invalid_auth` in logs | Bot token wrong or revoked — reinstall the app and update the Secret. |
 | Log shows tokens missing while `enabled: true` | The Secret isn't wired: check `existingSecret` and that the Secret has all three keys. |

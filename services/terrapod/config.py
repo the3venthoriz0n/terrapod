@@ -858,10 +858,6 @@ class SlackConfig(BaseModel):
             "Slack reaches the Request-URL endpoint via the public webhook ingress."
         ),
     )
-    default_channel: str = Field(
-        default="",
-        description="Channel for the connectivity check / fallback posts (e.g. #integration).",
-    )
     # --- secrets: delivered via secretKeyRef → env, never rendered to the ConfigMap ---
     bot_token: str = Field(default="", description="Bot User OAuth Token (xoxb-…)")
     app_token: str = Field(
