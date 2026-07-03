@@ -41,13 +41,13 @@ import structlog
 from terrapod.runner import lock_extender, plan_artifacts
 from terrapod.runner.phases import (
     backend_backstop,
+    execution_hooks,
     init_phase,
     log_capture,
     mirror_config,
     opa,
     plan_apply,
     resource_profile,
-    setup_script,
     terragrunt,
     tf_args,
     tfvars,
@@ -167,6 +167,14 @@ def _run_plan_phase(
     Returns the orchestrator's exit code (0 on success, non-zero on
     failure / OPA mandatory-set deny)."""
     log = structlog.get_logger("runner.job_entrypoint")
+
+    # pre_plan execution hooks (#619) — after init, before plan. A failing
+    # hook fails the run (no plan is produced).
+    try:
+        execution_hooks.run_point("pre_plan", env=os.environ.copy())
+    except execution_hooks.HookError as exc:
+        log.error("pre_plan hook failed", hook=exc.name, rc=exc.exit_code)
+        return exc.exit_code
 
     # The plan binary lives at strip_dir, which for non-terragrunt runs is
     # the process CWD and for terragrunt is the resolved `.terragrunt-cache`
@@ -440,6 +448,14 @@ def _run_apply_phase(
             except OSError:
                 pass
 
+    # pre_apply execution hooks (#619) — after confirm/plan-file restore,
+    # before apply. A failing hook fails the run with nothing applied yet.
+    try:
+        execution_hooks.run_point("pre_apply", env=os.environ.copy())
+    except execution_hooks.HookError as exc:
+        log.error("pre_apply hook failed", hook=exc.name, rc=exc.exit_code)
+        return exc.exit_code
+
     _APPLY_LOG.write_bytes(b"")
     _flush_stdio()
     rc = plan_apply.run_apply(
@@ -493,6 +509,24 @@ def _run_apply_phase(
                 pass
             if rc == 0:
                 rc = 1
+
+    # post_apply execution hooks (#619) — run ONLY after a successful apply AND
+    # a successful state upload (rc still 0), so state is already persisted. A
+    # failing post_apply hook fails the run WITHOUT losing state: the run
+    # surfaces as errored ("apply succeeded; post-apply hook failed") rather
+    # than silently passing. Runs before the apply-result POST so a failed hook
+    # doesn't report the apply as clean.
+    if rc == 0:
+        try:
+            execution_hooks.run_point("post_apply", env=os.environ.copy())
+        except execution_hooks.HookError as exc:
+            log.error(
+                "post_apply hook failed — apply and state upload succeeded; "
+                "failing the run to surface the hook error (state is safe)",
+                hook=exc.name,
+                rc=exc.exit_code,
+            )
+            return exc.exit_code
 
     if rc == 0:
         try:
@@ -570,11 +604,15 @@ def _run_body(cfg: RunnerConfig, work_dir: Path) -> int:
     if cfg.phase == "apply":
         reuse_plan_lock_file(cfg, strip_dir=cwd)
 
-    # 7. Setup script (operator-supplied tfvars / cloud auth / etc.).
+    # 7. pre_init execution hooks (#619) — operator-supplied setup steps
+    # (cloud/secret auth, /etc/hosts entries, extra tooling) run for BOTH
+    # phases, before init. This supersedes the removed setup_script /
+    # TP_SETUP_SCRIPT slot (which was never wired to a delivery path). A
+    # failing hook fails the run.
     try:
-        setup_script.run(cfg.setup_script, env=os.environ.copy())
-    except setup_script.SetupScriptError as exc:
-        log.error("setup script failed", rc=exc.exit_code)
+        execution_hooks.run_point("pre_init", env=os.environ.copy())
+    except execution_hooks.HookError as exc:
+        log.error("pre_init hook failed", hook=exc.name, rc=exc.exit_code)
         return exc.exit_code
 
     # 8. Build var-file / target / replace argv pieces.
