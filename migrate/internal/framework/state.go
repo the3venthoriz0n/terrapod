@@ -107,14 +107,19 @@ type State struct {
 	// connection per source OAuth-client / PAT.
 	VCSConnections []VCSConnectionRecord `json:"vcs_connections,omitempty"`
 
+	// VariableSets is the varset mapping — SourceID → TerrapodID for
+	// each migrated variable set, recorded after workspaces so their
+	// per-workspace assignments could resolve.
+	VariableSets []VariableSetRecord `json:"variable_sets,omitempty"`
+
 	// SkippedItems records what didn't migrate, in the order the
 	// source emitted them. Surfaced in reports.
 	SkippedItems []SkippedRecord `json:"skipped_items,omitempty"`
 
-	// Subsequent increments add per-resource mappings for variable
-	// sets, run triggers, notifications, agent pools, registry
-	// modules, registry providers. Each gets a Record type to keep
-	// the State struct narrow rather than embedding raw IR.
+	// Subsequent increments add per-resource mappings for run triggers,
+	// notifications, agent pools, registry modules, registry providers.
+	// Each gets a Record type to keep the State struct narrow rather
+	// than embedding raw IR.
 }
 
 // WorkspaceRecord is what we remember about each migrated workspace.
@@ -163,6 +168,24 @@ type VCSConnectionRecord struct {
 	ServerURL  string `json:"server_url,omitempty"`
 	TerrapodID string `json:"terrapod_id,omitempty"`
 	State      string `json:"state"`
+}
+
+// VariableSetRecord is the SourceID → TerrapodID mapping for a migrated
+// variable set, plus enough metadata for the report and idempotent
+// re-runs. Like WorkspaceRecord, CreatedByMigration gates any future
+// rollback so the tool never deletes a varset it merely reused.
+type VariableSetRecord struct {
+	SourceID           string `json:"source_id"`
+	Name               string `json:"name"`
+	TerrapodID         string `json:"terrapod_id,omitempty"`
+	State              string `json:"state"` // "pending" | "created" | "reused" | "errored"
+	Error              string `json:"error,omitempty"`
+	CreatedByMigration bool   `json:"created_by_migration,omitempty"`
+	// ExpectedVarCount / AssignedWorkspaces record what the migration
+	// wrote so a report (or a future verify) can confirm parity without
+	// re-reading the source.
+	ExpectedVarCount   int `json:"expected_var_count,omitempty"`
+	AssignedWorkspaces int `json:"assigned_workspaces,omitempty"`
 }
 
 // SkippedRecord — operator-visible record of what we declined to
@@ -290,6 +313,38 @@ func (s *State) RollbackTargets() []*WorkspaceRecord {
 	var out []*WorkspaceRecord
 	for i := range s.Workspaces {
 		r := &s.Workspaces[i]
+		if r.CreatedByMigration && r.TerrapodID != "" && r.State != "rolled_back" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// VarsetBySourceID returns the recorded variable set by source ID, or
+// nil if not present. Used by `apply` to skip re-creating a varset a
+// prior run already made (idempotent resume).
+func (s *State) VarsetBySourceID(sourceID string) *VariableSetRecord {
+	for i := range s.VariableSets {
+		if s.VariableSets[i].SourceID == sourceID {
+			return &s.VariableSets[i]
+		}
+	}
+	return nil
+}
+
+// VarsetRollbackTargets returns the variable-set records `rollback` may
+// delete: those THIS migration created (CreatedByMigration) that still
+// carry a TerrapodID and haven't already been rolled back. Reused/
+// pre-existing varsets and already-rolled-back records are never
+// returned, so the caller can delete the full list without re-checking
+// provenance. Unlike workspaces, varsets are org-level config with no
+// state serial — there is no advanced-state guard; the provenance gate
+// is the safety boundary. The returned slice points into s.VariableSets
+// so the caller can mutate the records (mark rolled_back) and Save.
+func (s *State) VarsetRollbackTargets() []*VariableSetRecord {
+	var out []*VariableSetRecord
+	for i := range s.VariableSets {
+		r := &s.VariableSets[i]
 		if r.CreatedByMigration && r.TerrapodID != "" && r.State != "rolled_back" {
 			out = append(out, r)
 		}
