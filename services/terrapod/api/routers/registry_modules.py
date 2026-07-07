@@ -23,17 +23,28 @@ TFE V2 Management:
     DELETE /api/terrapod/v1/registry-modules/private/default/{name}/{prov}/{ver}
 """
 
+import asyncio
+import os
 import uuid as _uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from terrapod.api.dependencies import AuthenticatedUser, get_current_user, require_non_runner
+from terrapod.api.dependencies import (
+    AuthenticatedUser,
+    effective_platform_roles,
+    get_current_user,
+    require_non_runner,
+)
 from terrapod.api.labels import validate_labels
+from terrapod.api.serialization import rfc3339
+from terrapod.auth import capabilities as cap
+from terrapod.auth.capabilities import has_capability
 from terrapod.db.models import ModuleWorkspaceLink, RegistryModuleVersion, Workspace
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
@@ -48,9 +59,7 @@ from terrapod.services.registry_module_service import (
     upload_module_tarball,
 )
 from terrapod.services.registry_rbac_service import (
-    REGISTRY_PERMISSION_HIERARCHY,
-    has_registry_permission,
-    resolve_registry_permission,
+    resolve_registry_capabilities_for,
 )
 from terrapod.storage import get_storage
 from terrapod.storage.protocol import ObjectStore
@@ -122,7 +131,7 @@ def _semver_sort_key(version_str: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
-def _module_to_jsonapi(module, effective_permission: str | None = None) -> dict:  # type: ignore[no-untyped-def]
+def _module_to_jsonapi(module, caps: frozenset[str] | None = None) -> dict:  # type: ignore[no-untyped-def]
     sorted_versions = sorted(
         module.versions or [], key=lambda v: _semver_sort_key(v.version), reverse=True
     )
@@ -135,7 +144,7 @@ def _module_to_jsonapi(module, effective_permission: str | None = None) -> dict:
         }
         for v in sorted_versions
     ]
-    perm = effective_permission
+    caps = caps or frozenset()
     return {
         "id": str(module.id),
         "type": "registry-modules",
@@ -155,12 +164,12 @@ def _module_to_jsonapi(module, effective_permission: str | None = None) -> dict:
             "vcs-tag-pattern": module.vcs_tag_pattern,
             "vcs-last-tag": module.vcs_last_tag,
             "version-statuses": versions,
-            "created-at": module.created_at.isoformat() if module.created_at else None,
-            "updated-at": module.updated_at.isoformat() if module.updated_at else None,
+            "created-at": rfc3339(module.created_at),
+            "updated-at": rfc3339(module.updated_at),
             "permissions": {
-                "can-update": has_registry_permission(perm, "admin"),
-                "can-destroy": has_registry_permission(perm, "admin"),
-                "can-create-version": has_registry_permission(perm, "write"),
+                "can-update": has_capability(caps, cap.REGISTRY_ADMIN),
+                "can-destroy": has_capability(caps, cap.REGISTRY_ADMIN),
+                "can-create-version": has_capability(caps, cap.REGISTRY_WRITE),
             },
         },
     }
@@ -182,16 +191,14 @@ async def list_module_versions_cli(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    caps = await resolve_registry_capabilities_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
-    if not has_registry_permission(perm, "read"):
+    if not has_capability(caps, cap.REGISTRY_READ):
         raise HTTPException(status_code=404, detail="Module not found")
 
     versions = sorted(
@@ -219,16 +226,14 @@ async def download_module_cli(
     """Get download URL for a module version (CLI protocol). Requires read."""
     module = await get_module(db, namespace, name, provider)
     if module is not None:
-        perm = await resolve_registry_permission(
+        caps = await resolve_registry_capabilities_for(
             db,
-            user.email,
-            user.roles,
+            user,
             module.name,
             module.labels or {},
             module.owner_email,
-            auth_method=user.auth_method,
         )
-        if not has_registry_permission(perm, "read"):
+        if not has_capability(caps, cap.REGISTRY_READ):
             raise HTTPException(status_code=404, detail="Module version not found")
 
     url = await get_module_download_url(
@@ -276,11 +281,11 @@ async def create_module_endpoint(
         try:
             conn_id = _uuid.UUID(attrs.vcs_connection_id.removeprefix("vcs-"))
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail="Invalid vcs_connection_id") from exc
+            raise HTTPException(status_code=422, detail="Invalid vcs_connection_id") from exc
 
         result = await db.execute(sa_select(VCSConnection).where(VCSConnection.id == conn_id))
         if result.scalars().first() is None:
-            raise HTTPException(status_code=400, detail="VCS connection not found")
+            raise HTTPException(status_code=422, detail="VCS connection not found")
         module.vcs_connection_id = conn_id
         module.source = "vcs"
     if attrs.vcs_repo_url:
@@ -315,17 +320,15 @@ async def list_modules_endpoint(
     modules = await list_modules(db)
     visible = []
     for m in modules:
-        perm = await resolve_registry_permission(
+        caps = await resolve_registry_capabilities_for(
             db,
-            user.email,
-            user.roles,
+            user,
             m.name,
             m.labels or {},
             m.owner_email,
-            auth_method=user.auth_method,
         )
-        if perm is not None:
-            visible.append(_module_to_jsonapi(m, perm))
+        if has_capability(caps, cap.REGISTRY_READ):
+            visible.append(_module_to_jsonapi(m, caps))
     return JSONResponse(content={"data": visible})
 
 
@@ -341,19 +344,17 @@ async def show_module_endpoint(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    caps = await resolve_registry_capabilities_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
-    if not has_registry_permission(perm, "read"):
+    if not has_capability(caps, cap.REGISTRY_READ):
         raise HTTPException(status_code=404, detail="Module not found")
 
-    return JSONResponse(content={"data": _module_to_jsonapi(module, perm)})
+    return JSONResponse(content={"data": _module_to_jsonapi(module, caps)})
 
 
 @management_router.get("/registry-modules/private/default/{name}/{provider}/{version}/interface")
@@ -374,16 +375,14 @@ async def module_interface_endpoint(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    caps = await resolve_registry_capabilities_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
-    if not has_registry_permission(perm, "read"):
+    if not has_capability(caps, cap.REGISTRY_READ):
         raise HTTPException(status_code=404, detail="Module not found")
 
     result = await db.execute(
@@ -424,16 +423,14 @@ async def delete_module_endpoint(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    caps = await resolve_registry_capabilities_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
-    if not has_registry_permission(perm, "admin"):
+    if not has_capability(caps, cap.REGISTRY_ADMIN):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Requires admin permission on module",
@@ -460,16 +457,14 @@ async def update_module_endpoint(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    caps = await resolve_registry_capabilities_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
-    if not has_registry_permission(perm, "admin"):
+    if not has_capability(caps, cap.REGISTRY_ADMIN):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Requires admin permission on module",
@@ -478,7 +473,7 @@ async def update_module_endpoint(
     attrs = body.get("data", {}).get("attributes", {})
 
     if "owner-email" in attrs:
-        if "admin" not in user.roles:
+        if "admin" not in effective_platform_roles(user):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only platform admins can change owner",
@@ -489,26 +484,25 @@ async def update_module_endpoint(
         # Validate up-front (size limits + reserved-key check). Raises 422
         # before any self-lockout logic.
         new_labels = validate_labels(attrs["labels"])
-        # Self-lockout check: warn if label change would reduce user's access
+        # Self-lockout check: warn if label change would remove any capability
+        # the caller currently holds on this module. Capability sets are a
+        # partial order, so the guard is a set-difference ("would the edit
+        # remove any capability I hold?"), not a total-order level comparison.
         if (
             new_labels != (module.labels or {})
             and not attrs.get("force")
-            and "admin" not in user.roles
+            and "admin" not in effective_platform_roles(user)
             and module.owner_email != user.email
         ):
-            new_perm = await resolve_registry_permission(
+            new_caps = await resolve_registry_capabilities_for(
                 db,
-                user.email,
-                user.roles,
+                user,
                 module.name,
                 new_labels,
                 module.owner_email,
-                auth_method=user.auth_method,
             )
-            if new_perm is None or REGISTRY_PERMISSION_HIERARCHY.get(
-                new_perm, -1
-            ) < REGISTRY_PERMISSION_HIERARCHY.get(perm, -1):
-                new_level = new_perm or "none"
+            removed = caps - new_caps
+            if removed:
                 return JSONResponse(
                     status_code=409,
                     content={
@@ -517,8 +511,9 @@ async def update_module_endpoint(
                                 "status": "409",
                                 "title": "Label change would reduce your access",
                                 "detail": (
-                                    f"This label change would reduce your access from "
-                                    f"{perm} to {new_level} on this module. "
+                                    f"This label change would remove capabilities you "
+                                    f"currently hold on this module "
+                                    f"({', '.join(sorted(removed))}). "
                                     f'Re-submit with "force": true to confirm.'
                                 ),
                             }
@@ -540,11 +535,11 @@ async def update_module_endpoint(
             try:
                 conn_id = _uuid.UUID(str(vcs_conn_val).removeprefix("vcs-"))
             except ValueError as exc:
-                raise HTTPException(status_code=400, detail="Invalid vcs_connection_id") from exc
+                raise HTTPException(status_code=422, detail="Invalid vcs_connection_id") from exc
 
             result = await db.execute(sa_select(VCSConnection).where(VCSConnection.id == conn_id))
             if result.scalars().first() is None:
-                raise HTTPException(status_code=400, detail="VCS connection not found")
+                raise HTTPException(status_code=422, detail="VCS connection not found")
             module.vcs_connection_id = conn_id
             module.source = "vcs"
         else:
@@ -558,7 +553,7 @@ async def update_module_endpoint(
 
     await db.commit()
     await db.refresh(module)
-    return JSONResponse(content={"data": _module_to_jsonapi(module, perm)})
+    return JSONResponse(content={"data": _module_to_jsonapi(module, caps)})
 
 
 @management_router.post("/registry-modules/private/default/{name}/{provider}/versions")
@@ -575,24 +570,48 @@ async def create_module_version_endpoint(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    caps = await resolve_registry_capabilities_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
-    if not has_registry_permission(perm, "write"):
+    if not has_capability(caps, cap.REGISTRY_WRITE):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Requires write permission on module",
         )
 
     version_str = body.data.attributes.version
-    mod_version, upload_url = await create_module_version(db, storage, module.id, version_str)
-    await db.commit()
+
+    # Pre-check for an existing version so a duplicate returns a clean 409
+    # instead of an IntegrityError on flush (which would otherwise abort the
+    # transaction after we'd already minted a presigned upload URL). The unique
+    # constraint on (module_id, version) is the backstop for the race.
+    existing = await db.execute(
+        select(RegistryModuleVersion).where(
+            RegistryModuleVersion.module_id == module.id,
+            RegistryModuleVersion.version == version_str,
+        )
+    )
+    if existing.scalars().first() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Version {version_str} already exists for this module",
+        )
+
+    try:
+        mod_version, upload_url = await create_module_version(db, storage, module.id, version_str)
+        await db.commit()
+    except IntegrityError:
+        # Race: a concurrent create inserted the same version between our
+        # pre-check and flush. Roll back and surface the same 409.
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Version {version_str} already exists for this module",
+        ) from None
 
     logger.info(
         "Module version created",
@@ -609,9 +628,7 @@ async def create_module_version_endpoint(
                 "attributes": {
                     "version": mod_version.version,
                     "status": mod_version.upload_status,
-                    "created-at": mod_version.created_at.isoformat()
-                    if mod_version.created_at
-                    else None,
+                    "created-at": rfc3339(mod_version.created_at),
                 },
                 "links": {
                     "upload": upload_url.url,
@@ -633,16 +650,14 @@ async def delete_module_version_endpoint(
     """Delete a specific module version. Requires admin on module."""
     module = await get_module(db, "default", name, provider)
     if module is not None:
-        perm = await resolve_registry_permission(
+        caps = await resolve_registry_capabilities_for(
             db,
-            user.email,
-            user.roles,
+            user,
             module.name,
             module.labels or {},
             module.owner_email,
-            auth_method=user.auth_method,
         )
-        if not has_registry_permission(perm, "admin"):
+        if not has_capability(caps, cap.REGISTRY_ADMIN):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Requires admin permission on module",
@@ -676,34 +691,46 @@ async def upload_module_version_endpoint(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    caps = await resolve_registry_capabilities_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
-    if not has_registry_permission(perm, "write"):
+    if not has_capability(caps, cap.REGISTRY_WRITE):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Requires write permission on module",
         )
 
-    data = await request.body()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty request body")
+    # Stream the tarball to a capped tempfile on the ephemeral PVC rather than
+    # buffering it with `await request.body()` — the upload is streamed into
+    # storage and the module interface is parsed from disk, so the archive is
+    # never held in the worker heap (CLAUDE.md #14).
+    from terrapod.api.upload_stream import stream_to_tempfile
 
-    mod_version = await upload_module_tarball(db, storage, "default", name, provider, version, data)
-    await db.commit()
+    tmp_path, size = await stream_to_tempfile(request, suffix=".module.tar.gz")
+    try:
+        if size == 0:
+            raise HTTPException(status_code=400, detail="Empty request body")
+
+        mod_version = await upload_module_tarball(
+            db, storage, "default", name, provider, version, tmp_path
+        )
+        await db.commit()
+    finally:
+        try:
+            await asyncio.to_thread(os.unlink, tmp_path)
+        except OSError:
+            pass
 
     logger.info(
         "Module tarball uploaded",
         module=name,
         provider=provider,
         version=version,
-        size=len(data),
+        size=size,
     )
 
     return JSONResponse(
@@ -715,9 +742,7 @@ async def upload_module_version_endpoint(
                 "attributes": {
                     "version": mod_version.version,
                     "status": mod_version.upload_status,
-                    "created-at": mod_version.created_at.isoformat()
-                    if mod_version.created_at
-                    else None,
+                    "created-at": rfc3339(mod_version.created_at),
                 },
             }
         },
@@ -755,16 +780,14 @@ async def update_module_vcs_endpoint(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    caps = await resolve_registry_capabilities_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
-    if not has_registry_permission(perm, "admin"):
+    if not has_capability(caps, cap.REGISTRY_ADMIN):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Requires admin permission on module",
@@ -783,11 +806,11 @@ async def update_module_vcs_endpoint(
         try:
             conn_id = _uuid.UUID(attrs.vcs_connection_id.removeprefix("vcs-"))
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail="Invalid vcs_connection_id") from exc
+            raise HTTPException(status_code=422, detail="Invalid vcs_connection_id") from exc
 
         result = await db.execute(sa_select(VCSConnection).where(VCSConnection.id == conn_id))
         if result.scalars().first() is None:
-            raise HTTPException(status_code=400, detail="VCS connection not found")
+            raise HTTPException(status_code=422, detail="VCS connection not found")
         module.vcs_connection_id = conn_id
     else:
         module.vcs_connection_id = None
@@ -831,7 +854,7 @@ def _link_to_jsonapi(link: ModuleWorkspaceLink) -> dict:
         "attributes": {
             "workspace-id": f"ws-{link.workspace_id}",
             "workspace-name": ws.name if ws else "",
-            "created-at": link.created_at.isoformat() if link.created_at else None,
+            "created-at": rfc3339(link.created_at),
             "created-by": link.created_by,
         },
     }
@@ -849,16 +872,14 @@ async def list_workspace_links(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    caps = await resolve_registry_capabilities_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
-    if not has_registry_permission(perm, "read"):
+    if not has_capability(caps, cap.REGISTRY_READ):
         raise HTTPException(status_code=404, detail="Module not found")
 
     result = await db.execute(
@@ -884,16 +905,14 @@ async def create_workspace_link(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    caps = await resolve_registry_capabilities_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
-    if not has_registry_permission(perm, "admin"):
+    if not has_capability(caps, cap.REGISTRY_ADMIN):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Requires admin permission on module",
@@ -957,16 +976,14 @@ async def delete_workspace_link(
     if module is None:
         raise HTTPException(status_code=404, detail="Module not found")
 
-    perm = await resolve_registry_permission(
+    caps = await resolve_registry_capabilities_for(
         db,
-        user.email,
-        user.roles,
+        user,
         module.name,
         module.labels or {},
         module.owner_email,
-        auth_method=user.auth_method,
     )
-    if not has_registry_permission(perm, "admin"):
+    if not has_capability(caps, cap.REGISTRY_ADMIN):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Requires admin permission on module",

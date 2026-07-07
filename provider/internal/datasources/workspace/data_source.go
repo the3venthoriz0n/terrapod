@@ -31,6 +31,8 @@ type workspaceDataSourceModel struct {
 	AutoApply                     types.Bool   `tfsdk:"auto_apply"`
 	ExecutionBackend              types.String `tfsdk:"execution_backend"`
 	TerraformVersion              types.String `tfsdk:"terraform_version"`
+	TerragruntEnabled             types.Bool   `tfsdk:"terragrunt_enabled"`
+	TerragruntVersion             types.String `tfsdk:"terragrunt_version"`
 	WorkingDirectory              types.String `tfsdk:"working_directory"`
 	ResourceCPU                   types.String `tfsdk:"resource_cpu"`
 	ResourceMemory                types.String `tfsdk:"resource_memory"`
@@ -40,15 +42,26 @@ type workspaceDataSourceModel struct {
 	VCSConnectionID               types.String `tfsdk:"vcs_connection_id"`
 	AgentPoolID                   types.String `tfsdk:"agent_pool_id"`
 	VarFiles                      types.List   `tfsdk:"var_files"`
+	TriggerPrefixes               types.List   `tfsdk:"trigger_prefixes"`
+	DriftIgnoreRules              types.List   `tfsdk:"drift_ignore_rules"`
 	DriftDetectionEnabled         types.Bool   `tfsdk:"drift_detection_enabled"`
 	DriftDetectionIntervalSeconds types.Int64  `tfsdk:"drift_detection_interval_seconds"`
+	PlanExpirySeconds             types.Int64  `tfsdk:"plan_expiry_seconds"`
 	AISummaryMode                 types.String `tfsdk:"ai_summary_mode"`
 	AISummaryContext              types.String `tfsdk:"ai_summary_context"`
+	SlackChannel                  types.String `tfsdk:"slack_channel"`
 	OwnerEmail                    types.String `tfsdk:"owner_email"`
 	DriftStatus                   types.String `tfsdk:"drift_status"`
 	DriftLastCheckedAt            types.String `tfsdk:"drift_last_checked_at"`
+	DriftLatestRunID              types.String `tfsdk:"drift_latest_run_id"`
+	StateDiverged                 types.Bool   `tfsdk:"state_diverged"`
 	LifecycleState                types.String `tfsdk:"lifecycle_state"`
 	LifecycleReason               types.String `tfsdk:"lifecycle_reason"`
+	VCSLastPolledAt               types.String `tfsdk:"vcs_last_polled_at"`
+	VCSLastError                  types.String `tfsdk:"vcs_last_error"`
+	VCSLastErrorAt                types.String `tfsdk:"vcs_last_error_at"`
+	AgentPoolName                 types.String `tfsdk:"agent_pool_name"`
+	VCSConnectionName             types.String `tfsdk:"vcs_connection_name"`
 	Locked                        types.Bool   `tfsdk:"locked"`
 	CreatedAt                     types.String `tfsdk:"created_at"`
 	UpdatedAt                     types.String `tfsdk:"updated_at"`
@@ -73,6 +86,8 @@ func (d *workspaceDataSource) Schema(_ context.Context, _ datasource.SchemaReque
 			"auto_apply":                       computedBool("Auto-apply setting."),
 			"execution_backend":                computedString("Execution backend."),
 			"terraform_version":                computedString("Terraform/tofu version."),
+			"terragrunt_enabled":               computedBool("Whether terragrunt wraps tofu/terraform for agent-mode runs."),
+			"terragrunt_version":               computedString("Terragrunt CLI version (when terragrunt_enabled)."),
 			"working_directory":                computedString("Working directory."),
 			"resource_cpu":                     computedString("CPU request."),
 			"resource_memory":                  computedString("Memory request."),
@@ -82,15 +97,26 @@ func (d *workspaceDataSource) Schema(_ context.Context, _ datasource.SchemaReque
 			"vcs_connection_id":                computedString("VCS connection ID."),
 			"agent_pool_id":                    computedString("Agent pool ID."),
 			"var_files":                        computedList("Var files for -var-file arguments."),
+			"trigger_prefixes":                 computedList("Repo-root-relative paths the VCS sparse-checkout must include in addition to working_directory (e.g. sibling modules referenced via `source = \"../foo\"`)."),
+			"drift_ignore_rules":               computedList("Glob-aware patterns suppressed by the drift-result classifier (#482). See the resource attribute docs for syntax."),
 			"drift_detection_enabled":          computedBool("Drift detection enabled."),
 			"drift_detection_interval_seconds": computedInt64("Drift detection interval."),
+			"plan_expiry_seconds":              computedInt64("Per-workspace plan expiry TTL in seconds (#646); null/0 = disabled."),
 			"ai_summary_mode":                  computedString("Per-workspace AI plan-summary mode: 'default' (follow deployment global), 'enabled' (always summarise), or 'disabled' (never summarise)."),
 			"ai_summary_context":               computedString("Workspace-specific context appended to the AI summariser prompt."),
+			"slack_channel":                    computedString("Opt-in Slack channel for this workspace's run notifications (#556); empty = silent."),
 			"owner_email":                      computedString("Owner email."),
 			"drift_status":                     computedString("Drift status."),
 			"drift_last_checked_at":            computedString("Last drift check."),
+			"drift_latest_run_id":              computedString("ID of the drift run that produced the current `drift_status`, prefixed `run-…`. Empty when drift has never run or was just cleared by a successful apply."),
+			"state_diverged":                   computedBool("True when an apply Job succeeded but uploading the resulting state to Terrapod failed; the recorded state is out of sync with reality."),
 			"lifecycle_state":                  computedString("Workspace lifecycle state (e.g. active, or flagged/destroying when its autodiscovery source directory was deleted)."),
 			"lifecycle_reason":                 computedString("Human-readable reason for the current lifecycle state."),
+			"vcs_last_polled_at":               computedString("Timestamp of the most recent successful VCS poll cycle."),
+			"vcs_last_error":                   computedString("Most recent VCS poll error message. Empty when the last poll succeeded."),
+			"vcs_last_error_at":                computedString("Timestamp of `vcs_last_error`."),
+			"agent_pool_name":                  computedString("Human-readable name of the assigned agent pool, server-derived from `agent_pool_id`."),
+			"vcs_connection_name":              computedString("Human-readable name of the assigned VCS connection, server-derived from `vcs_connection_id`."),
 			"locked":                           computedBool("Lock status."),
 			"created_at":                       computedString("Creation timestamp."),
 			"updated_at":                       computedString("Update timestamp."),
@@ -161,15 +187,25 @@ func readDataSourceModel(ctx context.Context, res *terrapod.Resource, m *workspa
 	}
 	m.AISummaryMode = types.StringValue(mode)
 	m.AISummaryContext = types.StringValue(terrapod.GetStringAttr(res, "ai-summary-context"))
+	m.SlackChannel = types.StringValue(terrapod.GetStringAttr(res, "slack-channel"))
 
 	setOptionalString(&m.TerraformVersion, terrapod.GetStringAttr(res, "terraform-version"))
+	m.TerragruntEnabled = types.BoolValue(terrapod.GetBoolAttr(res, "terragrunt-enabled"))
+	setOptionalString(&m.TerragruntVersion, terrapod.GetStringAttr(res, "terragrunt-version"))
 	setOptionalString(&m.VCSRepoURL, terrapod.GetStringAttr(res, "vcs-repo-url"))
 	setOptionalString(&m.VCSBranch, terrapod.GetStringAttr(res, "vcs-branch"))
 	setOptionalString(&m.AgentPoolID, terrapod.GetStringAttr(res, "agent-pool-id"))
 	setOptionalString(&m.DriftStatus, terrapod.GetStringAttr(res, "drift-status"))
 	setOptionalString(&m.DriftLastCheckedAt, terrapod.GetStringAttr(res, "drift-last-checked-at"))
+	setOptionalString(&m.DriftLatestRunID, terrapod.GetStringAttr(res, "drift-latest-run-id"))
 	setOptionalString(&m.LifecycleState, terrapod.GetStringAttr(res, "lifecycle-state"))
 	setOptionalString(&m.LifecycleReason, terrapod.GetStringAttr(res, "lifecycle-reason"))
+	setOptionalString(&m.VCSLastPolledAt, terrapod.GetStringAttr(res, "vcs-last-polled-at"))
+	setOptionalString(&m.VCSLastError, terrapod.GetStringAttr(res, "vcs-last-error"))
+	setOptionalString(&m.VCSLastErrorAt, terrapod.GetStringAttr(res, "vcs-last-error-at"))
+	setOptionalString(&m.AgentPoolName, terrapod.GetStringAttr(res, "agent-pool-name"))
+	setOptionalString(&m.VCSConnectionName, terrapod.GetStringAttr(res, "vcs-connection-name"))
+	m.StateDiverged = types.BoolValue(terrapod.GetBoolAttr(res, "state-diverged"))
 
 	if v := terrapod.GetRelationshipID(res, "vcs-connection"); v != "" {
 		m.VCSConnectionID = types.StringValue(v)
@@ -183,12 +219,34 @@ func readDataSourceModel(ctx context.Context, res *terrapod.Resource, m *workspa
 		m.DriftDetectionIntervalSeconds = types.Int64Null()
 	}
 
+	if v := terrapod.GetIntAttr(res, "plan-expiry-seconds"); v > 0 {
+		m.PlanExpirySeconds = types.Int64Value(v)
+	} else {
+		m.PlanExpirySeconds = types.Int64Null()
+	}
+
 	if varFiles := terrapod.GetListAttr(res, "var-files"); len(varFiles) > 0 {
 		val, d := types.ListValueFrom(ctx, types.StringType, varFiles)
 		diags.Append(d...)
 		m.VarFiles = val
 	} else {
 		m.VarFiles = types.ListNull(types.StringType)
+	}
+
+	if tp := terrapod.GetListAttr(res, "trigger-prefixes"); len(tp) > 0 {
+		val, d := types.ListValueFrom(ctx, types.StringType, tp)
+		diags.Append(d...)
+		m.TriggerPrefixes = val
+	} else {
+		m.TriggerPrefixes = types.ListNull(types.StringType)
+	}
+
+	if rules := terrapod.GetListAttr(res, "drift-ignore-rules"); len(rules) > 0 {
+		val, d := types.ListValueFrom(ctx, types.StringType, rules)
+		diags.Append(d...)
+		m.DriftIgnoreRules = val
+	} else {
+		m.DriftIgnoreRules = types.ListNull(types.StringType)
 	}
 
 	if labels := terrapod.GetMapAttr(res, "labels"); len(labels) > 0 {

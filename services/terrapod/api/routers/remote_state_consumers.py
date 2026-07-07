@@ -31,10 +31,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from terrapod.api.dependencies import AuthenticatedUser, get_current_user
+from terrapod.auth import capabilities as cap
+from terrapod.auth.capabilities import has_capability
 from terrapod.db.models import Workspace, WorkspaceRemoteStateConsumer
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
-from terrapod.services.workspace_rbac_service import has_permission, resolve_workspace_permission
+from terrapod.services.workspace_rbac_service import (
+    resolve_workspace_capabilities_for,
+)
 
 router = APIRouter(tags=["remote-state-consumers"])
 logger = get_logger(__name__)
@@ -94,14 +98,14 @@ async def _get_workspace(workspace_id: str, db: AsyncSession) -> Workspace:
     return ws
 
 
-async def _require_ws_permission(
+async def _require_ws_capability(
     ws: Workspace, required: str, user: AuthenticatedUser, db: AsyncSession
 ) -> None:
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
-    if not has_permission(perm, required):
+    caps = await resolve_workspace_capabilities_for(db, user, ws)
+    if not has_capability(caps, required):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Requires {required} permission on workspace",
+            detail=f"Requires {required} capability on workspace",
         )
 
 
@@ -130,7 +134,7 @@ async def create_remote_state_consumer(
     control of the secret-bearing state is the security invariant.
     """
     producer = await _get_workspace(workspace_id, db)
-    await _require_ws_permission(producer, "admin", user, db)
+    await _require_ws_capability(producer, cap.WORKSPACE_SETTINGS, user, db)
 
     consumer = await _get_workspace(_extract_consumer_id(body), db)
 
@@ -172,6 +176,13 @@ async def create_remote_state_consumer(
     await db.refresh(row, attribute_names=["producer_workspace", "consumer_workspace"])
     await db.commit()
 
+    # Live-update both Sharing tabs: the producer gets a new outbound consumer,
+    # the consumer a new inbound producer it may now read from.
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(str(producer.id), "remote_state_consumer_change")
+    await publish_workspace_event(str(consumer.id), "remote_state_consumer_change")
+
     logger.info(
         "Remote-state consumer authorized",
         edge_id=str(row.id),
@@ -197,7 +208,7 @@ async def list_remote_state_consumers(
     read (I'm the consumer). Requires read on the workspace.
     """
     ws = await _get_workspace(workspace_id, db)
-    await _require_ws_permission(ws, "read", user, db)
+    await _require_ws_capability(ws, cap.STATE_READ_METADATA, user, db)
 
     if filter_type is None:
         filter_type = "outbound"
@@ -241,7 +252,7 @@ async def replace_remote_state_consumers(
     Body shape: ``{"data": [{"type": "workspaces", "id": "ws-..."}, ...]}``.
     """
     producer = await _get_workspace(workspace_id, db)
-    await _require_ws_permission(producer, "admin", user, db)
+    await _require_ws_capability(producer, cap.WORKSPACE_SETTINGS, user, db)
 
     items = body.get("data", [])
     if not isinstance(items, list):
@@ -341,7 +352,7 @@ async def show_remote_state_consumer(
     if row is None:
         raise HTTPException(status_code=404, detail="Remote-state consumer not found")
 
-    await _require_ws_permission(row.producer_workspace, "read", user, db)
+    await _require_ws_capability(row.producer_workspace, cap.STATE_READ_METADATA, user, db)
 
     return JSONResponse(content={"data": _consumer_json(row)})
 
@@ -370,13 +381,22 @@ async def delete_remote_state_consumer(
     if row is None:
         raise HTTPException(status_code=404, detail="Remote-state consumer not found")
 
-    await _require_ws_permission(row.producer_workspace, "admin", user, db)
+    await _require_ws_capability(row.producer_workspace, cap.WORKSPACE_SETTINGS, user, db)
+
+    producer_id = str(row.producer_workspace_id)
+    consumer_id = str(row.consumer_workspace_id)
+    revoked_edge_id = str(row.id)
 
     await db.delete(row)
     await db.commit()
 
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(producer_id, "remote_state_consumer_change")
+    await publish_workspace_event(consumer_id, "remote_state_consumer_change")
+
     logger.info(
         "Remote-state consumer revoked",
-        edge_id=str(row.id),
+        edge_id=revoked_edge_id,
         by=user.email,
     )

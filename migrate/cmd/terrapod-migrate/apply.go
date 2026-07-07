@@ -356,6 +356,33 @@ func loadTFEPlan(ctx context.Context, address, token, org string) (ir.Plan, writ
 	}
 	skipped = append(skipped, varSkipped...)
 
+	varsets, vsSkipped, err := c.VariableSets(ctx)
+	if err != nil {
+		return ir.Plan{}, nil, err
+	}
+	skipped = append(skipped, vsSkipped...)
+
+	runTriggers, err := c.RunTriggers(ctx, workspaces)
+	if err != nil {
+		return ir.Plan{}, nil, err
+	}
+
+	notifications, ntSkipped, err := c.Notifications(ctx, workspaces)
+	if err != nil {
+		return ir.Plan{}, nil, err
+	}
+	skipped = append(skipped, ntSkipped...)
+
+	agentPools, err := c.AgentPools(ctx)
+	if err != nil {
+		return ir.Plan{}, nil, err
+	}
+
+	gpgKeys, err := c.GPGKeys(ctx)
+	if err != nil {
+		return ir.Plan{}, nil, err
+	}
+
 	plan := ir.Plan{
 		Source: "tfe",
 		SourceMetadata: map[string]string{
@@ -365,6 +392,11 @@ func loadTFEPlan(ctx context.Context, address, token, org string) (ir.Plan, writ
 		},
 		VCSConnections: conns,
 		Workspaces:     workspaces,
+		VariableSets:   varsets,
+		RunTriggers:    runTriggers,
+		Notifications:  notifications,
+		AgentPools:     agentPools,
+		GPGKeys:        gpgKeys,
 		Skipped:        skipped,
 	}
 	return plan, c.StateReader(), nil
@@ -385,6 +417,11 @@ func printReportSummary(r *writer.Report, dryRun bool) {
 	}
 	fmt.Printf("  connections:   %d\n", len(r.Connections))
 	fmt.Printf("  workspaces:    %d\n", len(r.Workspaces))
+	fmt.Printf("  variable sets: %d\n", len(r.VariableSets))
+	fmt.Printf("  run triggers:  %d\n", len(r.RunTriggers))
+	fmt.Printf("  notifications: %d\n", len(r.Notifications))
+	fmt.Printf("  agent pools:   %d\n", len(r.AgentPools))
+	fmt.Printf("  gpg keys:      %d\n", len(r.GPGKeys))
 	fmt.Printf("  skipped:       %d\n", len(r.Skipped))
 	if len(r.Errors) > 0 {
 		fmt.Printf("  errors:        %d\n", len(r.Errors))
@@ -412,12 +449,124 @@ func printReportSummary(r *writer.Report, dryRun bool) {
 			}
 		}
 	}
+	for _, vs := range r.VariableSets {
+		for _, v := range vs.VarOutcomes {
+			if v.State == "needs_value" {
+				needsValue = append(needsValue, fmt.Sprintf("varset %s / %s", vs.Name, v.Key))
+			}
+		}
+	}
 	if len(needsValue) > 0 {
 		fmt.Printf("\n  sensitive variables needing operator action (%d):\n", len(needsValue))
 		fmt.Println("    These were created as empty rows with sensitive=true. Open each")
-		fmt.Println("    workspace in Terrapod and fill in the value before the next plan.")
+		fmt.Println("    workspace/variable set in Terrapod and fill in the value before the next plan.")
 		for _, n := range needsValue {
 			fmt.Printf("    - %s\n", n)
+		}
+	}
+
+	// Variable-set assignments that couldn't be resolved (the referenced
+	// workspace wasn't in the migration scope) need a manual assignment.
+	var unresolved []string
+	for _, vs := range r.VariableSets {
+		for _, ref := range vs.Unresolved {
+			unresolved = append(unresolved, fmt.Sprintf("varset %s → source workspace %s", vs.Name, ref))
+		}
+	}
+	if len(unresolved) > 0 {
+		fmt.Printf("\n  variable-set assignments needing operator action (%d):\n", len(unresolved))
+		fmt.Println("    These sets reference workspaces outside the migration scope. Assign")
+		fmt.Println("    them to the intended workspaces in Terrapod by hand.")
+		for _, u := range unresolved {
+			fmt.Printf("    - %s\n", u)
+		}
+	}
+
+	// Run triggers whose source or destination wasn't migrated can't be
+	// created automatically — the operator wires them up once both
+	// workspaces exist on Terrapod.
+	var skippedTriggers []string
+	for _, rt := range r.RunTriggers {
+		if rt.State == "skipped" {
+			skippedTriggers = append(skippedTriggers, fmt.Sprintf("%s → %s", rt.SourceName, rt.DestinationName))
+		}
+	}
+	if len(skippedTriggers) > 0 {
+		fmt.Printf("\n  run triggers needing operator action (%d):\n", len(skippedTriggers))
+		fmt.Println("    One or both endpoints were outside the migration scope. Recreate")
+		fmt.Println("    these source → destination triggers in Terrapod once both workspaces exist.")
+		for _, s := range skippedTriggers {
+			fmt.Printf("    - %s\n", s)
+		}
+	}
+
+	// Generic-webhook notification configs migrate with an empty HMAC
+	// token (the source never returns it). The operator must re-enter
+	// the token before the receiver will accept signed deliveries.
+	var needsToken []string
+	for _, nc := range r.Notifications {
+		if nc.NeedsToken && nc.State != "skipped" {
+			needsToken = append(needsToken, fmt.Sprintf("%s / %s", nc.WorkspaceName, nc.Name))
+		}
+	}
+	if len(needsToken) > 0 {
+		fmt.Printf("\n  notification tokens needing operator action (%d):\n", len(needsToken))
+		fmt.Println("    These generic-webhook configs were created with an empty HMAC token")
+		fmt.Println("    (the source never returns it). Re-enter each token in Terrapod if the")
+		fmt.Println("    receiver verifies signatures.")
+		for _, n := range needsToken {
+			fmt.Printf("    - %s\n", n)
+		}
+	}
+
+	// Notification configs whose destination workspace wasn't migrated
+	// can't be attached automatically.
+	var skippedNotifications []string
+	for _, nc := range r.Notifications {
+		if nc.State == "skipped" {
+			skippedNotifications = append(skippedNotifications, fmt.Sprintf("%s / %s", nc.WorkspaceName, nc.Name))
+		}
+	}
+	if len(skippedNotifications) > 0 {
+		fmt.Printf("\n  notifications needing operator action (%d):\n", len(skippedNotifications))
+		fmt.Println("    The destination workspace was outside the migration scope. Recreate")
+		fmt.Println("    these configs in Terrapod once the workspace exists.")
+		for _, s := range skippedNotifications {
+			fmt.Printf("    - %s\n", s)
+		}
+	}
+
+	// Every migrated agent pool needs a fresh join token + redeployed
+	// listeners — TFE agent tokens are write-only and never portable.
+	var poolsNeedingListeners []string
+	for _, ap := range r.AgentPools {
+		if ap.State == "created" || ap.State == "reused" {
+			poolsNeedingListeners = append(poolsNeedingListeners, ap.Name)
+		}
+	}
+	if len(poolsNeedingListeners) > 0 {
+		fmt.Printf("\n  agent pools needing operator action (%d):\n", len(poolsNeedingListeners))
+		fmt.Println("    The pool + its workspace assignments were migrated, but agent tokens")
+		fmt.Println("    are never portable. For each pool, generate a fresh join token in")
+		fmt.Println("    Terrapod and redeploy your listeners against it before agent runs work.")
+		for _, n := range poolsNeedingListeners {
+			fmt.Printf("    - %s\n", n)
+		}
+	}
+
+	// Pool member workspaces that weren't migrated can't be re-pointed.
+	var unresolvedPoolWorkspaces []string
+	for _, ap := range r.AgentPools {
+		for _, ref := range ap.Unresolved {
+			unresolvedPoolWorkspaces = append(unresolvedPoolWorkspaces, fmt.Sprintf("pool %s → source workspace %s", ap.Name, ref))
+		}
+	}
+	if len(unresolvedPoolWorkspaces) > 0 {
+		fmt.Printf("\n  agent-pool assignments needing operator action (%d):\n", len(unresolvedPoolWorkspaces))
+		fmt.Println("    These pool member workspaces were outside the migration scope. Point")
+		fmt.Println("    them at the migrated pool in Terrapod by hand once they exist.")
+		for _, u := range unresolvedPoolWorkspaces {
+			fmt.Printf("    - %s\n", u)
 		}
 	}
 }

@@ -1,13 +1,33 @@
 """Build K8s Job specs for terraform/tofu plan and apply phases."""
 
 import json
-import os
 import re
 
-from terrapod.config import RunnerConfig
+from terrapod.config import RunnerConfig, settings
 from terrapod.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+# Per-run vars Secret (mounted files). Keep in sync with
+# runner/job_entrypoint.py + runner/phases/execution_hooks.py which read the
+# same paths.
+_TFVARS_SECRET_KEY = "terraform.tfvars.json"
+_TFVARS_FILENAME = "terraform.tfvars.json"
+_TFVARS_MOUNT_DIR = "/var/run/terrapod/vars"
+# Execution hooks (#619) — shipped as an extra key in the same per-run vars
+# Secret, mounted alongside the tfvars file.
+_HOOKS_SECRET_KEY = "execution-hooks.json"
+_HOOKS_FILENAME = "execution-hooks.json"
+
+# Custom outbound CA trust bundle (#592). The listener ships the raw custom CA
+# into a per-run Secret under this key; an init container merges it with the
+# runner image's own system roots into an emptyDir, and the runner container
+# trusts the merged file. Paths/key mirror the chart's _helpers.tpl so the
+# deployment and Job machinery stay identical.
+_CA_BUNDLE_KEY = "ca-extra.pem"
+_CA_SRC_DIR = "/etc/terrapod-ca-src"
+_CA_MERGED_DIR = "/etc/terrapod-ca"
+_CA_MERGED_FILE = f"{_CA_MERGED_DIR}/ca-bundle.crt"
 
 
 def _double_resource(value: str) -> str:
@@ -44,11 +64,15 @@ def build_job_spec(
     auth_secret_name: str,
     env_vars: list[dict[str, str]],
     terraform_vars: list[dict[str, str]],
+    execution_hooks: list[dict] | None = None,
+    vars_secret_name: str = "",
     resource_cpu: str = "1",
     resource_memory: str = "2Gi",
     timeout_minutes: int = 60,
     terraform_version: str = "",
     execution_backend: str = "",
+    terragrunt_enabled: bool = False,
+    terragrunt_version: str = "",
     namespace: str = "",
     plan_only: bool = False,
     var_files: list[str] | None = None,
@@ -59,6 +83,7 @@ def build_job_spec(
     allow_empty_apply: bool = False,
     is_destroy: bool = False,
     working_directory: str = "",
+    ca_secret_name: str = "",
 ) -> dict:
     """Build a K8s Job spec for a run phase.
 
@@ -67,8 +92,14 @@ def build_job_spec(
         phase: "plan" or "apply".
         runner_config: Global runner config (image, defaults, etc.).
         auth_secret_name: K8s Secret name containing the runner token.
-        env_vars: Workspace env vars [{key, value}].
-        terraform_vars: Terraform vars [{key, value}] → TF_VAR_*.
+        vars_secret_name: K8s Secret holding all workspace variable values
+            (terraform tfvars blob + env vars). When set, env vars are sourced
+            via secretKeyRef and terraform vars are mounted as a file — no
+            variable value is plaintext in the Job spec.
+        env_vars: Workspace env vars [{key, value}] — keys referenced via
+            secretKeyRef into vars_secret_name.
+        terraform_vars: Terraform vars [{key, value, hcl}] — presence triggers
+            the mounted tfvars volume; the entrypoint renders the file.
         resource_cpu: CPU request (e.g. "1", "500m").
         resource_memory: Memory request (e.g. "2Gi", "256Mi").
         timeout_minutes: Job timeout in minutes.
@@ -77,13 +108,13 @@ def build_job_spec(
         namespace: Target namespace for the Job.
     """
     if not namespace:
-        namespace = os.environ.get("TERRAPOD_RUNNER_NAMESPACE", "terrapod-runners")
+        namespace = runner_config.runner_namespace
 
     run_short = run_id[:16]
     job_name = f"tprun-{run_short}-{phase}"
 
     # Build container env vars
-    api_url = os.environ.get("TERRAPOD_API_URL", "http://terrapod-api:8000")
+    api_url = runner_config.server_url or "http://terrapod-api:8000"
     container_env = [
         # HOME defends against tools that consult $HOME without a
         # passwd entry (helm's repository/index cache,
@@ -122,7 +153,7 @@ def build_job_spec(
     # a trailing `/` ("https://x.example/" vs "https://x.example") don't
     # trigger a no-op redirect — the entrypoint's host-extraction re-
     # checks at hostname level either way, this is just a tighter guard.
-    public_api_url = os.environ.get("TERRAPOD_PUBLIC_API_URL", "").strip()
+    public_api_url = (runner_config.public_api_url or "").strip()
     if public_api_url and public_api_url.rstrip("/") != api_url.rstrip("/"):
         container_env.append({"name": "TP_PUBLIC_API_URL", "value": public_api_url})
 
@@ -131,6 +162,27 @@ def build_job_spec(
     backend = execution_backend or runner_config.default_execution_backend
     container_env.append({"name": "TP_VERSION", "value": version})
     container_env.append({"name": "TP_BACKEND", "value": backend})
+    # Runner-side executable verification level (#607): the runner re-verifies
+    # the terraform/tofu/terragrunt binary against the publisher's signed
+    # SHA256SUMS with its own pinned key before executing it. Mirrors the
+    # server's binary_cache.verify so operators control it in one place.
+    container_env.append(
+        {"name": "TP_VERIFY_BINARIES", "value": settings.registry.binary_cache.verify}
+    )
+    # Operator-overridden publisher keys (#607): propagate the configured trust
+    # set to the Job so runner-side verification uses the same keys as the API
+    # (set at Job-creation from config, not fetched at request time → not an
+    # attacker-controllable trust anchor). Empty (default) → runner uses bundled.
+    for _tool, _armor in settings.registry.binary_cache.signing_keys.items():
+        if _armor:
+            container_env.append({"name": f"TP_SIGNING_KEY_{_tool.upper()}", "value": _armor})
+    # Terragrunt (#534): the runner wraps tofu/terraform with terragrunt when
+    # enabled. Version is partial (e.g. "1.0") — the binary cache resolves it.
+    if terragrunt_enabled:
+        container_env.append({"name": "TP_TERRAGRUNT_ENABLED", "value": "true"})
+        container_env.append(
+            {"name": "TP_TERRAGRUNT_VERSION", "value": terragrunt_version or "1.0"}
+        )
     if plan_only:
         container_env.append({"name": "TP_PLAN_ONLY", "value": "true"})
     if var_files:
@@ -158,13 +210,50 @@ def build_job_spec(
         }
     )
 
-    # Workspace env vars (category=env)
+    # Workspace env vars (category=env). Values are sourced from the per-run
+    # vars Secret via secretKeyRef — never plaintext in the Job spec, since env
+    # vars can be sensitive and are readable via `kubectl describe` / etcd. The
+    # listener populates the Secret (key = the env var name).
     for var in env_vars:
-        container_env.append({"name": var["key"], "value": var["value"]})
+        if vars_secret_name:
+            container_env.append(
+                {
+                    "name": var["key"],
+                    "valueFrom": {"secretKeyRef": {"name": vars_secret_name, "key": var["key"]}},
+                }
+            )
+        else:
+            container_env.append({"name": var["key"], "value": var["value"]})
 
-    # Terraform vars (category=terraform → TF_VAR_*)
-    for var in terraform_vars:
-        container_env.append({"name": f"TF_VAR_{var['key']}", "value": var["value"]})
+    # Terraform vars (category=terraform) are NOT injected as env vars. They are
+    # delivered as a read-only mounted file from the same per-run Secret (volume
+    # added below) and the entrypoint renders terrapod.auto.tfvars from it. This
+    # keeps sensitive values off the Job spec env and makes complex/object
+    # values round-trip identically on terraform and tofu.
+
+    # Forward proxy (#592) — lets `terraform init` reach PUBLIC registry/git
+    # module sources through a corporate proxy. Both upper and lower case: Go
+    # (terraform/tofu, the AWS SDK) reads the UPPER form, while many libraries
+    # read the lower form. no_proxy is pre-resolved by the chart; we do NOT
+    # force the API host into it — in split-cluster the runner→API hop reaches
+    # the public URL and legitimately traverses the proxy.
+    if runner_config.proxy:
+        p = runner_config.proxy
+        for name, value in (
+            ("HTTP_PROXY", p.http_proxy),
+            ("HTTPS_PROXY", p.https_proxy),
+            ("NO_PROXY", p.no_proxy),
+        ):
+            if value:
+                container_env.append({"name": name, "value": value})
+                container_env.append({"name": name.lower(), "value": value})
+
+    # Custom CA trust bundle (#592) — point the runner's TLS stacks at the
+    # init-container-merged bundle (system roots + custom CA). Volumes + init
+    # container are added to the pod spec further down.
+    if ca_secret_name and runner_config.ca_bundle_enabled:
+        for name in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO"):
+            container_env.append({"name": name, "value": _CA_MERGED_FILE})
 
     # Extra env vars from runner config (Helm values → runners.extraEnv)
     for extra in runner_config.extra_env:
@@ -302,6 +391,79 @@ def build_job_spec(
             },
         },
     }
+
+    # Per-run vars Secret: mount the terraform variables (and execution-hook
+    # scripts, #619) as read-only files. The listener creates the Secret with an
+    # ownerReference to this Job, so it cascade-deletes when the Job is GC'd
+    # (same lifecycle as the auth Secret).
+    secret_items = []
+    if terraform_vars:
+        secret_items.append({"key": _TFVARS_SECRET_KEY, "path": _TFVARS_FILENAME})
+    if execution_hooks:
+        secret_items.append({"key": _HOOKS_SECRET_KEY, "path": _HOOKS_FILENAME})
+    if vars_secret_name and secret_items:
+        pod = job_spec["spec"]["template"]["spec"]
+        pod["volumes"].append(
+            {
+                "name": "tfvars",
+                "secret": {
+                    "secretName": vars_secret_name,
+                    "items": secret_items,
+                },
+            }
+        )
+        pod["containers"][0]["volumeMounts"].append(
+            {"name": "tfvars", "mountPath": _TFVARS_MOUNT_DIR, "readOnly": True}
+        )
+
+    # Custom CA trust bundle (#592): mount the per-run CA Secret (raw custom CA,
+    # shipped by the listener from its own mounted source) and an emptyDir for
+    # the merged bundle, plus an init container that concatenates the runner
+    # image's system roots with the custom CA. Runner containers run with
+    # readOnlyRootFilesystem, so the merge MUST land on the writable emptyDir,
+    # not the image's /etc/ssl. Mirrors terrapod.caBundle.initContainer in
+    # _helpers.tpl so deployment and Job behave identically.
+    if ca_secret_name and runner_config.ca_bundle_enabled:
+        pod = job_spec["spec"]["template"]["spec"]
+        pod["volumes"].append(
+            {
+                "name": "ca-src",
+                "secret": {
+                    "secretName": ca_secret_name,
+                    "items": [{"key": _CA_BUNDLE_KEY, "path": _CA_BUNDLE_KEY}],
+                },
+            }
+        )
+        pod["volumes"].append({"name": "ca-merged", "emptyDir": {}})
+        pod["containers"][0]["volumeMounts"].append(
+            {"name": "ca-merged", "mountPath": _CA_MERGED_DIR, "readOnly": True}
+        )
+        pod.setdefault("initContainers", []).append(
+            {
+                "name": "ca-merge",
+                "image": image,
+                "imagePullPolicy": runner_config.image.pull_policy,
+                "command": [
+                    "/bin/sh",
+                    "-c",
+                    f"cat /etc/ssl/certs/ca-certificates.crt {_CA_SRC_DIR}/{_CA_BUNDLE_KEY} "
+                    f"> {_CA_MERGED_FILE}",
+                ],
+                "securityContext": {
+                    "runAsNonRoot": True,
+                    "runAsUser": 1000,
+                    "runAsGroup": 1000,
+                    "readOnlyRootFilesystem": True,
+                    "allowPrivilegeEscalation": False,
+                    "capabilities": {"drop": ["ALL"]},
+                    "seccompProfile": {"type": "RuntimeDefault"},
+                },
+                "volumeMounts": [
+                    {"name": "ca-src", "mountPath": _CA_SRC_DIR, "readOnly": True},
+                    {"name": "ca-merged", "mountPath": _CA_MERGED_DIR},
+                ],
+            }
+        )
 
     # envFrom — inject all keys from Secrets/ConfigMaps as env vars
     if runner_config.extra_env_from:

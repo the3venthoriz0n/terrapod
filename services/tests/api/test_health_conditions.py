@@ -25,8 +25,10 @@ def _mock_workspace(**overrides):
     ws.vcs_branch = ""
     ws.var_files = []
     ws.trigger_prefixes = []
+    ws.drift_ignore_rules = []
     ws.drift_detection_enabled = False
     ws.drift_detection_interval_seconds = 86400
+    ws.plan_expiry_seconds = None
     ws.drift_last_checked_at = None
     ws.drift_status = overrides.get("drift_status", "")
     ws.state_diverged = overrides.get("state_diverged", False)

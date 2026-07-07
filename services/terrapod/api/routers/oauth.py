@@ -9,8 +9,7 @@ Endpoints:
     POST /oauth/token — exchange auth code for API token
 """
 
-import base64
-import hashlib
+import hmac
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, status
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -23,6 +22,8 @@ from terrapod.auth.auth_state import (
     generate_state,
     store_auth_state,
 )
+from terrapod.auth.pkce import s256_challenge
+from terrapod.config import settings
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
 from terrapod.redis.client import get_redis_client
@@ -149,12 +150,18 @@ async def oauth_token(
             detail="PKCE verification failed",
         )
 
-    # Create a long-lived API token (no expiry by default)
+    # Create a short-lived interactive API token (terraform login). Bound to
+    # the authenticating identity; created_by is the same identity. The
+    # lifespan comes from auth.login_token_ttl_hours (default 12h) — these are
+    # per-session CLI credentials, not max-lifetime tokens. 0 falls back to the
+    # api_token_max_ttl_hours cap. create_api_token clamps to that cap either way.
     api_token, raw_token = await create_api_token(
         db=db,
-        user_email=auth_code.email,
+        bound_to=auth_code.email,
+        created_by=auth_code.email,
+        kind="interactive",
         description=f"terraform login ({auth_code.provider_name})",
-        token_type="user",
+        lifespan_hours=settings.auth.login_token_ttl_hours or None,
     )
     await db.commit()
 
@@ -190,6 +197,7 @@ def _verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:
     if method != "S256":
         return False
 
-    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
-    computed_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-    return computed_challenge == code_challenge
+    computed_challenge = s256_challenge(code_verifier)
+    # Timing-safe — the PKCE challenge is attacker-influenced in the token
+    # exchange; match every other secret comparison in the codebase.
+    return hmac.compare_digest(computed_challenge, code_challenge)

@@ -4,7 +4,6 @@ Uses the kubernetes Python client to interact with the K8s API.
 """
 
 import asyncio
-import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 
@@ -62,7 +61,17 @@ def _get_core_api() -> client.CoreV1Api:
 
 
 def _default_namespace() -> str:
-    return os.environ.get("TERRAPOD_RUNNER_NAMESPACE", "terrapod-runners")
+    """Fallback runner namespace for call sites that don't pass one explicitly.
+
+    Sourced from the loaded RunnerConfig (the runners.yaml ConfigMap) — the
+    single source of truth per the config-channel contract. The listener's
+    launch/status/delete paths always pass the namespace explicitly; this is a
+    defensive fallback only. (It deliberately does NOT read an env var: the
+    chart delivers the runner namespace via the ConfigMap, not env.)
+    """
+    from terrapod.config import load_runner_config
+
+    return load_runner_config().runner_namespace
 
 
 async def create_job(job_spec: dict, namespace: str = "") -> str:
@@ -410,12 +419,24 @@ async def get_pod_logs(
         if limit_bytes is not None:
             log_kwargs["limit_bytes"] = limit_bytes
 
-        logs = await loop.run_in_executor(
+        # _preload_content=False so the kubernetes client returns the raw
+        # urllib3 HTTPResponse instead of round-tripping through its
+        # broken text-response deserializer (which calls str(bytes_obj),
+        # producing literal `b'...'`-prefixed garbage in the streaming
+        # log view — see #449 / v0.33.0 smoke).
+        log_kwargs["_preload_content"] = False
+        resp = await loop.run_in_executor(
             _executor,
             lambda: core_api.read_namespaced_pod_log(**log_kwargs),
         )
-        # Clear last_response to release the raw log string from K8s client memory
-        core_api.api_client.last_response = None
-        return logs
+        try:
+            data = resp.data
+            return data.decode("utf-8", errors="replace") if isinstance(data, bytes) else data
+        finally:
+            try:
+                resp.release_conn()
+            except Exception:
+                pass
+            core_api.api_client.last_response = None
     except ApiException:
         return ""

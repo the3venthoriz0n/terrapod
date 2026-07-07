@@ -27,6 +27,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from terrapod.api.dependencies import AuthenticatedUser, get_current_user, require_admin
+from terrapod.auth import capabilities as cap
+from terrapod.auth.capabilities import has_capability
 from terrapod.db.models import (
     Variable,
     VariableSet,
@@ -37,7 +39,9 @@ from terrapod.db.models import (
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
 from terrapod.services import variable_service
-from terrapod.services.workspace_rbac_service import has_permission, resolve_workspace_permission
+from terrapod.services.workspace_rbac_service import (
+    resolve_workspace_capabilities_for,
+)
 
 router = APIRouter(prefix="/api/v2", tags=["variables"])
 logger = get_logger(__name__)
@@ -96,8 +100,8 @@ async def list_workspace_vars(
 ) -> JSONResponse:
     """List all variables for a workspace. Requires read."""
     ws = await _get_workspace(workspace_id, db)
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
-    if not has_permission(perm, "read"):
+    caps = await resolve_workspace_capabilities_for(db, user, ws)
+    if not has_capability(caps, cap.VAR_READ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="Requires read permission on workspace"
         )
@@ -114,8 +118,8 @@ async def create_workspace_var(
 ) -> JSONResponse:
     """Create a variable for a workspace. Requires write."""
     ws = await _get_workspace(workspace_id, db)
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
-    if not has_permission(perm, "write"):
+    caps = await resolve_workspace_capabilities_for(db, user, ws)
+    if not has_capability(caps, cap.VAR_WRITE):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="Requires write permission on workspace"
         )
@@ -140,6 +144,10 @@ async def create_workspace_var(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
 
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(str(ws.id), "workspace_variable_change")
+
     return JSONResponse(content={"data": _var_json(var)}, status_code=201)
 
 
@@ -153,8 +161,8 @@ async def update_workspace_var(
 ) -> JSONResponse:
     """Update a workspace variable. Requires write."""
     ws = await _get_workspace(workspace_id, db)
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
-    if not has_permission(perm, "write"):
+    caps = await resolve_workspace_capabilities_for(db, user, ws)
+    if not has_capability(caps, cap.VAR_WRITE):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="Requires write permission on workspace"
         )
@@ -181,6 +189,10 @@ async def update_workspace_var(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
 
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(str(ws.id), "workspace_variable_change")
+
     return JSONResponse(content={"data": _var_json(var)})
 
 
@@ -193,8 +205,8 @@ async def delete_workspace_var(
 ) -> None:
     """Delete a workspace variable. Requires write."""
     ws = await _get_workspace(workspace_id, db)
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
-    if not has_permission(perm, "write"):
+    caps = await resolve_workspace_capabilities_for(db, user, ws)
+    if not has_capability(caps, cap.VAR_WRITE):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="Requires write permission on workspace"
         )
@@ -206,6 +218,10 @@ async def delete_workspace_var(
 
     await variable_service.delete_variable(db, var)
     await db.commit()
+
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(str(ws.id), "workspace_variable_change")
 
 
 # ── Variable Sets ────────────────────────────────────────────────────────
@@ -472,11 +488,20 @@ async def update_varset_var(
         vsv.category = attrs["category"]
     if "hcl" in attrs:
         vsv.hcl = attrs["hcl"]
+    was_sensitive = vsv.sensitive
     if "value" in attrs:
         vsv.value = attrs["value"]
         vsv.version_id = variable_service._version_hash(vsv.key, attrs["value"], vsv.category)
     if "sensitive" in attrs:
         vsv.sensitive = attrs["sensitive"]
+
+    # Security: a sensitive → non-sensitive downgrade must not expose the
+    # previously-hidden value. If no fresh value was supplied in the same
+    # request, clear it so the old secret is never returned in plaintext
+    # (mirrors variable_service.update_variable for workspace vars).
+    if was_sensitive and vsv.sensitive is False and "value" not in attrs:
+        vsv.value = ""
+        vsv.version_id = variable_service._version_hash(vsv.key, "", vsv.category)
 
     await db.commit()
     await db.refresh(vsv)

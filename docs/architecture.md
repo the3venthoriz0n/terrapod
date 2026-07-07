@@ -4,6 +4,22 @@ This document describes the internal architecture of Terrapod, covering system c
 
 ---
 
+## Why a single organization
+
+Terrapod is deliberately **single-organization**: there is exactly one implicit organization, always named `default`, and the concept is intentionally absent from the data model and API surface (there is no `org_name` column anywhere). This is a design choice, not a missing feature — the reasoning:
+
+**Organizations are a SaaS multi-tenancy mechanism.** In Terraform Cloud — a hosted, multi-tenant SaaS — an *organization* is the boundary that keeps many unrelated customers apart on shared infrastructure; each customer signs up as its own org. That boundary exists because the control plane is shared by parties who must never see each other's state.
+
+**Terrapod is self-hosted, so that boundary is already the deployment.** A Terrapod installation belongs to one team that runs it. The isolation an organization provides in SaaS is, here, provided by the install itself. When you genuinely need two *isolated tenants*, the answer is a **second Terrapod instance** — a second Helm release — which gives **stronger** isolation than org-scoping inside one database ever could: separate database, separate Redis, separate object storage, independent upgrade cadence, and independent blast radius. Org-scoping within a shared schema is a softer boundary (one bug, one bad query, one migration touches every tenant); separate installs are a hard one.
+
+**This is the direction HashiCorp itself now recommends.** Multiple organizations were Terraform Enterprise's original design for segmenting discrete lines of business, but current HashiCorp guidance steers *away* from it. The validated pattern [*Migrate Terraform Enterprise organizations to projects*](https://developer.hashicorp.com/validated-patterns/terraform/migrate-terraform-orgs-projects) recommends "minimizing organizations and leveraging projects to isolate RBAC, assign policy sets and variable sets, isolate VCS integrations and other features," noting that proliferating organizations "creates a significant maintenance burden on the platform team and introduces negative performance impacts." The modern TFE / HCP Terraform shape is **one organization, segmented internally** — not many organizations.
+
+**Terrapod takes the same shape, with labels instead of projects.** Where HashiCorp's guidance segments a single org with *projects* and *teams*, Terrapod segments with [label-based RBAC](rbac.md): roles match workspaces by label allow/deny rules (e.g. `team: payments` + `env: prod` → `write`), and the same labels drive filtering across the UI. A workspace can belong to any combination of dimensions rather than a single project, so labels cover the project/team segmentation use case — more flexibly — without the organization (or project, or team) hierarchy.
+
+**What you give up, and why it's worth it.** You cannot present several *named* organizations through one endpoint. In exchange, the platform sheds an entire axis of complexity — no org column on every table, no org-scoped RBAC and membership, no org switcher — that a single-company, self-hosted deployment does not need. If your requirement is truly multi-tenant (separate, mutually-distrusting tenants), run an instance per tenant; if it is segmentation within one company, labels already do it.
+
+---
+
 ## System Components
 
 ```
@@ -44,10 +60,10 @@ This document describes the internal architecture of Terrapod, covering system c
 
 | Component | Purpose | Implementation |
 |---|---|---|
-| **Next.js Web** | Single ingress entry point; serves UI pages and proxies API calls | Next.js 15, React 19, Tailwind CSS, Radix UI |
+| **Next.js Web** | Single ingress entry point; serves UI pages and proxies API calls | Next.js 16, React 19, Tailwind CSS, Radix UI |
 | **FastAPI API** | All business logic, TFE V2 API, auth, registry, VCS polling | Python 3.13+, FastAPI, SQLAlchemy async, Pydantic |
 | **Runner Listener** | Receives run events via SSE, creates K8s Jobs, reports status, streams logs | Same Python codebase as API, different entrypoint |
-| **Runner Jobs** | Ephemeral containers that execute `terraform` or `tofu` | Minimal Alpine image with curl/tar/jq |
+| **Runner Jobs** | Ephemeral containers that execute `terraform` or `tofu` | Slim Debian image (`python:3.13-slim`) with git/openssh-client/opa; pure-Python orchestrator |
 | **PostgreSQL** | Relational data: users, workspaces, state metadata, runs, registry | PostgreSQL 14+ |
 | **Redis** | Sessions, auth state, listener heartbeats, SSE event channels, Job status cache, API token role cache | Redis 7+ |
 | **Object Storage** | State files, config tarballs, plan outputs, logs, registry artifacts, cache | S3, Azure Blob, GCS, or filesystem |
@@ -208,16 +224,18 @@ Terrapod's execution layer follows the Actions Runner Controller (ARC) pattern: 
    - Returns short-lived HMAC-signed token scoped to run_id
         |
 5. Listener creates K8s Job in runner namespace
-   - Image: terrapod-runner (minimal Alpine)
+   - Image: terrapod-runner (slim Debian + python + git + opa)
    - Resources: from workspace config (cpu/memory requests + 2x limits)
-   - Env vars: workspace variables + Terraform vars
+   - Terraform vars: mounted tfvars file from the vars Secret (not env)
+   - Env vars: workspace env vars via secretKeyRef (values never in Job spec)
    - TP_AUTH_TOKEN via secretKeyRef (token never in Job spec)
    - Service account: per-pool SA > global runner config SA > K8s default
    - Azure Workload Identity pod label added when `runners.azureWorkloadIdentity: true`
         |
-6. Listener creates K8s Secret (tprun-{run_short}-auth)
-   - Contains the runner token
-   - ownerReference → Job (K8s GC deletes Secret when Job is cleaned up)
+6. Listener creates K8s Secrets (tprun-{run_short}-{phase}-auth + -vars)
+   - auth Secret: the runner token
+   - vars Secret: terraform.tfvars.json blob (mounted) + env var keys (secretKeyRef)
+   - ownerReference → Job (K8s GC deletes both Secrets when Job is cleaned up)
         |
 7. Listener reports Job name/namespace back to API ← LISTENER IS DONE
         |
@@ -242,20 +260,20 @@ Terrapod's execution layer follows the Actions Runner Controller (ARC) pattern: 
 
 ### Signal Forwarding and Graceful Termination
 
-Runner Jobs use a configurable `terminationGracePeriodSeconds` (default 120, set via `runners.terminationGracePeriodSeconds` in Helm). The entrypoint (`docker/runner-entrypoint.sh`) implements time-budgeted graceful shutdown with a SIGKILL watchdog:
+Runner Jobs use a configurable `terminationGracePeriodSeconds` (default 120, set via `runners.terminationGracePeriodSeconds` in Helm). The Python orchestrator (`services/terrapod/runner/job_entrypoint.py`) implements time-budgeted graceful shutdown with a SIGKILL watchdog:
 
 ```
-T=0: K8s sends SIGTERM to PID 1
+T=0: K8s sends SIGTERM to PID 1 (python -m terrapod.runner.job_entrypoint)
     |
     v
-runner-entrypoint.sh (traps SIGTERM/SIGQUIT)
+exec_subprocess.run signal handler (registered per terraform/tofu invocation)
     |
     v
 Forwards SIGINT to terraform/tofu child process
 (SIGINT is HashiCorp's recommended signal for containers)
     |                                          |
     v                                          v
-Terraform graceful shutdown            Background watchdog starts
+Terraform graceful shutdown            Background watchdog thread starts
 (finishes API call, writes state,      (sleeps CHILD_GRACE seconds,
  releases lock, exits)                  then sends SIGKILL if still running)
     |
@@ -263,9 +281,13 @@ Terraform graceful shutdown            Background watchdog starts
 T=0→T=95s: Wait for terraform to exit (or be killed by watchdog)
     |
     v
-T=95s→T=115s: Upload artifacts with --max-time bounds
-    - Apply/plan log upload (best-effort)
-    - State upload (FATAL — failure flags workspace as state-diverged)
+T=95s→T=115s: try/finally block in job_entrypoint.main runs the
+              EXIT-trap equivalent:
+    - Roll per-phase logs (init.log, plan.log, apply.log) into the
+      combined log via LogCapture.append_file
+    - upload_combined_log → /artifacts/{phase}-log
+    - resource_profile.post_profile → /resource-profile (cgroup peak
+      memory + cumulative CPU, plus the run's exit code)
     |
     v
 T=120s: K8s SIGKILL deadline
@@ -274,10 +296,10 @@ T=120s: K8s SIGKILL deadline
 **Key design decisions:**
 - **SIGINT, not SIGTERM**: HashiCorp recommends SIGINT for container graceful shutdown. A second signal (INT or TERM) causes ungraceful abort that may skip state writing entirely
 - **SIGKILL watchdog**: Only one signal is ever sent. If terraform hangs, the watchdog escalates to SIGKILL after `CHILD_GRACE` seconds
-- **State upload is fatal**: If state upload fails after a successful apply, the entrypoint calls `POST /api/terrapod/v1/runs/{run_id}/state-diverged` to flag the workspace and exits with code 1
+- **State upload is fatal**: If state upload fails after a successful apply, the apply phase calls `POST /api/terrapod/v1/runs/{run_id}/state-diverged` to flag the workspace and the orchestrator exits non-zero
 - **Time budget**: `TP_TERMINATION_GRACE` env var (from Helm `runners.terminationGracePeriodSeconds`) partitions the K8s grace period between terraform shutdown and artifact uploads (25s reserved for uploads)
 
-The entrypoint script is at `docker/runner-entrypoint.sh`.
+The orchestrator is `services/terrapod/runner/job_entrypoint.py`; each phase is its own module under `services/terrapod/runner/phases/`.
 
 ### Agent Pools and Listeners
 

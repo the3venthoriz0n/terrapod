@@ -16,14 +16,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from terrapod.api.metrics import BINARY_CACHE_REQUESTS
 from terrapod.config import settings
 from terrapod.db.models import CachedBinary
+from terrapod.http_retry import arequest_with_retry
 from terrapod.logging_config import get_logger
+from terrapod.services.artifact_verification import VerificationError, verify_binary
+from terrapod.services.cache_errors import CacheOnlyError
 from terrapod.services.hashing_stream import HashingStream
-from terrapod.storage.keys import binary_cache_key
+from terrapod.storage.keys import (
+    binary_cache_key,
+    binary_cache_sums_key,
+    binary_cache_sums_sig_key,
+)
 from terrapod.storage.protocol import ObjectStore
 
 logger = get_logger(__name__)
 
-VALID_TOOLS = {"terraform", "tofu"}
+VALID_TOOLS = {"terraform", "tofu", "terragrunt"}
 VALID_OS = {"linux", "darwin", "windows", "freebsd", "openbsd", "solaris"}
 VALID_ARCH = {"amd64", "arm64", "arm", "386"}
 
@@ -93,6 +100,67 @@ def _version_sort_key(v: str) -> tuple:
     return base_parts + (tier_rank, tier_num)
 
 
+def _sealed() -> bool:
+    """Sealed (cache-only) mode — never fetch upstream."""
+    return settings.registry.cache_only
+
+
+async def _cached_versions(db: AsyncSession, tool: str) -> list[str]:
+    """Distinct versions present in the binary cache for a tool, newest first
+    (with major.minor shortcuts), shaped like ``list_available_versions``."""
+    result = await db.execute(
+        select(CachedBinary.version).where(CachedBinary.tool == tool).distinct()
+    )
+    versions = sorted({row[0] for row in result.all()}, key=_version_sort_key, reverse=True)
+    shortcuts: list[str] = []
+    seen: set[str] = set()
+    for v in versions:
+        parts = v.split(".")
+        if len(parts) >= 2:
+            sc = f"{parts[0]}.{parts[1]}"
+            if sc not in seen:
+                seen.add(sc)
+                shortcuts.append(sc)
+    return shortcuts + versions
+
+
+def _pick_cached_version(full: list[str], partial: str) -> str | None:
+    """Pick the best match for a partial version from a NEWEST-FIRST list of
+    full x.y.z versions. Empty/'latest' → newest; 'x.y' → newest 'x.y.*';
+    exact 'x.y.z' → itself. Returns None when nothing matches. Pure (no I/O)."""
+    want = (partial or "").strip()
+    if want and want.lower() != "latest" and len(want.split(".")) >= 3:
+        return want  # exact — honoured; cache lookup errors later if absent
+    candidates = full
+    if want and want.lower() != "latest":
+        prefix = want + "."
+        candidates = [v for v in full if v.startswith(prefix)]
+    return candidates[0] if candidates else None
+
+
+async def _sealed_resolve(tool: str, partial: str) -> str:
+    """Resolve a partial version against ONLY cached entries (sealed mode).
+
+    Picks the highest cached x.y.z matching the partial; an exact x.y.z is
+    returned as-is (the subsequent cache lookup surfaces an actionable error if
+    it isn't present). Raises CacheOnlyError when nothing cached matches.
+    """
+    from terrapod.db.session import get_db_session
+
+    async with get_db_session() as db:
+        full = [v for v in await _cached_versions(db, tool) if len(v.split(".")) >= 3]
+
+    picked = _pick_cached_version(full, partial)
+    if picked is not None:
+        return picked
+
+    raise CacheOnlyError(
+        f"No cached {tool} version matches {partial or 'latest'!r} and sealed "
+        f"(cache_only) mode is enabled. Pre-populate it via the bulk-warm admin "
+        f"endpoint before sealing, or disable registry.cache_only."
+    )
+
+
 async def get_or_cache_binary(
     db: AsyncSession,
     storage: ObjectStore,
@@ -131,8 +199,18 @@ async def get_or_cache_binary(
         presigned = await storage.presigned_get_url(key)
         return presigned.url
 
-    # Cache miss — fetch from upstream
+    # Cache miss
     BINARY_CACHE_REQUESTS.labels(tool=tool, result="miss").inc()
+
+    # Sealed (cache-only) mode: never fetch upstream — surface an actionable error.
+    if _sealed():
+        raise CacheOnlyError(
+            f"{tool} {version} ({os_}/{arch}) is not in the cache and sealed "
+            f"(cache_only) mode is enabled. Pre-populate it via the bulk-warm admin "
+            f"endpoint (POST /api/terrapod/v1/admin/binary-cache/warm-bulk) before "
+            f"sealing, or disable registry.cache_only."
+        )
+
     logger.info(
         "Binary cache miss, fetching from upstream",
         tool=tool,
@@ -143,12 +221,49 @@ async def get_or_cache_binary(
 
     if tool == "terraform":
         download_url = _terraform_download_url(version, os_, arch)
+    elif tool == "terragrunt":
+        download_url = _terragrunt_download_url(version, os_, arch)
     else:
         download_url = _tofu_download_url(version, os_, arch)
 
-    # Stream directly to object storage
+    # Stream directly to object storage. terraform/tofu ship a zip; terragrunt
+    # ships a bare per-platform binary, so the stored content type differs.
     key = binary_cache_key(tool, version, os_, arch)
-    shasum, size_bytes = await _fetch_and_store_binary(storage, key, download_url)
+    content_type = "application/octet-stream" if tool == "terragrunt" else "application/zip"
+    shasum, size_bytes = await _fetch_and_store_binary(
+        storage, key, download_url, content_type=content_type
+    )
+
+    # Integrity gate (#607): verify the downloaded binary against the publisher's
+    # signed SHA256SUMS before recording it. The DB row is what gates serving
+    # (no row → cache miss → never returned), so verifying before the INSERT
+    # below means a tampered binary is never served. On failure we also delete
+    # the just-written object so it doesn't linger orphaned in storage. The
+    # binary is *executed* on every run, so this is fail-closed by default.
+    verify_level = settings.registry.binary_cache.verify
+    if verify_level != "off":
+        try:
+            async with httpx.AsyncClient(follow_redirects=True) as vclient:
+                manifest, sig = await verify_binary(
+                    vclient, tool, version, os_, arch, shasum, level=verify_level
+                )
+        except VerificationError:
+            await storage.delete(key)
+            BINARY_CACHE_REQUESTS.labels(tool=tool, result="verify_failed").inc()
+            raise
+        # Persist the signed manifest + sig so the runner can independently
+        # re-verify the executable against the publisher's signature with its
+        # own pinned key — no upstream reach needed (#607). Only when we have
+        # both (signature mode); checksum mode has no sig to serve.
+        if sig is not None:
+            await storage.put(
+                binary_cache_sums_key(tool, version), manifest, content_type="text/plain"
+            )
+            await storage.put(
+                binary_cache_sums_sig_key(tool, version),
+                sig,
+                content_type="application/pgp-signature",
+            )
 
     # Record in database. Two concurrent cache misses for the same
     # (tool, version, os, arch) — typical when two runners spin up
@@ -191,6 +306,45 @@ async def get_or_cache_binary(
 
     presigned = await storage.presigned_get_url(key)
     return presigned.url
+
+
+async def get_or_cache_sums(storage: ObjectStore, tool: str, version: str) -> tuple[bytes, bytes]:
+    """Return the (SHA256SUMS, detached-sig) bytes for a tool/version (#607).
+
+    Serves the runner's cache-path executable verification: the runner fetches
+    these and re-verifies the downloaded binary against the publisher signature
+    with its own pinned key. Lazily fetches from upstream + verifies + persists
+    if not already cached (e.g. a binary cached before this feature shipped).
+    Raises on unverifiable/unavailable material — fail closed.
+    """
+    if tool not in VALID_TOOLS:
+        raise ValueError(f"Invalid tool: {tool}. Must be one of {VALID_TOOLS}")
+
+    sums_key = binary_cache_sums_key(tool, version)
+    sig_key = binary_cache_sums_sig_key(tool, version)
+    if await storage.exists(sums_key) and await storage.exists(sig_key):
+        return await storage.get(sums_key), await storage.get(sig_key)
+
+    # Sealed (cache-only) mode: never fetch the manifest/sig from upstream.
+    if _sealed():
+        raise CacheOnlyError(
+            f"SHA256SUMS for {tool} {version} are not cached and sealed (cache_only) "
+            f"mode is enabled. They are persisted when the binary is warmed under "
+            f"verify=signature — re-warm it before sealing, or disable registry.cache_only."
+        )
+
+    # Not persisted yet — fetch from upstream, verify the signature against the
+    # pinned publisher key, persist, and return. Import locally to avoid a
+    # module-load cycle (artifact_verification imports config, not this module).
+    from terrapod.services.artifact_verification import fetch_sums_and_sig
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        manifest, sig = await fetch_sums_and_sig(client, tool, version, level="signature")
+    if sig is None:  # pragma: no cover - signature level always returns a sig
+        raise ValueError("no signature available for SHA256SUMS")
+    await storage.put(sums_key, manifest, content_type="text/plain")
+    await storage.put(sig_key, sig, content_type="application/pgp-signature")
+    return manifest, sig
 
 
 async def list_cached_binaries(
@@ -236,8 +390,13 @@ async def warm_binary(
     os_: str,
     arch: str,
 ) -> str:
-    """Pre-warm a binary into the cache. Returns presigned URL."""
-    return await get_or_cache_binary(db, storage, tool, version, os_, arch)
+    """Pre-warm a binary into the cache. Returns presigned URL.
+
+    Resolves a partial version (e.g. "1.12" → "1.12.3") first, so warm
+    manifests / bulk-warm entries can use major.minor like the CLI does.
+    """
+    resolved = await resolve_version(tool, version)
+    return await get_or_cache_binary(db, storage, tool, resolved, os_, arch)
 
 
 # --- Available Versions ---
@@ -251,6 +410,13 @@ async def list_available_versions(tool: str) -> list[str]:
     """
     if tool not in VALID_TOOLS:
         raise ValueError(f"Invalid tool: {tool}. Must be one of {VALID_TOOLS}")
+
+    # Sealed mode: list ONLY cached versions, never the upstream index.
+    if _sealed():
+        from terrapod.db.session import get_db_session
+
+        async with get_db_session() as db:
+            return await _cached_versions(db, tool)
 
     # Check Redis cache
     cache_key = f"tp:versions:{tool}"
@@ -269,6 +435,8 @@ async def list_available_versions(tool: str) -> list[str]:
 
     if tool == "terraform":
         versions = await _fetch_terraform_versions()
+    elif tool == "terragrunt":
+        versions = await _fetch_terragrunt_versions()
     else:
         versions = await _fetch_tofu_versions()
 
@@ -303,14 +471,19 @@ async def list_available_versions(tool: str) -> list[str]:
 
 
 async def _fetch_terraform_versions() -> list[str]:
-    """Fetch terraform versions from releases.hashicorp.com.
+    """Fetch terraform versions from the configured terraform version index
+    (default releases.hashicorp.com; overridable via
+    `binary_cache.terraform_version_index_url` for internal mirrors).
 
     Filters by the configured allow_prerelease policy: stable-only by default,
     or includes rc/beta/alpha/dev tiers down to the configured floor.
     """
-    url = "https://releases.hashicorp.com/terraform/index.json"
+    url = settings.registry.binary_cache.terraform_version_index_url
     async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(url)
+        # Upstream GET — idempotent by method; retried on flaky-upstream
+        # transient failures (connection errors, read-timeouts, 5xx).
+        # trust_env (httpx default) routes via the configured proxy/CA (#592).
+        resp = await arequest_with_retry(client, "GET", url)
         resp.raise_for_status()
         data = resp.json()
 
@@ -325,16 +498,53 @@ async def _fetch_terraform_versions() -> list[str]:
     return versions
 
 
-async def _fetch_tofu_versions() -> list[str]:
-    """Fetch tofu versions from GitHub releases.
+# Official OpenTofu version index (the default for tofu_version_index_url) — the
+# same one OpenTofu's own installer uses. We resolve tofu versions from here
+# instead of the GitHub releases API, which is rate-limited (60 req/hr
+# unauthenticated) and routinely 504s from CI/cloud IPs. When that listing
+# failed, the binary cache could not resolve a partial version (e.g. "1.12") and
+# 502'd the runner, which then dead-ended because it had no fully-qualified
+# version to fall back on (#338). This CDN-backed static JSON is not
+# rate-limited. Version ids carry NO leading "v" and include pre-releases as
+# "x.y.z-suffix", so the allow_prerelease policy still applies on the string.
+# Operators can override the source via `binary_cache.tofu_version_index_url`
+# (an internal mirror must serve the same `{"versions": [{"id": ...}]}` shape).
 
-    Filters by the configured allow_prerelease policy. GitHub's
-    `prerelease` flag is the authoritative signal for pre-release status;
-    the policy is applied on top of it.
-    """
-    url = "https://api.github.com/repos/opentofu/opentofu/releases"
+
+async def _fetch_tofu_version_ids() -> list[str]:
+    """Return every OpenTofu release version id from the configured index."""
+    url = settings.registry.binary_cache.tofu_version_index_url
     async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(url, params={"per_page": 100})
+        # trust_env (httpx default) routes via the configured proxy/CA (#592).
+        resp = await arequest_with_retry(client, "GET", url)
+        resp.raise_for_status()
+        data = resp.json()
+    return [v["id"] for v in data.get("versions", []) if v.get("id")]
+
+
+async def _fetch_tofu_versions() -> list[str]:
+    """Fetch the list of installable tofu versions (allow_prerelease applied)."""
+    policy = settings.registry.binary_cache.allow_prerelease
+    versions = []
+    for version in await _fetch_tofu_version_ids():
+        if not _is_version_allowed(version, policy):
+            continue
+        parts = version.split("-")[0].split(".")
+        if len(parts) >= 3:
+            versions.append(version)
+    return versions
+
+
+async def _fetch_terragrunt_versions() -> list[str]:
+    """Fetch terragrunt versions from GitHub releases (gruntwork-io/terragrunt).
+
+    Same shape as `_fetch_tofu_versions`: GitHub's `prerelease` flag plus the
+    configured allow_prerelease policy gate which versions are offered.
+    """
+    url = settings.registry.binary_cache.terragrunt_version_index_url
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # trust_env (httpx default) routes via the configured proxy/CA (#592).
+        resp = await arequest_with_retry(client, "GET", url, params={"per_page": 100})
         resp.raise_for_status()
         releases = resp.json()
 
@@ -364,6 +574,10 @@ async def resolve_version(tool: str, partial_version: str) -> str:
 
     Results are cached in Redis for 1 hour.
     """
+    # Sealed mode: resolve ONLY against cached entries, never the upstream index.
+    if _sealed():
+        return await _sealed_resolve(tool, partial_version)
+
     # Normalize empty, None, or "latest" to the latest stable release
     if not partial_version or partial_version.strip().lower() == "latest":
         versions = await list_available_versions(tool)
@@ -394,6 +608,8 @@ async def resolve_version(tool: str, partial_version: str) -> str:
         resolved = await _resolve_terraform_version(partial_version)
     elif tool == "tofu":
         resolved = await _resolve_tofu_version(partial_version)
+    elif tool == "terragrunt":
+        resolved = await _resolve_terragrunt_version(partial_version)
     else:
         return partial_version
 
@@ -416,17 +632,19 @@ async def resolve_version(tool: str, partial_version: str) -> str:
 
 
 async def _resolve_terraform_version(partial: str) -> str:
-    """Resolve partial terraform version via releases.hashicorp.com index.
+    """Resolve partial terraform version via the configured terraform version
+    index (default releases.hashicorp.com; see terraform_version_index_url).
 
     Honors the allow_prerelease policy: pre-release versions are only
     considered when explicitly permitted.
     """
-    url = "https://releases.hashicorp.com/terraform/index.json"
+    url = settings.registry.binary_cache.terraform_version_index_url
     prefix = f"{partial}."
     policy = settings.registry.binary_cache.allow_prerelease
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(url)
+        # trust_env (httpx default) routes via the configured proxy/CA (#592).
+        resp = await arequest_with_retry(client, "GET", url)
         resp.raise_for_status()
         data = resp.json()
 
@@ -448,17 +666,43 @@ async def _resolve_terraform_version(partial: str) -> str:
 
 
 async def _resolve_tofu_version(partial: str) -> str:
-    """Resolve partial tofu version via GitHub releases API.
+    """Resolve a partial tofu version (e.g. "1.12") to the highest matching
+    exact release via the official OpenTofu version index (#338).
 
     Honors the allow_prerelease policy: pre-release versions are only
     considered when explicitly permitted.
     """
-    url = "https://api.github.com/repos/opentofu/opentofu/releases"
+    prefix = f"{partial}."  # index ids carry no leading "v"
+    policy = settings.registry.binary_cache.allow_prerelease
+
+    matching = []
+    for version in await _fetch_tofu_version_ids():
+        if not version.startswith(prefix):
+            continue
+        if not _is_version_allowed(version, policy):
+            continue
+        matching.append(version)
+
+    if not matching:
+        logger.warning("No matching tofu version found", partial=partial, policy=policy)
+        return partial
+
+    matching.sort(key=_version_sort_key)
+    return matching[-1]
+
+
+async def _resolve_terragrunt_version(partial: str) -> str:
+    """Resolve partial terragrunt version via GitHub releases (gruntwork-io/terragrunt).
+
+    Mirrors `_resolve_tofu_version`; honors the allow_prerelease policy.
+    """
+    url = settings.registry.binary_cache.terragrunt_version_index_url
     prefix = f"v{partial}."
     policy = settings.registry.binary_cache.allow_prerelease
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(url, params={"per_page": 100})
+        # trust_env (httpx default) routes via the configured proxy/CA (#592).
+        resp = await arequest_with_retry(client, "GET", url, params={"per_page": 100})
         resp.raise_for_status()
         releases = resp.json()
 
@@ -473,7 +717,7 @@ async def _resolve_tofu_version(partial: str) -> str:
         matching.append(version)
 
     if not matching:
-        logger.warning("No matching tofu version found", partial=partial, policy=policy)
+        logger.warning("No matching terragrunt version found", partial=partial, policy=policy)
         return partial
 
     matching.sort(key=_version_sort_key)
@@ -515,7 +759,24 @@ def _tofu_download_url(version: str, os_: str, arch: str) -> str:
     return f"{cfg.tofu_mirror_url}/v{version}/{filename}"
 
 
-async def _fetch_and_store_binary(storage: ObjectStore, key: str, url: str) -> tuple[str, int]:
+def _terragrunt_download_url(version: str, os_: str, arch: str) -> str:
+    """Build the upstream download URL for a terragrunt binary.
+
+    Terragrunt releases a bare per-platform binary (not a zip/tarball):
+    `terragrunt_<os>_<arch>` under the GitHub release `v<version>` tag. The
+    os/arch tokens match Terrapod's (linux/darwin/windows × amd64/arm64).
+    """
+    cfg = settings.registry.binary_cache
+    filename = f"terragrunt_{os_}_{arch}"
+    return f"{cfg.terragrunt_mirror_url}/v{version}/{filename}"
+
+
+async def _fetch_and_store_binary(
+    storage: ObjectStore,
+    key: str,
+    url: str,
+    content_type: str = "application/zip",
+) -> tuple[str, int]:
     """Stream a binary from upstream directly into object storage.
 
     Returns (sha256_hex, size_bytes).
@@ -524,5 +785,5 @@ async def _fetch_and_store_binary(storage: ObjectStore, key: str, url: str) -> t
         async with client.stream("GET", url, timeout=300.0) as resp:
             resp.raise_for_status()
             stream = HashingStream(resp)
-            await storage.put_stream(key, stream, content_type="application/zip")
+            await storage.put_stream(key, stream, content_type=content_type)
             return stream.sha256_hex, stream.size

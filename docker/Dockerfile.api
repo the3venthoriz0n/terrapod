@@ -4,7 +4,7 @@
 # Multi-stage: builder has gcc for compiling C extensions (asyncpg),
 # runtime image is slim with only runtime libraries.
 
-FROM python:3.14-slim AS builder
+FROM python:3.13-slim AS builder
 
 # Install build + runtime dependencies
 # apt-get upgrade picks up security patches for base OS packages
@@ -45,7 +45,7 @@ RUN "$POETRY_HOME"/bin/poetry lock --no-interaction --no-ansi \
     && pip install --no-cache-dir -r /tmp/requirements.txt
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
-FROM python:3.14-slim
+FROM python:3.13-slim
 LABEL org.opencontainers.image.source=https://github.com/mattrobinsonsre/terrapod
 
 # Runtime-only system libraries (no gcc, no -dev headers)
@@ -57,11 +57,12 @@ LABEL org.opencontainers.image.source=https://github.com/mattrobinsonsre/terrapo
 # CVE-2026-27135). Without this the apt-upgrade layer is reused from
 # before the patch was published — same cache-staleness issue the
 # runner image's APK_REFRESH solves.
-ARG APT_REFRESH=2026-06-04
+ARG APT_REFRESH=2026-06-26
 RUN echo "apt-refresh=${APT_REFRESH}" \
     && apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     curl \
     git \
+    postgresql-client \
     xmlsec1 \
     libxmlsec1-openssl \
     && rm -rf /var/lib/apt/lists/*
@@ -72,11 +73,11 @@ RUN echo "apt-refresh=${APT_REFRESH}" \
 # OPA version via the image tag — see docs/policies.md). TARGETARCH is set
 # by buildx; fall back to dpkg for a plain `docker build`.
 ARG TARGETARCH
-ARG OPA_VERSION=1.16.2
+ARG OPA_VERSION=1.18.0
 RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
     && BASE="https://github.com/open-policy-agent/opa/releases/download/v${OPA_VERSION}" \
-    && curl -fsSL -o /usr/local/bin/opa "${BASE}/opa_linux_${ARCH}_static" \
-    && curl -fsSL -o /tmp/opa.sha256 "${BASE}/opa_linux_${ARCH}_static.sha256" \
+    && curl -fsSL --retry 6 --retry-delay 4 --retry-all-errors -o /usr/local/bin/opa "${BASE}/opa_linux_${ARCH}_static" \
+    && curl -fsSL --retry 6 --retry-delay 4 --retry-all-errors -o /tmp/opa.sha256 "${BASE}/opa_linux_${ARCH}_static.sha256" \
     && echo "$(cut -d' ' -f1 /tmp/opa.sha256)  /usr/local/bin/opa" | sha256sum -c - \
     && rm /tmp/opa.sha256 \
     && chmod 0755 /usr/local/bin/opa \
@@ -85,7 +86,7 @@ RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
 WORKDIR /app
 
 # Copy installed Python packages from builder
-COPY --from=builder /usr/local/lib/python3.14/site-packages /usr/local/lib/python3.14/site-packages
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy application code

@@ -3,7 +3,7 @@
 # Only includes httpx, kubernetes, prometheus-client, structlog, pydantic.
 # No cloud SDKs, no SQLAlchemy, no authlib, no SAML.
 
-FROM python:3.14-slim AS builder
+FROM python:3.13-slim AS builder
 
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     pkg-config \
@@ -16,12 +16,12 @@ COPY services/pyproject-listener.toml pyproject.toml
 RUN pip install --no-cache-dir .
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
-FROM python:3.14-slim
+FROM python:3.13-slim
 LABEL org.opencontainers.image.source=https://github.com/mattrobinsonsre/terrapod
 
 # Bump APT_REFRESH to bust the cached apt layer and re-pull Debian
 # security patches (CVE-2026-27135 etc.) — see Dockerfile.api.
-ARG APT_REFRESH=2026-06-04
+ARG APT_REFRESH=2026-06-26
 RUN echo "apt-refresh=${APT_REFRESH}" \
     && apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     curl \
@@ -30,12 +30,13 @@ RUN echo "apt-refresh=${APT_REFRESH}" \
 WORKDIR /app
 
 # Copy installed Python packages from builder
-COPY --from=builder /usr/local/lib/python3.14/site-packages /usr/local/lib/python3.14/site-packages
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Only the modules the listener imports: config, logging_config, runner/
+# Only the modules the listener imports: config, logging_config, http_retry, runner/
 COPY services/terrapod/config.py ./terrapod/config.py
 COPY services/terrapod/logging_config.py ./terrapod/logging_config.py
+COPY services/terrapod/http_retry.py ./terrapod/http_retry.py
 COPY services/terrapod/runner/ ./terrapod/runner/
 
 # Create non-root user and data directories

@@ -25,7 +25,9 @@ from pathlib import Path
 import httpx
 
 from terrapod.config import settings
+from terrapod.http_retry import arequest_with_retry
 from terrapod.logging_config import get_logger
+from terrapod.services.cache_errors import CacheOnlyError
 from terrapod.services.hashing_stream import HashingStream
 from terrapod.storage.keys import (
     platform_provider_binary_key,
@@ -134,6 +136,11 @@ async def get_download_info(
     shasums_sig_key = platform_provider_shasums_sig_key(version)
     filename = f"terraform-provider-terrapod_{version}_{os_}_{arch}.zip"
 
+    # Sealed (cache-only) mode: never fetch the platform provider from GitHub.
+    # The binary + SHA256SUMS must already be cached; otherwise surface an
+    # actionable error rather than reaching upstream (#606).
+    sealed = settings.registry.cache_only
+
     # Check if binary is already cached
     if await storage.exists(binary_key):
         logger.debug(
@@ -141,6 +148,12 @@ async def get_download_info(
             version=version,
             os=os_,
             arch=arch,
+        )
+    elif sealed:
+        raise CacheOnlyError(
+            f"The platform terrapod provider {version} ({os_}/{arch}) is not cached "
+            f"and sealed (cache_only) mode is enabled. Pre-populate it before sealing, "
+            f"or disable registry.cache_only."
         )
     else:
         # Cache miss — fetch from GitHub Release
@@ -154,10 +167,16 @@ async def get_download_info(
 
     # Ensure SHA256SUMS is cached (fetch once per version)
     if not await storage.exists(shasums_key):
+        if sealed:
+            raise CacheOnlyError(
+                f"SHA256SUMS for the platform terrapod provider {version} are not cached "
+                f"and sealed (cache_only) mode is enabled. Pre-populate the provider "
+                f"before sealing, or disable registry.cache_only."
+            )
         await _fetch_and_cache_shasums(storage, version, shasums_key)
 
     # Ensure SHA256SUMS.sig is cached (fetch once per version, optional)
-    if not await storage.exists(shasums_sig_key):
+    if not await storage.exists(shasums_sig_key) and not sealed:
         await _fetch_and_cache_shasums_sig(storage, version, shasums_sig_key)
 
     # Generate presigned URL for the binary
@@ -213,7 +232,9 @@ async def _fetch_and_cache_shasums(
     filename = f"terraform-provider-terrapod_{version}_SHA256SUMS"
     url = _release_url(version, filename)
     async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as http:
-        resp = await http.get(url)
+        # Upstream GET from GitHub Releases — idempotent by method; retried
+        # on transient connection/read-timeout/5xx failures.
+        resp = await arequest_with_retry(http, "GET", url)
         if resp.status_code != 200:
             logger.warning(
                 "SHA256SUMS not available upstream",
@@ -235,7 +256,7 @@ async def _fetch_and_cache_shasums_sig(
     filename = f"terraform-provider-terrapod_{version}_SHA256SUMS.sig"
     url = _release_url(version, filename)
     async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as http:
-        resp = await http.get(url)
+        resp = await arequest_with_retry(http, "GET", url)
         if resp.status_code != 200:
             logger.debug(
                 "SHA256SUMS.sig not available upstream",

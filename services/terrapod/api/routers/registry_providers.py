@@ -14,30 +14,48 @@ CLI Protocol:
     GET  /api/v2/registry/providers/{namespace}/{name}/versions
     GET  /api/v2/registry/providers/{namespace}/{name}/{version}/download/{os}/{arch}
 
-TFE V2 Management:
+TFE V2 Management + client-signed publish (no presigned URLs, no finalize):
     POST   /api/terrapod/v1/registry-providers
     GET    /api/terrapod/v1/registry-providers
     GET    /api/terrapod/v1/registry-providers/private/default/{name}
     DELETE /api/terrapod/v1/registry-providers/private/default/{name}
-    POST   .../private/default/{name}/versions
     GET    .../private/default/{name}/versions
     DELETE .../private/default/{name}/versions/{ver}
-    POST   .../private/default/{name}/versions/{ver}/platforms
+    PUT    .../private/default/{name}/versions/{ver}/shasums         (client manifest)
+    PUT    .../private/default/{name}/versions/{ver}/shasums.sig     (signature; trust gate)
+    PUT    .../private/default/{name}/versions/{ver}/platforms/{os}/{arch}  (streamed zip)
     GET    .../private/default/{name}/versions/{ver}/platforms
     DELETE .../private/default/{name}/versions/{ver}/platforms/{os}/{arch}
+
+Publishing is client-signed and CLI-only (terrapod-publish): the browser UI
+is read-only for versions. The old presigned create-version / create-platform
+POSTs and the server-signed `/upload` PUT were removed.
 """
 
-import uuid
+import asyncio
+import hashlib
+import os
+import tempfile
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from terrapod.api.dependencies import AuthenticatedUser, get_current_user, require_non_runner
+from terrapod.api.dependencies import (
+    AuthenticatedUser,
+    effective_platform_roles,
+    get_current_user,
+    require_non_runner,
+)
 from terrapod.api.labels import validate_labels
+from terrapod.api.serialization import rfc3339
+from terrapod.auth import capabilities as cap
+from terrapod.auth.capabilities import has_capability
+from terrapod.config import settings
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
+from terrapod.services.cache_errors import CacheOnlyError
 from terrapod.services.platform_provider_service import (
     get_download_info as platform_get_download_info,
 )
@@ -45,9 +63,8 @@ from terrapod.services.platform_provider_service import (
     get_version_list as platform_get_version_list,
 )
 from terrapod.services.registry_provider_service import (
+    PublishValidationError,
     create_provider,
-    create_provider_platform,
-    create_provider_version,
     delete_provider,
     delete_provider_platform,
     delete_provider_version,
@@ -57,12 +74,12 @@ from terrapod.services.registry_provider_service import (
     list_provider_platforms,
     list_provider_versions,
     list_providers,
-    upload_provider_binary,
+    record_provider_binary,
+    store_and_verify_provider_sig,
+    store_provider_shasums,
 )
 from terrapod.services.registry_rbac_service import (
-    REGISTRY_PERMISSION_HIERARCHY,
-    has_registry_permission,
-    resolve_registry_permission,
+    resolve_registry_capabilities_for,
 )
 from terrapod.storage import get_storage
 from terrapod.storage.protocol import ObjectStore
@@ -93,37 +110,11 @@ class CreateProviderRequest(BaseModel):
     data: Data
 
 
-class CreateProviderVersionRequest(BaseModel):
-    class Data(BaseModel):
-        class Attributes(BaseModel):
-            version: str
-            key_id: str = ""
-            protocols: list[str] = ["5.0"]
-
-        type: str = "registry-provider-versions"
-        attributes: Attributes
-
-    data: Data
-
-
-class CreateProviderPlatformRequest(BaseModel):
-    class Data(BaseModel):
-        class Attributes(BaseModel):
-            os: str
-            arch: str
-            filename: str
-
-        type: str = "registry-provider-platforms"
-        attributes: Attributes
-
-    data: Data
-
-
 # --- JSON:API serialization ---
 
 
-def _provider_to_jsonapi(provider, effective_permission: str | None = None) -> dict:  # type: ignore[no-untyped-def]
-    perm = effective_permission
+def _provider_to_jsonapi(provider, caps: frozenset[str] | None = None) -> dict:  # type: ignore[no-untyped-def]
+    caps = caps or frozenset()
     return {
         "id": str(provider.id),
         "type": "registry-providers",
@@ -132,12 +123,12 @@ def _provider_to_jsonapi(provider, effective_permission: str | None = None) -> d
             "namespace": provider.namespace,
             "labels": provider.labels or {},
             "owner-email": provider.owner_email,
-            "created-at": provider.created_at.isoformat() if provider.created_at else None,
-            "updated-at": provider.updated_at.isoformat() if provider.updated_at else None,
+            "created-at": rfc3339(provider.created_at),
+            "updated-at": rfc3339(provider.updated_at),
             "permissions": {
-                "can-update": has_registry_permission(perm, "admin"),
-                "can-destroy": has_registry_permission(perm, "admin"),
-                "can-create-version": has_registry_permission(perm, "write"),
+                "can-update": has_capability(caps, cap.REGISTRY_ADMIN),
+                "can-destroy": has_capability(caps, cap.REGISTRY_ADMIN),
+                "can-create-version": has_capability(caps, cap.REGISTRY_WRITE),
             },
         },
     }
@@ -156,7 +147,7 @@ def _version_to_jsonapi(version, upload_links: dict | None = None) -> dict:  # t
             "shasums-uploaded": version.shasums_uploaded,
             "shasums-sig-uploaded": version.shasums_sig_uploaded,
             "platforms": platforms,
-            "created-at": version.created_at.isoformat() if version.created_at else None,
+            "created-at": rfc3339(version.created_at),
         },
     }
     if upload_links:
@@ -184,26 +175,24 @@ def _platform_to_jsonapi(platform, upload_link: str | None = None) -> dict:  # t
 # --- Helper ---
 
 
-async def _require_provider_permission(
+async def _require_provider_capability(
     db: AsyncSession,
     user: AuthenticatedUser,
     provider,
-    required: str,
+    required_cap: str,
 ) -> None:
-    """Check registry permission on a provider or raise 403."""
-    perm = await resolve_registry_permission(
+    """Check the required registry capability on a provider or raise 403."""
+    caps = await resolve_registry_capabilities_for(
         db,
-        user.email,
-        user.roles,
+        user,
         provider.name,
         provider.labels or {},
         provider.owner_email,
-        auth_method=user.auth_method,
     )
-    if not has_registry_permission(perm, required):
+    if not has_capability(caps, required_cap):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Requires {required} permission on provider",
+            detail=f"Requires {required_cap} capability on provider",
         )
 
 
@@ -231,16 +220,14 @@ async def list_provider_versions_cli(
     if provider is None:
         raise HTTPException(status_code=404, detail="Provider not found")
 
-    perm = await resolve_registry_permission(
+    caps = await resolve_registry_capabilities_for(
         db,
-        user.email,
-        user.roles,
+        user,
         provider.name,
         provider.labels or {},
         provider.owner_email,
-        auth_method=user.auth_method,
     )
-    if not has_registry_permission(perm, "read"):
+    if not has_capability(caps, cap.REGISTRY_READ):
         raise HTTPException(status_code=404, detail="Provider not found")
 
     versions = []
@@ -280,6 +267,9 @@ async def download_provider_cli(
         try:
             info = await platform_get_download_info(storage, version, os, arch)
             return JSONResponse(content=info)
+        except CacheOnlyError as e:
+            # Sealed mode + not cached — actionable 404, never fetch upstream.
+            raise HTTPException(status_code=404, detail=str(e)) from e
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
         except RuntimeError as e:
@@ -287,16 +277,14 @@ async def download_provider_cli(
 
     provider = await get_provider(db, namespace, name)
     if provider is not None:
-        perm = await resolve_registry_permission(
+        caps = await resolve_registry_capabilities_for(
             db,
-            user.email,
-            user.roles,
+            user,
             provider.name,
             provider.labels or {},
             provider.owner_email,
-            auth_method=user.auth_method,
         )
-        if not has_registry_permission(perm, "read"):
+        if not has_capability(caps, cap.REGISTRY_READ):
             raise HTTPException(status_code=404, detail="Provider platform not found")
 
     info = await get_provider_download_info(db, storage, namespace, name, version, os, arch)
@@ -342,17 +330,15 @@ async def list_providers_endpoint(
     providers = await list_providers(db)
     visible = []
     for p in providers:
-        perm = await resolve_registry_permission(
+        caps = await resolve_registry_capabilities_for(
             db,
-            user.email,
-            user.roles,
+            user,
             p.name,
             p.labels or {},
             p.owner_email,
-            auth_method=user.auth_method,
         )
-        if perm is not None:
-            visible.append(_provider_to_jsonapi(p, perm))
+        if caps:
+            visible.append(_provider_to_jsonapi(p, caps))
     return JSONResponse(content={"data": visible})
 
 
@@ -367,19 +353,17 @@ async def show_provider_endpoint(
     if provider is None:
         raise HTTPException(status_code=404, detail="Provider not found")
 
-    perm = await resolve_registry_permission(
+    caps = await resolve_registry_capabilities_for(
         db,
-        user.email,
-        user.roles,
+        user,
         provider.name,
         provider.labels or {},
         provider.owner_email,
-        auth_method=user.auth_method,
     )
-    if not has_registry_permission(perm, "read"):
+    if not has_capability(caps, cap.REGISTRY_READ):
         raise HTTPException(status_code=404, detail="Provider not found")
 
-    return JSONResponse(content={"data": _provider_to_jsonapi(provider, perm)})
+    return JSONResponse(content={"data": _provider_to_jsonapi(provider, caps)})
 
 
 @management_router.delete(_BASE + "/private/default/{name}")
@@ -394,7 +378,7 @@ async def delete_provider_endpoint(
     if provider is None:
         raise HTTPException(status_code=404, detail="Provider not found")
 
-    await _require_provider_permission(db, user, provider, "admin")
+    await _require_provider_capability(db, user, provider, cap.REGISTRY_ADMIN)
 
     deleted = await delete_provider(db, storage, "default", name)
     if not deleted:
@@ -416,16 +400,14 @@ async def update_provider_endpoint(
     if provider is None:
         raise HTTPException(status_code=404, detail="Provider not found")
 
-    perm = await resolve_registry_permission(
+    caps = await resolve_registry_capabilities_for(
         db,
-        user.email,
-        user.roles,
+        user,
         provider.name,
         provider.labels or {},
         provider.owner_email,
-        auth_method=user.auth_method,
     )
-    if not has_registry_permission(perm, "admin"):
+    if not has_capability(caps, cap.REGISTRY_ADMIN):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Requires admin permission on provider",
@@ -434,7 +416,7 @@ async def update_provider_endpoint(
     attrs = body.get("data", {}).get("attributes", {})
 
     if "owner-email" in attrs:
-        if "admin" not in user.roles:
+        if "admin" not in effective_platform_roles(user):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only platform admins can change owner",
@@ -445,26 +427,23 @@ async def update_provider_endpoint(
         # Validate up-front (size limits + reserved-key check). Raises 422
         # before any self-lockout logic.
         new_labels = validate_labels(attrs["labels"])
-        # Self-lockout check: warn if label change would reduce user's access
+        # Self-lockout check: refuse (409) if the label change would remove any
+        # capability the caller currently holds. Capability sets are a partial
+        # order, so the guard is set-difference, not a level comparison.
         if (
             new_labels != (provider.labels or {})
             and not attrs.get("force")
-            and "admin" not in user.roles
+            and "admin" not in effective_platform_roles(user)
             and provider.owner_email != user.email
         ):
-            new_perm = await resolve_registry_permission(
+            new_caps = await resolve_registry_capabilities_for(
                 db,
-                user.email,
-                user.roles,
+                user,
                 provider.name,
                 new_labels,
                 provider.owner_email,
-                auth_method=user.auth_method,
             )
-            if new_perm is None or REGISTRY_PERMISSION_HIERARCHY.get(
-                new_perm, -1
-            ) < REGISTRY_PERMISSION_HIERARCHY.get(perm, -1):
-                new_level = new_perm or "none"
+            if caps - new_caps:
                 return JSONResponse(
                     status_code=409,
                     content={
@@ -473,9 +452,9 @@ async def update_provider_endpoint(
                                 "status": "409",
                                 "title": "Label change would reduce your access",
                                 "detail": (
-                                    f"This label change would reduce your access from "
-                                    f"{perm} to {new_level} on this provider. "
-                                    f'Re-submit with "force": true to confirm.'
+                                    "This label change would remove capabilities you "
+                                    "currently hold on this provider. "
+                                    'Re-submit with "force": true to confirm.'
                                 ),
                             }
                         ]
@@ -485,61 +464,104 @@ async def update_provider_endpoint(
 
     await db.commit()
     await db.refresh(provider)
-    return JSONResponse(content={"data": _provider_to_jsonapi(provider, perm)})
+    return JSONResponse(content={"data": _provider_to_jsonapi(provider, caps)})
 
 
 # --- Version Management ---
 
 
-@management_router.post(_BASE + "/private/default/{name}/versions")
-async def create_provider_version_endpoint(
+# Per-platform provider zips can be large; stream them to the PVC. Manifest +
+# signature are tiny and read into memory.
+_MAX_PROVIDER_BINARY_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB hard cap per platform zip
+_MAX_SHASUMS_BYTES = 1 * 1024 * 1024  # 1 MiB — SHA256SUMS / .sig are tiny
+
+
+def _resolve_ephemeral_tmpdir() -> str | None:
+    """Resolve the API pod's ephemeral-storage PVC mount for large tempfiles.
+
+    Matches `run_artifacts._resolve_ephemeral_tmpdir`. On the API pod `/tmp`
+    is a RAM-backed emptyDir; provider zips (tens to hundreds of MB) MUST land
+    on the dedicated PVC at `settings.vcs.tmpdir`. None falls back to the
+    system default for local dev and tests.
+    """
+    configured = settings.vcs.tmpdir
+    if configured and os.path.isdir(configured):
+        return configured
+    return None
+
+
+@management_router.put(_BASE + "/private/default/{name}/versions/{version}/shasums")
+async def upload_provider_shasums_endpoint(
     name: str,
-    body: CreateProviderVersionRequest,
+    version: str,
+    request: Request,
     user: AuthenticatedUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     storage: ObjectStore = Depends(get_storage),
 ) -> JSONResponse:
-    """Create a provider version and get upload URLs. Requires write."""
+    """Upload the client-built SHA256SUMS manifest (first publish step). Requires write.
+
+    Upserts the version. The manifest is not yet trusted — the detached
+    signature must be uploaded next and verify against a registered key.
+    """
     provider = await get_provider(db, "default", name)
     if provider is None:
         raise HTTPException(status_code=404, detail="Provider not found")
+    await _require_provider_capability(db, user, provider, cap.REGISTRY_WRITE)
 
-    await _require_provider_permission(db, user, provider, "write")
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty SHA256SUMS body")
+    if len(data) > _MAX_SHASUMS_BYTES:
+        raise HTTPException(status_code=413, detail="SHA256SUMS too large")
 
-    attrs = body.data.attributes
-
-    # Resolve GPG key if key_id provided
-    gpg_key_uuid: uuid.UUID | None = None
-    if attrs.key_id:
-        from terrapod.services.gpg_key_service import get_gpg_key_by_key_id
-
-        gpg_key = await get_gpg_key_by_key_id(db, attrs.key_id)
-        if gpg_key is not None:
-            gpg_key_uuid = gpg_key.id
-
-    prov_version, shasums_url, sig_url = await create_provider_version(
-        db, storage, provider.id, attrs.version, gpg_key_uuid, attrs.protocols
-    )
+    prov_version = await store_provider_shasums(db, storage, "default", name, version, data)
     await db.commit()
     await db.refresh(prov_version, attribute_names=["platforms"])
-
-    logger.info(
-        "Provider version created",
-        provider_id=str(provider.id),
-        version=attrs.version,
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"data": _version_to_jsonapi(prov_version)},
     )
 
+
+@management_router.put(_BASE + "/private/default/{name}/versions/{version}/shasums.sig")
+async def upload_provider_shasums_sig_endpoint(
+    name: str,
+    version: str,
+    request: Request,
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    storage: ObjectStore = Depends(get_storage),
+) -> JSONResponse:
+    """Upload + verify the detached SHA256SUMS signature — the trust gate. Requires write.
+
+    Verifies the signature against a *registered* GPG key over the previously
+    uploaded manifest; 422 on any failure. On success the signing key is linked
+    so the CLI download advertises it and binary uploads are unblocked.
+    """
+    provider = await get_provider(db, "default", name)
+    if provider is None:
+        raise HTTPException(status_code=404, detail="Provider not found")
+    await _require_provider_capability(db, user, provider, cap.REGISTRY_WRITE)
+
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty signature body")
+    if len(data) > _MAX_SHASUMS_BYTES:
+        raise HTTPException(status_code=413, detail="Signature too large")
+
+    try:
+        prov_version = await store_and_verify_provider_sig(
+            db, storage, "default", name, version, data
+        )
+    except PublishValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await db.commit()
+    await db.refresh(prov_version, attribute_names=["platforms"])
+    logger.info("Provider SHA256SUMS signature verified", provider=name, version=version)
     return JSONResponse(
-        status_code=status.HTTP_201_CREATED,
-        content={
-            "data": _version_to_jsonapi(
-                prov_version,
-                upload_links={
-                    "shasums-upload": shasums_url.url,
-                    "shasums-sig-upload": sig_url.url,
-                },
-            )
-        },
+        status_code=status.HTTP_200_OK,
+        content={"data": _version_to_jsonapi(prov_version)},
     )
 
 
@@ -554,16 +576,14 @@ async def list_provider_versions_endpoint(
     if provider is None:
         raise HTTPException(status_code=404, detail="Provider not found")
 
-    perm = await resolve_registry_permission(
+    caps = await resolve_registry_capabilities_for(
         db,
-        user.email,
-        user.roles,
+        user,
         provider.name,
         provider.labels or {},
         provider.owner_email,
-        auth_method=user.auth_method,
     )
-    if not has_registry_permission(perm, "read"):
+    if not has_capability(caps, cap.REGISTRY_READ):
         raise HTTPException(status_code=404, detail="Provider not found")
 
     versions = await list_provider_versions(db, provider.id)
@@ -583,7 +603,7 @@ async def delete_provider_version_endpoint(
     """Delete a provider version and its platforms. Requires admin."""
     provider = await get_provider(db, "default", name)
     if provider is not None:
-        await _require_provider_permission(db, user, provider, "admin")
+        await _require_provider_capability(db, user, provider, cap.REGISTRY_ADMIN)
 
     deleted = await delete_provider_version(db, storage, "default", name, version)
     if not deleted:
@@ -594,38 +614,6 @@ async def delete_provider_version_endpoint(
 
 
 # --- Platform Management ---
-
-
-@management_router.post(_BASE + "/private/default/{name}/versions/{version}/platforms")
-async def create_provider_platform_endpoint(
-    name: str,
-    version: str,
-    body: CreateProviderPlatformRequest,
-    user: AuthenticatedUser = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-    storage: ObjectStore = Depends(get_storage),
-) -> JSONResponse:
-    """Create a platform entry and get an upload URL. Requires write."""
-    provider = await get_provider(db, "default", name)
-    if provider is None:
-        raise HTTPException(status_code=404, detail="Provider not found")
-
-    await _require_provider_permission(db, user, provider, "write")
-
-    prov_version = await get_provider_version(db, provider.id, version)
-    if prov_version is None:
-        raise HTTPException(status_code=404, detail="Provider version not found")
-
-    attrs = body.data.attributes
-    platform, upload_url = await create_provider_platform(
-        db, storage, prov_version.id, attrs.os, attrs.arch, attrs.filename
-    )
-    await db.commit()
-
-    return JSONResponse(
-        status_code=status.HTTP_201_CREATED,
-        content={"data": _platform_to_jsonapi(platform, upload_link=upload_url.url)},
-    )
 
 
 @management_router.get(_BASE + "/private/default/{name}/versions/{version}/platforms")
@@ -640,16 +628,14 @@ async def list_provider_platforms_endpoint(
     if provider is None:
         raise HTTPException(status_code=404, detail="Provider not found")
 
-    perm = await resolve_registry_permission(
+    caps = await resolve_registry_capabilities_for(
         db,
-        user.email,
-        user.roles,
+        user,
         provider.name,
         provider.labels or {},
         provider.owner_email,
-        auth_method=user.auth_method,
     )
-    if not has_registry_permission(perm, "read"):
+    if not has_capability(caps, cap.REGISTRY_READ):
         raise HTTPException(status_code=404, detail="Provider not found")
 
     prov_version = await get_provider_version(db, provider.id, version)
@@ -662,42 +648,93 @@ async def list_provider_platforms_endpoint(
     )
 
 
-@management_router.put(
-    _BASE + "/private/default/{name}/versions/{version}/platforms/{os}/{arch}/upload"
-)
-async def upload_provider_binary_endpoint(
+@management_router.put(_BASE + "/private/default/{name}/versions/{version}/platforms/{os}/{arch}")
+async def upload_provider_platform_endpoint(
     name: str,
     version: str,
-    os: str,
-    arch: str,
     request: Request,
+    os_: str = Path(alias="os"),
+    arch: str = Path(),
     user: AuthenticatedUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     storage: ObjectStore = Depends(get_storage),
 ) -> JSONResponse:
-    """Upload a provider binary directly. Requires write. Idempotent."""
+    """Stream + validate a provider platform zip, then store it. Requires write. Idempotent.
+
+    The version's SHA256SUMS and its verified signature must already be
+    uploaded (trust gate) — else 422. The body is streamed to the ephemeral
+    PVC (never buffered in RAM), its sha-256 computed on the fly, and checked
+    against the signed manifest before the file is committed to storage. The
+    server never re-signs.
+    """
     provider = await get_provider(db, "default", name)
     if provider is None:
         raise HTTPException(status_code=404, detail="Provider not found")
+    await _require_provider_capability(db, user, provider, cap.REGISTRY_WRITE)
 
-    await _require_provider_permission(db, user, provider, "write")
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > _MAX_PROVIDER_BINARY_BYTES:
+                raise HTTPException(status_code=413, detail="provider binary too large")
+        except ValueError:
+            pass
 
-    data = await request.body()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty request body")
+    tmpdir = _resolve_ephemeral_tmpdir()
+    fd, tmp_path = await asyncio.to_thread(tempfile.mkstemp, suffix=".provider.zip", dir=tmpdir)
+    f = await asyncio.to_thread(os.fdopen, fd, "wb")
+    hasher = hashlib.sha256()
+    received = 0
+    try:
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            received += len(chunk)
+            if received > _MAX_PROVIDER_BINARY_BYTES:
+                raise HTTPException(status_code=413, detail="provider binary exceeded size cap")
+            hasher.update(chunk)
+            await asyncio.to_thread(f.write, chunk)
+        await asyncio.to_thread(f.flush)
+        await asyncio.to_thread(f.close)
+        if received == 0:
+            raise HTTPException(status_code=400, detail="Empty request body")
 
-    platform = await upload_provider_binary(db, storage, "default", name, version, os, arch, data)
-    await db.commit()
+        filename = f"terraform-provider-{name}_{version}_{os_}_{arch}.zip"
+        try:
+            platform = await record_provider_binary(
+                db,
+                storage,
+                "default",
+                name,
+                version,
+                os_,
+                arch,
+                sha256=hasher.hexdigest(),
+                filename=filename,
+                tmp_path=tmp_path,
+            )
+        except PublishValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        await db.commit()
+    finally:
+        if not f.closed:
+            try:
+                await asyncio.to_thread(f.close)
+            except OSError:
+                pass
+        try:
+            await asyncio.to_thread(os.unlink, tmp_path)
+        except OSError:
+            pass
 
     logger.info(
         "Provider binary uploaded",
         provider=name,
         version=version,
-        os=os,
+        os=os_,
         arch=arch,
-        size=len(data),
+        size=received,
     )
-
     return JSONResponse(
         status_code=status.HTTP_200_OK,
         content={"data": _platform_to_jsonapi(platform)},
@@ -719,7 +756,7 @@ async def delete_provider_platform_endpoint(
     """Delete a specific provider platform binary. Requires admin."""
     provider = await get_provider(db, "default", name)
     if provider is not None:
-        await _require_provider_permission(db, user, provider, "admin")
+        await _require_provider_capability(db, user, provider, cap.REGISTRY_ADMIN)
 
     deleted = await delete_provider_platform(db, storage, "default", name, version, os, arch)
     if not deleted:

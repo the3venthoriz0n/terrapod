@@ -1,6 +1,6 @@
 # Runners
 
-Runners are ephemeral Kubernetes Jobs that execute `terraform` or `tofu` plan and apply operations. The default runner image is a minimal Alpine container with `curl`, `tar`, `jq`, `unzip`, and `git` -- no terraform/tofu binary baked in. The correct version is downloaded at runtime from the [binary cache](registry.md).
+Runners are ephemeral Kubernetes Jobs that execute `terraform` or `tofu` plan and apply operations. The default runner image is a slim Debian (`python:3.13-slim`) container with `git`, `openssh-client`, `ca-certificates`, and a pinned `opa` binary -- no terraform/tofu binary baked in. The correct version is downloaded at runtime from the [binary cache](registry.md). The whole runner orchestrator is Python; nothing from the bash era survives.
 
 ---
 
@@ -10,36 +10,48 @@ The default image covers most use cases, but you may need additional tools -- cl
 
 ### Building a Custom Image
 
-Base your image on the default runner and add what you need:
+Base your image on the default runner and add what you need. The base is Debian, so use `apt-get` (not `apk`):
 
 ```dockerfile
 FROM ghcr.io/mattrobinsonsre/terrapod-runner:latest
 
 USER root
 
+# `curl` and `unzip` aren't in the base image; install them just for
+# the duration of this layer and remove afterwards.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl unzip \
+    && rm -rf /var/lib/apt/lists/*
+
 # Example: AWS CLI v2
-RUN apk add --no-cache gcompat \
-    && curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip \
+RUN curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-$(dpkg --print-architecture).zip" -o /tmp/awscliv2.zip \
     && unzip -q /tmp/awscliv2.zip -d /tmp \
     && /tmp/aws/install \
     && rm -rf /tmp/awscliv2.zip /tmp/aws
 
-# Example: Azure CLI
-RUN apk add --no-cache py3-pip \
-    && pip3 install --break-system-packages azure-cli
+# Example: Azure CLI (via apt repo)
+RUN curl -sSL https://packages.microsoft.com/keys/microsoft.asc \
+    | gpg --dearmor -o /usr/share/keyrings/microsoft.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ $(. /etc/os-release && echo $VERSION_CODENAME) main" \
+       > /etc/apt/sources.list.d/azure-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends azure-cli \
+    && rm -rf /var/lib/apt/lists/*
 
 # Example: gcloud CLI
-RUN curl -sSL https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz \
+RUN curl -sSL https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-$(uname -m).tar.gz \
     | tar -xz -C /opt \
     && /opt/google-cloud-sdk/install.sh --quiet \
     && ln -s /opt/google-cloud-sdk/bin/gcloud /usr/local/bin/gcloud
+
+# Drop the install-time tools so they don't sit in the final image.
+RUN apt-get purge -y curl unzip && apt-get autoremove -y
 
 USER 1000:1000
 ```
 
 Important:
 - Switch back to `USER 1000:1000` -- runner Jobs run as non-root
-- The entrypoint (`/entrypoint.sh`) must remain unchanged -- it handles signal forwarding and graceful shutdown
+- The canonical entrypoint is `python -m terrapod.runner.job_entrypoint` -- it drives signal forwarding, graceful shutdown, phase orchestration, and artifact uploads. Custom images should not override `ENTRYPOINT`; layer additional tooling on top via `RUN` and let the inherited entrypoint stand.
 - The working directory is `/workspace` and `/tmp` is writable (both are emptyDir volumes)
 
 ### Using a Custom Image
@@ -146,8 +158,10 @@ All runner Jobs inherit the following settings from `runners.*` in Helm values:
 | `runners.ttlSecondsAfterFinished` | `600` | Clean up completed Jobs after this many seconds |
 | `runners.terminationGracePeriodSeconds` | `120` | Time budget for graceful shutdown + artifact uploads |
 | `runners.tokenTTLSeconds` | `3600` | Runner token TTL (1 hour) |
+| `runners.hooksEnabled` | `true` | Master kill-switch for execution hooks. When `false`, the listener never delivers execution hooks to runner Jobs (for sealed/security-conscious deployments) |
 | `runners.maxTokenTTLSeconds` | `7200` | Maximum runner token TTL (2 hours) |
 | `runners.staleTimeoutSeconds` | `3600` | Mark run as errored if no Job status after this long |
+| `runners.driftMaxDurationSeconds` | `1800` | Max time a drift run may spend in `planning` before the reconciler errors it. Independent of `staleTimeoutSeconds` (which fires on dead listeners) — this one fires on terraform legitimately running too long for a background plan-only check. Set to `0` to disable |
 
 ### Per-Workspace Resources
 
@@ -234,6 +248,23 @@ terraform {
 
 Terraform and OpenTofu merge any file matching `*_override.tf` over the main configuration with *replacement* semantics, so this single block displaces whatever the main config declared — `cloud {}`, `backend "remote" {}`, `backend "s3" {}`, or nothing at all. The user's committed files are never modified, which keeps "why does my plan differ locally" diagnosable.
 
+---
+
+## Plan → Apply File Bridging (plan-artifacts)
+
+The plan and apply phases run as **separate K8s Jobs**, so anything plan generates on disk — `data.archive_file` outputs, `null_resource` local-exec scratch, dynamically rendered `local_file` content — is gone by the time apply starts, even though the saved `tfplan` references those exact paths. The runner bridges them with a **workspace-diff snapshot**:
+
+1. After `tofu init` (and lock-file upload), the plan phase snapshots the relative-path set of the workspace tree.
+2. It runs `tofu plan -out=tfplan`, snapshots again, and computes `new_files = post_plan − post_init` (pure set difference; ignores existing-file mutations).
+3. New files are tarred and uploaded to `plans/{workspace_id}/{run_id}.plan-artifacts.tar`.
+4. The apply phase downloads the tarball after its own `tofu init -lockfile=readonly` and extracts it over the workspace before `tofu apply tfplan`.
+
+Excluded from the snapshot: `tfplan` (separate endpoint), `.terraform.lock.hcl` (separate endpoint, modified by the lock-extender), and `.terraform/terraform.tfstate` (apply's fresh init re-creates it). Symlinks are skipped — we don't try to restore symlinks across the pod boundary.
+
+The plan phase **always uploads**, even an empty tar when plan produced nothing new. That makes the apply-side contract explicit: a 404 on download means a real upload failure, not "no new files". For runs created by a pre-v0.34.0 runner where no tarball was ever uploaded, the apply phase logs the missing artifact and proceeds — the contract is enforced once both phases run feature-aware images.
+
+The cap is set by `runners.planArtifactsMaxBytes` in Helm values (default 256 MiB; minimum 10240 bytes). Uploads exceeding the cap are rejected with HTTP 413 and the run errors. Tune up for runs that build big lambda zips or other large generated archives.
+
 **Our override always wins.** Local execution is a hard correctness requirement, so the override is written unconditionally — the runner never defers to a user-supplied backend declaration (deferring to a committed `cloud {}` or `backend "remote"` would hand the runner a remote backend and recurse). Two mechanisms enforce this:
 
 1. **Merge order.** Override files are merged in lexical order with the *last* file winning. The `zzzz` filename prefix sorts after `override.tf` and the overwhelming majority of `*_override.tf` names, so Terrapod's `backend "local"` is the one that takes effect. If the workspace does ship its own override file declaring a backend/cloud block, the runner logs a `takes precedence` note so the override is visible — but still writes and wins with its own.
@@ -245,12 +276,12 @@ Terraform and OpenTofu merge any file matching `*_override.tf` over the main con
 
 Policy-as-code evaluation runs **on the runner**, between the plan phase and posting plan-result. The plan JSON is already on disk (just produced by `tofu show -json tfplan`), so the runner can evaluate OPA policies against it without a round-trip to storage and without any server-side concurrent-eval load. See [`docs/policies.md`](policies.md) for the authoring contract.
 
-Sequence inside `runner-entrypoint.sh`, after `tofu plan` completes successfully:
+Sequence inside the Python runner orchestrator (`services/terrapod/runner/job_entrypoint.py`), after `tofu plan` completes successfully:
 
-1. `tofu show -json tfplan > /tmp/plan.json` — produces the JSON form used by both OPA and the `plan-json-output` artifact.
-2. `tp_evaluate_policies` (the shell function in the entrypoint):
+1. `plan_apply.run_plan_show_json` runs `tofu show -json tfplan` and writes `/tmp/plan.json` — the JSON form used by both OPA and the `plan-json-output` artifact.
+2. `phases.opa.evaluate_policies`:
    - `GET /api/terrapod/v1/runs/{id}/policy-bundle` — fetches the policy sets in scope for this workspace, plus the run/workspace context. Bounded retries (3 attempts, 3s backoff); a persistent fetch failure is **fatal** to the run, never silently skipped.
-   - For each applicable set, for each policy: `opa eval --format json --stdin-input --data <rego> --data <context> 'data.terrapod' < /tmp/plan.json`. Parses `deny` / `warn` from the OPA output. One eval per policy preserves per-policy attribution in the UI.
+   - For each applicable set, for each policy: `opa eval --format json --stdin-input --data <rego> --data <context> 'data.terrapod' < /tmp/plan.json`. Parses `deny` / `warn` from the OPA output with defensive coercion (a misauthored `deny := "msg"` scalar is not allowed to silently pass). One eval per policy preserves per-policy attribution in the UI.
    - `POST /api/terrapod/v1/runs/{id}/policy-results` — uploads the aggregated results. Persisted via Postgres `ON CONFLICT DO NOTHING` on `(run_id, policy_set_id)` so retries are idempotent.
 3. The runner posts `plan-result`. The API's post-plan gate is now a pure DB query — by this point the policy_evaluation rows already exist (or there were no applicable sets, which is the right answer too).
 
@@ -281,7 +312,7 @@ The entrypoint reads the following environment variables (set automatically by t
 | `TP_ALLOW_EMPTY_APPLY` | `true` to allow empty applies |
 | `TP_TERMINATION_GRACE` | Termination grace period in seconds |
 
-Workspace variables (env and terraform) are also injected as environment variables on the Job pod.
+Workspace variables (env and terraform) are NOT passed as plaintext env in the Job spec — they are delivered via the per-run vars Secret described below.
 
 ### Per-phase auth Secret
 
@@ -293,6 +324,22 @@ tprun-<run-short-id>-apply-auth    # apply-phase Job consumes this
 ```
 
 The Job's pod spec references the token via `secretKeyRef` and exposes it as `TP_AUTH_TOKEN` — the raw token never appears in the Job spec, the listener logs, or `kubectl describe` output. The token is scoped to a single `run_id` and the matching phase, so a leaked apply token can't be replayed against an unrelated run or used to download a different workspace's state.
+
+### Per-phase vars Secret
+
+Workspace variable **values** are delivered to the Job through a second per-phase Secret, created and named with the identical `ownerReference`→Job lifecycle as the auth Secret (so it cascade-GCs when the Job's TTL expires; the listener needs only `secrets: create` RBAC, no sweeper):
+
+```
+tprun-<run-short-id>-plan-vars     # plan-phase Job consumes this
+tprun-<run-short-id>-apply-vars    # apply-phase Job consumes this
+```
+
+It holds:
+
+- a `terraform.tfvars.json` blob — every terraform-category variable (sensitive and not), with its `hcl` flag. The Secret is **mounted read-only** at `/var/run/terrapod/vars`; before `init` the runner renders a `terrapod.auto.tfvars` from it (`hcl=true` → raw HCL expression, otherwise → quoted string). A `.auto.tfvars` file parses **identically on terraform and tofu** for any variable type — which is why the runner uses a file rather than `TF_VAR_*` env (the env form diverges across engines for untyped complex values).
+- one key per env-category variable, each injected into the Job container via `secretKeyRef`.
+
+No variable value — sensitive or not — ever appears in the Job spec, the listener logs, or `kubectl describe` output. Sensitive terraform vars are protected by living only in this short-lived, cascade-GC'd Secret (mounted as the tfvars file), not by masking.
 
 ---
 

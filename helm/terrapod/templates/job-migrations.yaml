@@ -1,4 +1,7 @@
 {{- if and (ne .Values.api.enabled false) .Values.migrations.enabled }}
+{{- $dbAuthMode := (.Values.api.config.database).auth_mode | default "password" }}
+{{- $dbIam := or (eq $dbAuthMode "aws_iam") (eq $dbAuthMode "gcp_iam") (eq $dbAuthMode "azure_ad") }}
+{{- $dbCa := or .Values.api.databaseCA.inline .Values.api.databaseCA.existingConfigMap }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -11,7 +14,11 @@ metadata:
     "helm.sh/hook-weight": "-5"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
-  backoffLimit: 3
+  # Retry generously: when the database is co-deployed in the same release
+  # (eval/dev embedded Postgres), it may still be coming up when this hook
+  # first runs — the Job retries with exponential backoff until the DB is
+  # reachable. Harmless for an already-up managed DB in production.
+  backoffLimit: {{ .Values.migrations.backoffLimit | default 10 }}
   ttlSecondsAfterFinished: 600
   template:
     metadata:
@@ -22,6 +29,13 @@ spec:
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $dbIam }}
+      # Cloud-IAM DB auth: run under the API's IRSA/workload-identity SA so the
+      # Job can mint a DB token (the SA carries the rds-db:connect / Cloud SQL /
+      # Entra grant). The cloud identity webhook projects its own token, so the
+      # default SA token stays unmounted.
+      serviceAccountName: {{ include "terrapod.serviceAccountName" . }}
       {{- end }}
       automountServiceAccountToken: false
       restartPolicy: OnFailure
@@ -36,16 +50,37 @@ spec:
             - upgrade
             - head
           env:
-            {{- if .Values.postgresql.existingSecret }}
+            {{- $pgSecret := include "terrapod.postgresql.secretName" . }}
+            {{- if $pgSecret }}
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.postgresql.existingSecret }}
-                  key: {{ .Values.postgresql.existingSecretKey | default "url" }}
+                  name: {{ $pgSecret }}
+                  key: {{ include "terrapod.postgresql.secretKey" . }}
             {{- else if .Values.postgresql.url }}
             - name: DATABASE_URL
               value: {{ .Values.postgresql.url | quote }}
             {{- end }}
+            {{- if $dbIam }}
+            - name: TP_DB_AUTH_MODE
+              value: {{ $dbAuthMode | quote }}
+            - name: TP_DB_AWS_IAM_REGION
+              value: {{ (.Values.api.config.database).aws_iam_region | default "" | quote }}
+            - name: TP_DB_SSL_MODE
+              value: {{ (.Values.api.config.database).ssl_mode | default "" | quote }}
+            - name: TP_DB_SSL_ROOT_CERT
+              {{- if $dbCa }}
+              value: {{ printf "/etc/terrapod/db-ca/%s" (.Values.api.databaseCA.key | default "ca.pem") | quote }}
+              {{- else }}
+              value: {{ (.Values.api.config.database).ssl_root_cert | default "" | quote }}
+              {{- end }}
+            {{- end }}
+          {{- if and $dbIam $dbCa }}
+          volumeMounts:
+            - name: database-ca
+              mountPath: /etc/terrapod/db-ca
+              readOnly: true
+          {{- end }}
           resources:
             requests:
               cpu: 250m
@@ -55,4 +90,10 @@ spec:
               memory: 512Mi
           securityContext:
             {{- toYaml .Values.api.containerSecurityContext | nindent 12 }}
+      {{- if and $dbIam $dbCa }}
+      volumes:
+        - name: database-ca
+          configMap:
+            name: {{ .Values.api.databaseCA.existingConfigMap | default (printf "%s-database-ca" (include "terrapod.fullname" .)) }}
+      {{- end }}
 {{- end }}

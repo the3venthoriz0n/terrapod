@@ -14,6 +14,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/setplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
@@ -90,6 +91,22 @@ func (r *workspaceResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
+			"terragrunt_enabled": schema.BoolAttribute{
+				Description: "Wrap tofu/terraform with terragrunt for agent-mode runs. See https://terrapod.dev for the agent-mode limitations.",
+				Optional:    true,
+				Computed:    true,
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"terragrunt_version": schema.StringAttribute{
+				Description: "The terragrunt CLI version to use when terragrunt_enabled is true. Partial versions (e.g. \"1.0\") are resolved by the binary cache. Defaults to \"1.0\".",
+				Optional:    true,
+				Computed:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
 			"working_directory": schema.StringAttribute{
 				Description: "Working directory relative to the repo root.",
 				Optional:    true,
@@ -157,8 +174,39 @@ func (r *workspaceResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 			},
 			"var_files": schema.ListAttribute{
 				Description: "List of .tfvars file paths passed as -var-file arguments to plan/apply.",
+				// Optional + Computed with UseStateForUnknown — same rationale as
+				// drift_ignore_rules (#684): tolerate a server-held value the
+				// config doesn't set. Set `= []` to clear.
 				Optional:    true,
+				Computed:    true,
 				ElementType: types.StringType,
+				PlanModifiers: []planmodifier.List{
+					listplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"trigger_prefixes": schema.ListAttribute{
+				Description: "Repo-root-relative directories to include in the sparse VCS fetch in addition to `working_directory`. Required when the workspace's terraform crosses directory boundaries via relative module sources (`module \"foo\" { source = \"../foo\" }`) — sparse-checkout cone mode includes parents of the listed directories but NOT siblings, so the referenced sibling must be declared here or the runner will error with `Unable to evaluate directory symlink`.",
+				Optional:    true,
+				Computed:    true,
+				ElementType: types.StringType,
+				PlanModifiers: []planmodifier.List{
+					listplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"drift_ignore_rules": schema.ListAttribute{
+				Description: "Glob-aware patterns suppressed by the drift-result classifier (#482). Each entry is a Terraform resource address optionally suffixed with a dotted attribute path; `*` matches zero or more non-`.` characters (so it can span `[N]` indices but not segment boundaries), and `[*]` matches any bracketed index. A bare address with no attribute suffix silences any change to that resource — including destroys — so use carefully. Examples: `aws_iam_role.foo.tags.Environment`, `aws_autoscaling_group.workers[*].desired_capacity`, `module.eks*.argocd_cluster.*.config.tls_client_config.ca_data`, `aws_iam_role.foo`. Empty list (the default) means classic drift behaviour: every plan diff counts. Affects drift-detection runs only — regular plan/apply is untouched.",
+				// Optional + Computed: the server may hold a value this config
+				// doesn't set (e.g. set out-of-band via the bulk-update endpoint),
+				// so omitting it must mean "leave alone" (plan = unknown), not
+				// "force null" — otherwise the read-back's non-null value fails
+				// the framework's "inconsistent result after apply" check (#684).
+				// Set `= []` to explicitly clear.
+				Optional:    true,
+				Computed:    true,
+				ElementType: types.StringType,
+				PlanModifiers: []planmodifier.List{
+					listplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"drift_detection_enabled": schema.BoolAttribute{
 				Description: "Enable drift detection for this workspace. Defaults to true for VCS-connected workspaces, false otherwise.",
@@ -176,6 +224,14 @@ func (r *workspaceResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 					int64planmodifier.UseStateForUnknown(),
 				},
 			},
+			"plan_expiry_seconds": schema.Int64Attribute{
+				Description: "Per-workspace plan expiry TTL in seconds (#646). An apply-capable planned run older than this is auto-discarded and must be re-planned. Unset / 0 = disabled (the default).",
+				Optional:    true,
+				Computed:    true,
+				PlanModifiers: []planmodifier.Int64{
+					int64planmodifier.UseStateForUnknown(),
+				},
+			},
 			"ai_summary_mode": schema.StringAttribute{
 				Description: "Per-workspace AI plan-summary opt-in (#401). One of \"default\" (follow the deployment's global `ai_summary.enabled` setting), \"enabled\" (always summarise this workspace's plans), or \"disabled\" (never summarise — overrides global). Defaults to \"default\".",
 				Optional:    true,
@@ -186,6 +242,14 @@ func (r *workspaceResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 			},
 			"ai_summary_context": schema.StringAttribute{
 				Description: "Workspace-specific facts appended to the AI summariser's prompt (#401). Additive to the deployment-wide fleet context. Use to flag blast-radius concerns or domain knowledge the model should weigh when describing changes for this workspace. Max 4000 characters.",
+				Optional:    true,
+				Computed:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"slack_channel": schema.StringAttribute{
+				Description: "Slack channel this workspace's run notifications post to (#556) — approval / applied / errored / drift. Opt-in: leave empty and the workspace stays silent (there is no deployment-wide fan-out). Requires the Slack app to be enabled server-side.",
 				Optional:    true,
 				Computed:    true,
 				PlanModifiers: []planmodifier.String{
@@ -210,16 +274,84 @@ func (r *workspaceResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
+			// `UseStateForUnknown` ONLY belongs on Computed-only attrs
+			// whose value definitely does NOT change as a side effect of
+			// the apply. v0.35.5 applied it everywhere and broke apply
+			// on every workspace because the server-volatile timestamps
+			// (updated_at ticks on every PATCH; vcs_last_polled_at ticks
+			// on every poll cycle) produced plan-vs-apply-time mismatches
+			// → terraform-plugin-framework's consistency check aborted.
+			//
+			// Safe-for-UseStateForUnknown set (each field's invariant):
+			//   created_at         — immutable after creation
+			//   owner_email        — only the platform admin can change; PATCH never does
+			//   agent_pool_name    — only changes when agent_pool_id changes (caller's PATCH)
+			//   vcs_connection_name — only changes when vcs_connection_id changes
+			//   state_diverged     — only set/cleared by a state upload pathway; not by PATCH
+			//
+			// Server-volatile set (NO UseStateForUnknown — plan will
+			// honestly show `(known after apply)`; the diff noise is the
+			// right answer because the value can legitimately change
+			// between plan and apply):
+			//   updated_at, vcs_last_polled_at, vcs_last_error,
+			//   vcs_last_error_at, drift_status, drift_last_checked_at,
+			//   drift_latest_run_id, lifecycle_state, lifecycle_reason,
+			//   locked
 			"drift_status": schema.StringAttribute{
-				Description: "Current drift status.",
+				Description: "Current drift status: \"\" (never checked), \"no_drift\", \"drifted\", or \"errored\". Server-volatile — updates when a drift run completes.",
 				Computed:    true,
 			},
 			"drift_last_checked_at": schema.StringAttribute{
-				Description: "Timestamp of the last drift check.",
+				Description: "Timestamp of the last drift check. Server-volatile.",
 				Computed:    true,
 			},
+			"drift_latest_run_id": schema.StringAttribute{
+				Description: "ID of the drift run that produced the current `drift_status`, prefixed `run-…`. Empty when drift has never run or when cleared by a successful apply. Server-volatile.",
+				Computed:    true,
+			},
+			"state_diverged": schema.BoolAttribute{
+				Description: "True when an apply Job succeeded but uploading the resulting state to Terrapod failed; the recorded state is out of sync with reality. Stable across PATCHes — only the state-upload pathway changes this.",
+				Computed:    true,
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"lifecycle_state": schema.StringAttribute{
+				Description: "Autodiscovery lifecycle state for managed workspaces: \"active\", \"pending_deletion\", or \"archived\". Server-volatile — autodiscovery lifecycle reconciler can move this between plan and apply.",
+				Computed:    true,
+			},
+			"lifecycle_reason": schema.StringAttribute{
+				Description: "Human-readable explanation of `lifecycle_state`. Empty for active workspaces. Server-volatile.",
+				Computed:    true,
+			},
+			"vcs_last_polled_at": schema.StringAttribute{
+				Description: "Timestamp of the most recent successful VCS poll cycle. Server-volatile — VCS poller writes this every `vcs.poll_interval_seconds` (default 60s).",
+				Computed:    true,
+			},
+			"vcs_last_error": schema.StringAttribute{
+				Description: "Most recent VCS poll error message. Empty when the last poll succeeded. Server-volatile.",
+				Computed:    true,
+			},
+			"vcs_last_error_at": schema.StringAttribute{
+				Description: "Timestamp of `vcs_last_error`. Server-volatile.",
+				Computed:    true,
+			},
+			"agent_pool_name": schema.StringAttribute{
+				Description: "Human-readable name of the assigned agent pool, server-derived from `agent_pool_id`. Only changes when `agent_pool_id` changes.",
+				Computed:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"vcs_connection_name": schema.StringAttribute{
+				Description: "Human-readable name of the assigned VCS connection, server-derived from `vcs_connection_id`. Only changes when `vcs_connection_id` changes.",
+				Computed:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
 			"locked": schema.BoolAttribute{
-				Description: "Whether the workspace is locked.",
+				Description: "Whether the workspace is locked. Server-volatile — operators can lock/unlock via the API outside of Terraform.",
 				Computed:    true,
 			},
 			"created_at": schema.StringAttribute{
@@ -230,7 +362,7 @@ func (r *workspaceResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 				},
 			},
 			"updated_at": schema.StringAttribute{
-				Description: "Last update timestamp.",
+				Description: "Last update timestamp. Server-volatile — ticks on every PATCH and on every server-side write (drift detection, VCS poll, lifecycle reconciler).",
 				Computed:    true,
 			},
 		},
@@ -424,6 +556,13 @@ func buildCreateWorkspaceRequest(ctx context.Context, m *workspaceModel) (terrap
 	if !m.TerraformVersion.IsNull() && !m.TerraformVersion.IsUnknown() {
 		req.TerraformVersion = m.TerraformVersion.ValueString()
 	}
+	if !m.TerragruntEnabled.IsNull() && !m.TerragruntEnabled.IsUnknown() {
+		v := m.TerragruntEnabled.ValueBool()
+		req.TerragruntEnabled = &v
+	}
+	if !m.TerragruntVersion.IsNull() && !m.TerragruntVersion.IsUnknown() {
+		req.TerragruntVersion = m.TerragruntVersion.ValueString()
+	}
 	if !m.WorkingDirectory.IsNull() && !m.WorkingDirectory.IsUnknown() {
 		req.WorkingDirectory = m.WorkingDirectory.ValueString()
 	}
@@ -469,6 +608,20 @@ func buildCreateWorkspaceRequest(ctx context.Context, m *workspaceModel) (terrap
 		}
 		req.VarFiles = varFiles
 	}
+	if !m.TriggerPrefixes.IsNull() && !m.TriggerPrefixes.IsUnknown() {
+		triggerPrefixes := []string{}
+		for _, v := range m.TriggerPrefixes.Elements() {
+			triggerPrefixes = append(triggerPrefixes, v.(types.String).ValueString())
+		}
+		req.TriggerPrefixes = triggerPrefixes
+	}
+	if !m.DriftIgnoreRules.IsNull() && !m.DriftIgnoreRules.IsUnknown() {
+		rules := []string{}
+		for _, v := range m.DriftIgnoreRules.Elements() {
+			rules = append(rules, v.(types.String).ValueString())
+		}
+		req.DriftIgnoreRules = rules
+	}
 	if !m.DriftDetectionEnabled.IsNull() && !m.DriftDetectionEnabled.IsUnknown() {
 		v := m.DriftDetectionEnabled.ValueBool()
 		req.DriftDetectionEnabled = &v
@@ -477,11 +630,18 @@ func buildCreateWorkspaceRequest(ctx context.Context, m *workspaceModel) (terrap
 		v := m.DriftDetectionIntervalSeconds.ValueInt64()
 		req.DriftDetectionIntervalSeconds = &v
 	}
+	if !m.PlanExpirySeconds.IsNull() && !m.PlanExpirySeconds.IsUnknown() {
+		v := m.PlanExpirySeconds.ValueInt64()
+		req.PlanExpirySeconds = &v
+	}
 	if !m.AISummaryMode.IsNull() && !m.AISummaryMode.IsUnknown() {
 		req.AISummaryMode = m.AISummaryMode.ValueString()
 	}
 	if !m.AISummaryContext.IsNull() && !m.AISummaryContext.IsUnknown() {
 		req.AISummaryContext = m.AISummaryContext.ValueString()
+	}
+	if !m.SlackChannel.IsNull() && !m.SlackChannel.IsUnknown() {
+		req.SlackChannel = m.SlackChannel.ValueString()
 	}
 	return req, diags
 }
@@ -511,6 +671,13 @@ func buildUpdateWorkspaceRequest(ctx context.Context, m *workspaceModel) (terrap
 	if !m.TerraformVersion.IsNull() && !m.TerraformVersion.IsUnknown() {
 		req.TerraformVersion = m.TerraformVersion.ValueString()
 	}
+	if !m.TerragruntEnabled.IsNull() && !m.TerragruntEnabled.IsUnknown() {
+		v := m.TerragruntEnabled.ValueBool()
+		req.TerragruntEnabled = &v
+	}
+	if !m.TerragruntVersion.IsNull() && !m.TerragruntVersion.IsUnknown() {
+		req.TerragruntVersion = m.TerragruntVersion.ValueString()
+	}
 	if !m.WorkingDirectory.IsNull() && !m.WorkingDirectory.IsUnknown() {
 		req.WorkingDirectory = m.WorkingDirectory.ValueString()
 	}
@@ -556,6 +723,20 @@ func buildUpdateWorkspaceRequest(ctx context.Context, m *workspaceModel) (terrap
 		}
 		req.VarFiles = varFiles
 	}
+	if !m.TriggerPrefixes.IsNull() && !m.TriggerPrefixes.IsUnknown() {
+		triggerPrefixes := []string{}
+		for _, v := range m.TriggerPrefixes.Elements() {
+			triggerPrefixes = append(triggerPrefixes, v.(types.String).ValueString())
+		}
+		req.TriggerPrefixes = triggerPrefixes
+	}
+	if !m.DriftIgnoreRules.IsNull() && !m.DriftIgnoreRules.IsUnknown() {
+		rules := []string{}
+		for _, v := range m.DriftIgnoreRules.Elements() {
+			rules = append(rules, v.(types.String).ValueString())
+		}
+		req.DriftIgnoreRules = rules
+	}
 	if !m.DriftDetectionEnabled.IsNull() && !m.DriftDetectionEnabled.IsUnknown() {
 		v := m.DriftDetectionEnabled.ValueBool()
 		req.DriftDetectionEnabled = &v
@@ -564,12 +745,20 @@ func buildUpdateWorkspaceRequest(ctx context.Context, m *workspaceModel) (terrap
 		v := m.DriftDetectionIntervalSeconds.ValueInt64()
 		req.DriftDetectionIntervalSeconds = &v
 	}
+	if !m.PlanExpirySeconds.IsNull() && !m.PlanExpirySeconds.IsUnknown() {
+		v := m.PlanExpirySeconds.ValueInt64()
+		req.PlanExpirySeconds = &v
+	}
 	if !m.AISummaryMode.IsNull() && !m.AISummaryMode.IsUnknown() {
 		req.AISummaryMode = m.AISummaryMode.ValueString()
 	}
 	if !m.AISummaryContext.IsNull() && !m.AISummaryContext.IsUnknown() {
 		v := m.AISummaryContext.ValueString()
 		req.AISummaryContext = &v
+	}
+	if !m.SlackChannel.IsNull() && !m.SlackChannel.IsUnknown() {
+		v := m.SlackChannel.ValueString()
+		req.SlackChannel = &v
 	}
 	return req, diags
 }
@@ -603,6 +792,12 @@ func readWorkspaceIntoModel(ctx context.Context, ws *terrapod.Workspace, m *work
 	} else {
 		m.TerraformVersion = types.StringNull()
 	}
+	m.TerragruntEnabled = types.BoolValue(ws.TerragruntEnabled)
+	if ws.TerragruntVersion != "" {
+		m.TerragruntVersion = types.StringValue(ws.TerragruntVersion)
+	} else {
+		m.TerragruntVersion = types.StringNull()
+	}
 	if ws.VCSRepoURL != "" {
 		m.VCSRepoURL = types.StringValue(ws.VCSRepoURL)
 	} else {
@@ -631,6 +826,11 @@ func readWorkspaceIntoModel(ctx context.Context, ws *terrapod.Workspace, m *work
 	} else {
 		m.DriftDetectionIntervalSeconds = types.Int64Null()
 	}
+	if ws.PlanExpirySeconds != nil && *ws.PlanExpirySeconds > 0 {
+		m.PlanExpirySeconds = types.Int64Value(*ws.PlanExpirySeconds)
+	} else {
+		m.PlanExpirySeconds = types.Int64Null()
+	}
 	if ws.DriftStatus != "" {
 		m.DriftStatus = types.StringValue(ws.DriftStatus)
 	} else {
@@ -640,6 +840,52 @@ func readWorkspaceIntoModel(ctx context.Context, ws *terrapod.Workspace, m *work
 		m.DriftLastCheckedAt = types.StringValue(ws.DriftLastCheckedAt)
 	} else {
 		m.DriftLastCheckedAt = types.StringNull()
+	}
+	if ws.DriftLatestRunID != "" {
+		m.DriftLatestRunID = types.StringValue(ws.DriftLatestRunID)
+	} else {
+		m.DriftLatestRunID = types.StringNull()
+	}
+
+	// State + lifecycle + VCS poll status — read-only fields the server
+	// surfaces for diagnostics and operator UX. Empty-string from the
+	// SDK becomes Terraform null so a fresh workspace doesn't show
+	// "empty string" values in the state diff.
+	m.StateDiverged = types.BoolValue(ws.StateDiverged)
+	if ws.LifecycleState != "" {
+		m.LifecycleState = types.StringValue(ws.LifecycleState)
+	} else {
+		m.LifecycleState = types.StringNull()
+	}
+	if ws.LifecycleReason != "" {
+		m.LifecycleReason = types.StringValue(ws.LifecycleReason)
+	} else {
+		m.LifecycleReason = types.StringNull()
+	}
+	if ws.VCSLastPolledAt != "" {
+		m.VCSLastPolledAt = types.StringValue(ws.VCSLastPolledAt)
+	} else {
+		m.VCSLastPolledAt = types.StringNull()
+	}
+	if ws.VCSLastError != "" {
+		m.VCSLastError = types.StringValue(ws.VCSLastError)
+	} else {
+		m.VCSLastError = types.StringNull()
+	}
+	if ws.VCSLastErrorAt != "" {
+		m.VCSLastErrorAt = types.StringValue(ws.VCSLastErrorAt)
+	} else {
+		m.VCSLastErrorAt = types.StringNull()
+	}
+	if ws.AgentPoolName != "" {
+		m.AgentPoolName = types.StringValue(ws.AgentPoolName)
+	} else {
+		m.AgentPoolName = types.StringNull()
+	}
+	if ws.VCSConnectionName != "" {
+		m.VCSConnectionName = types.StringValue(ws.VCSConnectionName)
+	} else {
+		m.VCSConnectionName = types.StringNull()
 	}
 
 	// AI plan summary (#401). The server always returns a concrete
@@ -652,202 +898,67 @@ func readWorkspaceIntoModel(ctx context.Context, ws *terrapod.Workspace, m *work
 		m.AISummaryMode = types.StringValue("default")
 	}
 	m.AISummaryContext = types.StringValue(ws.AISummaryContext)
+	m.SlackChannel = types.StringValue(ws.SlackChannel)
 
-	// Var files
-	if len(ws.VarFiles) > 0 {
-		val, d := types.ListValueFrom(ctx, types.StringType, ws.VarFiles)
-		diags.Append(d...)
-		m.VarFiles = val
-	} else {
+	// Var files — same null-vs-empty rule as trigger_prefixes above.
+	if m.VarFiles.IsNull() && len(ws.VarFiles) == 0 {
 		m.VarFiles = types.ListNull(types.StringType)
+	} else {
+		vfVal, vfDiag := types.ListValueFrom(ctx, types.StringType, ws.VarFiles)
+		diags.Append(vfDiag...)
+		m.VarFiles = vfVal
 	}
 
-	// Labels
-	if len(ws.Labels) > 0 {
+	// Trigger prefixes — repo paths beyond `working_directory` that must
+	// land in the sparse-checkout fetch.
+	//
+	// The null-vs-empty-list ambiguity is the most-bitten edge in the
+	// terraform-plugin-framework Optional list pattern, and we've been
+	// burned by both directions:
+	//
+	// - v0.35.4: Read coerced `[]` to null. A caller that declared
+	//   `trigger_prefixes = []` got plan=[] / apply=null mismatch.
+	// - v0.35.5: Read coerced null to `[]`. A caller that OMITTED the
+	//   field got plan=null / apply=[] mismatch on the very first
+	//   apply against the new provider.
+	//
+	// Right answer: respect what the prior state holds. The framework
+	// passes the prior state into this function via `m`, so checking
+	// `m.TriggerPrefixes.IsNull()` BEFORE we overwrite it lets us
+	// preserve null when the caller's config + prior state were both
+	// null and the API just returned its default empty list. Only
+	// materialise as `[]` when the prior state already had a non-null
+	// list (or when the API returned a populated list).
+	if m.TriggerPrefixes.IsNull() && len(ws.TriggerPrefixes) == 0 {
+		// prior null + server empty → preserve null (caller omitted it)
+		m.TriggerPrefixes = types.ListNull(types.StringType)
+	} else {
+		tpVal, tpDiag := types.ListValueFrom(ctx, types.StringType, ws.TriggerPrefixes)
+		diags.Append(tpDiag...)
+		m.TriggerPrefixes = tpVal
+	}
+
+	// Drift-ignore rules (#482) — same null-vs-empty preservation rule
+	// as trigger_prefixes. Server default `[]` is preserved as null in
+	// state when the caller didn't declare the attribute.
+	if m.DriftIgnoreRules.IsNull() && len(ws.DriftIgnoreRules) == 0 {
+		m.DriftIgnoreRules = types.ListNull(types.StringType)
+	} else {
+		dirVal, dirDiag := types.ListValueFrom(ctx, types.StringType, ws.DriftIgnoreRules)
+		diags.Append(dirDiag...)
+		m.DriftIgnoreRules = dirVal
+	}
+
+	// Labels — same null-vs-empty-map rule as trigger_prefixes above.
+	// `len(nil-map) == 0` so an empty server map collapses to the
+	// preserve-null branch when prior state was null.
+	if m.Labels.IsNull() && len(ws.Labels) == 0 {
+		m.Labels = types.MapNull(types.StringType)
+	} else {
 		val, d := types.MapValueFrom(ctx, types.StringType, ws.Labels)
 		diags.Append(d...)
 		m.Labels = val
-	} else {
-		m.Labels = types.MapNull(types.StringType)
 	}
-	return diags
-}
-
-// buildWorkspaceAttrs converts the Terraform model into JSON:API attributes.
-//
-// DEPRECATED — kept for the ImportState path which still uses the raw
-// client until the read-by-name path lands on go-terrapod. Will be
-// deleted alongside the rest of provider/internal/client/ once every
-// resource has migrated.
-func buildWorkspaceAttrs(m *workspaceModel) map[string]any {
-	attrs := map[string]any{
-		"name": m.Name.ValueString(),
-	}
-
-	if !m.ExecutionMode.IsNull() && !m.ExecutionMode.IsUnknown() {
-		attrs["execution-mode"] = m.ExecutionMode.ValueString()
-	}
-	if !m.AutoApply.IsNull() && !m.AutoApply.IsUnknown() {
-		attrs["auto-apply"] = m.AutoApply.ValueBool()
-	}
-	if !m.ExecutionBackend.IsNull() && !m.ExecutionBackend.IsUnknown() {
-		attrs["execution-backend"] = m.ExecutionBackend.ValueString()
-	}
-	if !m.TerraformVersion.IsNull() && !m.TerraformVersion.IsUnknown() {
-		attrs["terraform-version"] = m.TerraformVersion.ValueString()
-	}
-	if !m.WorkingDirectory.IsNull() && !m.WorkingDirectory.IsUnknown() {
-		attrs["working-directory"] = m.WorkingDirectory.ValueString()
-	}
-	if !m.ResourceCPU.IsNull() && !m.ResourceCPU.IsUnknown() {
-		attrs["resource-cpu"] = m.ResourceCPU.ValueString()
-	}
-	if !m.ResourceMemory.IsNull() && !m.ResourceMemory.IsUnknown() {
-		attrs["resource-memory"] = m.ResourceMemory.ValueString()
-	}
-	if !m.Labels.IsNull() && !m.Labels.IsUnknown() {
-		labels := map[string]string{}
-		for k, v := range m.Labels.Elements() {
-			labels[k] = v.(types.String).ValueString()
-		}
-		attrs["labels"] = labels
-	}
-	if !m.VCSRepoURL.IsNull() {
-		attrs["vcs-repo-url"] = m.VCSRepoURL.ValueString()
-	}
-	if !m.VCSBranch.IsNull() {
-		attrs["vcs-branch"] = m.VCSBranch.ValueString()
-	}
-	if !m.VCSWorkflow.IsNull() && !m.VCSWorkflow.IsUnknown() {
-		attrs["vcs-workflow"] = m.VCSWorkflow.ValueString()
-	}
-	if !m.AutoMerge.IsNull() && !m.AutoMerge.IsUnknown() {
-		attrs["auto-merge"] = m.AutoMerge.ValueBool()
-	}
-	if !m.AutoMergeStrategy.IsNull() && !m.AutoMergeStrategy.IsUnknown() {
-		attrs["auto-merge-strategy"] = m.AutoMergeStrategy.ValueString()
-	}
-	if !m.AgentPoolID.IsNull() {
-		attrs["agent-pool-id"] = m.AgentPoolID.ValueString()
-	}
-	if !m.VarFiles.IsNull() && !m.VarFiles.IsUnknown() {
-		varFiles := []string{}
-		for _, v := range m.VarFiles.Elements() {
-			varFiles = append(varFiles, v.(types.String).ValueString())
-		}
-		attrs["var-files"] = varFiles
-	}
-	if !m.DriftDetectionEnabled.IsNull() && !m.DriftDetectionEnabled.IsUnknown() {
-		attrs["drift-detection-enabled"] = m.DriftDetectionEnabled.ValueBool()
-	}
-	if !m.DriftDetectionIntervalSeconds.IsNull() && !m.DriftDetectionIntervalSeconds.IsUnknown() {
-		attrs["drift-detection-interval-seconds"] = m.DriftDetectionIntervalSeconds.ValueInt64()
-	}
-
-	return attrs
-}
-
-// buildWorkspaceRels converts the Terraform model into JSON:API relationships.
-func buildWorkspaceRels(m *workspaceModel) map[string]any {
-	if m.VCSConnectionID.IsNull() || m.VCSConnectionID.ValueString() == "" {
-		return nil
-	}
-	return map[string]any{
-		"vcs-connection": map[string]any{
-			"data": map[string]any{
-				"id":   m.VCSConnectionID.ValueString(),
-				"type": "vcs-connections",
-			},
-		},
-	}
-}
-
-// readResourceIntoModel populates the Terraform model from a JSON:API resource.
-func readResourceIntoModel(ctx context.Context, res *terrapod.Resource, m *workspaceModel) diag.Diagnostics {
-	var diags diag.Diagnostics
-
-	m.ID = types.StringValue(res.ID)
-	m.Name = types.StringValue(terrapod.GetStringAttr(res, "name"))
-	m.ExecutionMode = types.StringValue(terrapod.GetStringAttr(res, "execution-mode"))
-	m.AutoApply = types.BoolValue(terrapod.GetBoolAttr(res, "auto-apply"))
-	m.ExecutionBackend = types.StringValue(terrapod.GetStringAttr(res, "execution-backend"))
-	m.WorkingDirectory = types.StringValue(terrapod.GetStringAttr(res, "working-directory"))
-	m.ResourceCPU = types.StringValue(terrapod.GetStringAttr(res, "resource-cpu"))
-	m.ResourceMemory = types.StringValue(terrapod.GetStringAttr(res, "resource-memory"))
-	m.VCSWorkflow = types.StringValue(terrapod.GetStringAttr(res, "vcs-workflow"))
-	m.AutoMerge = types.BoolValue(terrapod.GetBoolAttr(res, "auto-merge"))
-	m.AutoMergeStrategy = types.StringValue(terrapod.GetStringAttr(res, "auto-merge-strategy"))
-	m.OwnerEmail = types.StringValue(terrapod.GetStringAttr(res, "owner-email"))
-	m.Locked = types.BoolValue(terrapod.GetBoolAttr(res, "locked"))
-	m.CreatedAt = types.StringValue(terrapod.GetStringAttr(res, "created-at"))
-	m.UpdatedAt = types.StringValue(terrapod.GetStringAttr(res, "updated-at"))
-
-	// Nullable string fields
-	if v := terrapod.GetStringAttr(res, "terraform-version"); v != "" {
-		m.TerraformVersion = types.StringValue(v)
-	} else {
-		m.TerraformVersion = types.StringNull()
-	}
-
-	if v := terrapod.GetStringAttr(res, "vcs-repo-url"); v != "" {
-		m.VCSRepoURL = types.StringValue(v)
-	} else {
-		m.VCSRepoURL = types.StringNull()
-	}
-	if v := terrapod.GetStringAttr(res, "vcs-branch"); v != "" {
-		m.VCSBranch = types.StringValue(v)
-	} else {
-		m.VCSBranch = types.StringNull()
-	}
-	if v := terrapod.GetStringAttr(res, "agent-pool-id"); v != "" {
-		m.AgentPoolID = types.StringValue(v)
-	} else {
-		m.AgentPoolID = types.StringNull()
-	}
-
-	// VCS connection from relationship
-	if v := terrapod.GetRelationshipID(res, "vcs-connection"); v != "" {
-		m.VCSConnectionID = types.StringValue(v)
-	} else {
-		m.VCSConnectionID = types.StringNull()
-	}
-
-	// Drift detection
-	m.DriftDetectionEnabled = types.BoolValue(terrapod.GetBoolAttr(res, "drift-detection-enabled"))
-	if v := terrapod.GetIntAttr(res, "drift-detection-interval-seconds"); v > 0 {
-		m.DriftDetectionIntervalSeconds = types.Int64Value(v)
-	} else {
-		m.DriftDetectionIntervalSeconds = types.Int64Null()
-	}
-	if v := terrapod.GetStringAttr(res, "drift-status"); v != "" {
-		m.DriftStatus = types.StringValue(v)
-	} else {
-		m.DriftStatus = types.StringNull()
-	}
-	if v := terrapod.GetStringAttr(res, "drift-last-checked-at"); v != "" {
-		m.DriftLastCheckedAt = types.StringValue(v)
-	} else {
-		m.DriftLastCheckedAt = types.StringNull()
-	}
-
-	// Var files
-	if varFiles := terrapod.GetListAttr(res, "var-files"); len(varFiles) > 0 {
-		val, d := types.ListValueFrom(ctx, types.StringType, varFiles)
-		diags.Append(d...)
-		m.VarFiles = val
-	} else {
-		m.VarFiles = types.ListNull(types.StringType)
-	}
-
-	// Labels
-	if labels := terrapod.GetMapAttr(res, "labels"); len(labels) > 0 {
-		val, d := types.MapValueFrom(ctx, types.StringType, labels)
-		diags.Append(d...)
-		m.Labels = val
-	} else {
-		m.Labels = types.MapNull(types.StringType)
-	}
-
 	return diags
 }
 

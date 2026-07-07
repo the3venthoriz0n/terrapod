@@ -44,11 +44,24 @@ from terrapod.api.dependencies import (
     get_current_user,
     get_listener_identity,
 )
-from terrapod.db.models import PlanSummary, Run, StateVersion, VCSConnection, Workspace, now_utc
+from terrapod.auth import capabilities as cap
+from terrapod.auth.capabilities import has_capability
+from terrapod.config import settings
+from terrapod.db.models import (
+    PlanSummary,
+    PlanSummaryMessage,
+    Run,
+    StateVersion,
+    VCSConnection,
+    Workspace,
+    now_utc,
+)
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
 from terrapod.services import agent_pool_service, run_service
-from terrapod.services.workspace_rbac_service import has_permission, resolve_workspace_permission
+from terrapod.services.workspace_rbac_service import (
+    resolve_workspace_capabilities_for,
+)
 from terrapod.storage import get_storage
 from terrapod.storage.keys import apply_log_key, plan_json_output_key, plan_log_key
 from terrapod.storage.protocol import ObjectNotFoundError
@@ -112,12 +125,17 @@ def _run_json(
             "attributes": {
                 "status": run.status,
                 "message": run.message,
+                # Why a run was discarded (state changed / plan expired /
+                # superseded), null otherwise (#646/#647).
+                "discard-reason": run.discard_reason,
                 "is-destroy": run.is_destroy,
                 "auto-apply": run.auto_apply,
                 "plan-only": run.plan_only,
                 "source": run.source,
                 "execution-backend": run.execution_backend,
                 "terraform-version": run.terraform_version,
+                "terragrunt-enabled": run.terragrunt_enabled,
+                "terragrunt-version": run.terragrunt_version,
                 "resource-cpu": run.resource_cpu,
                 "resource-memory": run.resource_memory,
                 # Runner resource profile + OOM detection (#430). All
@@ -252,18 +270,18 @@ async def _get_workspace(workspace_id: str, db: AsyncSession) -> Workspace:
     return ws
 
 
-async def _require_run_ws_permission(
+async def _require_run_ws_capability(
     run: Run, required: str, user: AuthenticatedUser, db: AsyncSession
 ) -> None:
-    """Check that user has the required permission on the run's workspace."""
+    """Check that user holds the required capability on the run's workspace."""
     ws = await db.get(Workspace, run.workspace_id)
     if ws is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
-    if not has_permission(perm, required):
+    caps = await resolve_workspace_capabilities_for(db, user, ws)
+    if not has_capability(caps, required):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Requires {required} permission on workspace",
+            detail=f"Requires '{required}' capability on workspace",
         )
 
 
@@ -331,6 +349,17 @@ async def _fetch_vcs_config(
     # (one request, one workspace), so we don't bother computing a wider
     # union. If another caller fetched the same SHA with a different path
     # set, that's a different cache entry — content-addressed by paths_hash.
+    #
+    # If the workspace's terraform crosses directory boundaries via relative
+    # module sources (`module "auth0" { source = "../auth0" }`), the operator
+    # MUST declare the referenced paths in `trigger_prefixes` — sparse-checkout
+    # cone mode includes parent directories but not siblings, so without an
+    # explicit prefix the runner would `lstat ../foo: no such file`. This
+    # contract is consistent with the VCS-poll path's `_compute_paths_unions`,
+    # so a workspace that works under VCS poll also works here. See #478 /
+    # #480 for the history (v0.35.3 briefly forced whole-repo here as a
+    # blanket fix; v0.35.4 reverted that and put the responsibility back on
+    # the workspace declaration).
     fetch_paths: list[str] = []
     if ws.working_directory:
         fetch_paths.append(ws.working_directory.strip("/ "))
@@ -377,7 +406,44 @@ async def create_run(
     # Runs without a CV (UI-queued) will fetch code from VCS downstream.
     plan_only = attrs.get("plan-only", False)
     cv_data = relationships.get("configuration-version", {}).get("data", {})
-    has_cv = bool(cv_data.get("id", "") if cv_data else "")
+    cv_id_raw = cv_data.get("id", "") if cv_data else ""
+    has_cv = bool(cv_id_raw)
+    # Parse the CV id ONCE, up front, with a guard: a malformed id is a client
+    # error (422), not a 500. Reused below for the speculative check and the
+    # run's configuration_version_id.
+    cv_uuid: uuid.UUID | None = None
+    if has_cv:
+        try:
+            cv_uuid = uuid.UUID(cv_id_raw.removeprefix("cv-"))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Invalid configuration-version id",
+            ) from exc
+    # A run against a speculative configuration version is ALWAYS plan-only
+    # (TFE/HCP parity). The cloud backend uploads a speculative CV for
+    # `tofu plan` and relies on the server to infer plan-only rather than
+    # always setting the run's `plan-only` attribute. Without honoring the CV
+    # flag, a CLI `plan` on a VCS-connected workspace is mis-read as an apply
+    # and rejected by the guard below (#661).
+    if cv_uuid is not None:
+        from terrapod.db.models import ConfigurationVersion
+
+        _spec_cv = await db.get(ConfigurationVersion, cv_uuid)
+        if _spec_cv is not None and _spec_cv.speculative:
+            plan_only = True
+    # Config-managed guardrail (#535): a catalog-managed workspace runs only the
+    # wrapper config the catalog generated for it. A run that pins a different
+    # configuration version would diverge it from its catalog item — reject.
+    # CV-less re-runs (re-plan/re-apply of the generated config) stay allowed.
+    if ws.catalog_item_id is not None and has_cv:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This workspace is managed by the service catalog; runs cannot pin a "
+                "custom configuration version. Manage it through the catalog."
+            ),
+        )
     if ws.execution_mode == "agent" and ws.vcs_connection_id is not None and has_cv:
         if not plan_only:
             raise HTTPException(
@@ -387,21 +453,23 @@ async def create_run(
             )
         plan_only = True
 
-    # Check permission: plan-only requires plan, apply requires write
-    required = "plan" if plan_only else "write"
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
-    if not has_permission(perm, required):
+    # Check capability: plan-only needs run:plan; apply needs run:apply, or
+    # run:apply-destroy when the run is a destroy (is-destroy=true).
+    if plan_only:
+        required_cap = cap.RUN_PLAN
+    elif attrs.get("is-destroy", False):
+        required_cap = cap.RUN_APPLY_DESTROY
+    else:
+        required_cap = cap.RUN_APPLY
+    caps = await resolve_workspace_capabilities_for(db, user, ws)
+    if not has_capability(caps, required_cap):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Requires {required} permission on workspace",
+            detail=f"Requires '{required_cap}' capability on workspace",
         )
 
-    # Configuration version (optional — provided by CLI uploads)
-    cv_data = relationships.get("configuration-version", {}).get("data", {})
-    cv_id = cv_data.get("id", "") if cv_data else ""
-    cv_uuid = None
-    if cv_id:
-        cv_uuid = uuid.UUID(cv_id.removeprefix("cv-"))
+    # Configuration version (optional) — cv_uuid was parsed + validated above
+    # from the same relationship (422 on a malformed id).
 
     # VCS ref override: plan against an arbitrary branch/tag (always plan-only)
     vcs_ref = attrs.get("vcs-ref", "")
@@ -496,7 +564,7 @@ async def show_run(
 ) -> JSONResponse:
     """Show a run. Requires read on workspace."""
     run = await _get_run(run_id, db)
-    await _require_run_ws_permission(run, "read", user, db)
+    await _require_run_ws_capability(run, cap.RUN_READ, user, db)
     ws = await db.get(Workspace, run.workspace_id)
 
     # Look up state version created by this run (detail endpoint only)
@@ -526,8 +594,8 @@ async def list_workspace_runs(
 ) -> JSONResponse:
     """List runs for a workspace. Requires read."""
     ws = await _get_workspace(workspace_id, db)
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
-    if not has_permission(perm, "read"):
+    caps = await resolve_workspace_capabilities_for(db, user, ws)
+    if not has_capability(caps, cap.RUN_READ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Requires read permission on workspace",
@@ -552,7 +620,9 @@ async def confirm_run(
 ) -> JSONResponse:
     """Confirm a planned run for apply. Requires write."""
     run = await _get_run(run_id, db)
-    await _require_run_ws_permission(run, "write", user, db)
+    await _require_run_ws_capability(
+        run, cap.RUN_APPLY_DESTROY if run.is_destroy else cap.RUN_APPLY, user, db
+    )
 
     # No-op apply guard: a plan with has_changes=False has nothing to apply.
     # The reconciler short-circuits these directly to `applied`, so this
@@ -604,7 +674,7 @@ async def discard_run(
 ) -> JSONResponse:
     """Discard a planned run. Requires plan."""
     run = await _get_run(run_id, db)
-    await _require_run_ws_permission(run, "plan", user, db)
+    await _require_run_ws_capability(run, cap.RUN_CANCEL, user, db)
     try:
         run = await run_service.discard_run(db, run)
         await db.commit()
@@ -621,7 +691,7 @@ async def cancel_run(
 ) -> JSONResponse:
     """Cancel a run. Requires plan."""
     run = await _get_run(run_id, db)
-    await _require_run_ws_permission(run, "plan", user, db)
+    await _require_run_ws_capability(run, cap.RUN_CANCEL, user, db)
     try:
         run = await run_service.cancel_run(db, run)
         await db.commit()
@@ -644,7 +714,7 @@ async def retry_run(
     Requires plan permission.
     """
     run = await _get_run(run_id, db)
-    await _require_run_ws_permission(run, "plan", user, db)
+    await _require_run_ws_capability(run, cap.RUN_CANCEL, user, db)
 
     is_terminal = run.status in run_service.TERMINAL_STATES or (
         run.plan_only and run.status == "planned"
@@ -779,7 +849,7 @@ async def list_run_events(
     We synthesize events from the run's status timestamps.
     """
     run = await _get_run(run_id, db)
-    await _require_run_ws_permission(run, "read", user, db)
+    await _require_run_ws_capability(run, cap.RUN_READ, user, db)
 
     events = []
     event_pairs = [
@@ -815,8 +885,6 @@ async def list_run_events(
 
 def _plan_json(run: Run) -> dict:
     """Build plan JSON:API response for a run."""
-    from terrapod.config import settings
-
     base = settings.auth.callback_base_url.rstrip("/")
     attrs: dict = {
         "status": _plan_status(run),
@@ -836,8 +904,11 @@ def _plan_json(run: Run) -> dict:
         attrs["resource-imports"] = run.resource_imports
     # AI plan summary URL — surfaced as a Terrapod-native link on every
     # plan response so the UI knows where to fetch the structured
-    # summary. 404s gracefully when no summary exists yet.
-    attrs["ai-summary-url"] = f"{base}/api/terrapod/v1/runs/{run.id}/plan-summary"
+    # summary. 404s gracefully when no summary exists yet. Omitted
+    # entirely when the feature is globally disabled so the UI
+    # doesn't make a doomed fetch for every page load (#463 phase 7).
+    if settings.ai_summary.enabled:
+        attrs["ai-summary-url"] = f"{base}/api/terrapod/v1/runs/{run.id}/plan-summary"
     return {
         "data": {
             "id": f"plan-{run.id}",
@@ -862,7 +933,7 @@ async def show_plan_by_id(
     Plan IDs use the same UUID as the run with a 'plan-' prefix.
     """
     run = await _get_run(plan_id.replace("plan-", "run-"), db)
-    await _require_run_ws_permission(run, "read", user, db)
+    await _require_run_ws_capability(run, cap.RUN_READ, user, db)
     return JSONResponse(content=_plan_json(run))
 
 
@@ -883,7 +954,7 @@ async def show_plan_summary(
     branches on the ``kind`` attribute.
     """
     run = await _get_run(run_id, db)
-    await _require_run_ws_permission(run, "read", user, db)
+    await _require_run_ws_capability(run, cap.RUN_READ, user, db)
 
     summary = (
         await db.execute(select(PlanSummary).where(PlanSummary.run_id == run.id))
@@ -922,12 +993,11 @@ def _summary_kind_for_run(run: Run) -> str | None:
     """Pick the right summariser kind for a run's current state.
 
     Returns "plan_summary" for runs that produced a plan (any state past
-    `planning` except plan-phase errored), "failure_analysis" for runs
-    that failed during the plan phase, and None when no summary kind
-    applies (still in `pending`/`queued`/`planning`, or apply-phase
-    errored — apply failures aren't part of #401).
+    `planning` except errored), "failure_analysis" for runs that
+    errored during EITHER plan or apply (#419), and None when no
+    summary kind applies (still in `pending`/`queued`/`planning`).
     """
-    if run.status == "errored" and run.plan_started_at and run.apply_started_at is None:
+    if run.status == "errored" and run.plan_started_at:
         return "failure_analysis"
     if run.status in {"planned", "confirmed", "applying", "applied", "discarded"}:
         return "plan_summary"
@@ -963,7 +1033,7 @@ async def regenerate_plan_summary(
         raise HTTPException(status_code=503, detail="AI summary is disabled globally")
 
     run = await _get_run(run_id, db)
-    await _require_run_ws_permission(run, "read", user, db)
+    await _require_run_ws_capability(run, cap.RUN_READ, user, db)
 
     kind = _summary_kind_for_run(run)
     if kind is None:
@@ -1022,6 +1092,16 @@ async def regenerate_plan_summary(
         {"run_id": str(run.id), "kind": kind},
     )
 
+    # SSE so the run-detail page reverts to the pending placeholder
+    # immediately on regenerate, without waiting for the handler to
+    # fire its own pending event (#463 phase 4).
+    try:
+        from terrapod.services.summariser import _emit_summary_event
+
+        await _emit_summary_event("plan_summary_pending", run.workspace_id, run.id)
+    except Exception as e:  # SSE is best-effort
+        logger.debug("Failed to publish pending event on regenerate", error=str(e))
+
     return JSONResponse(
         status_code=202,
         content={
@@ -1050,6 +1130,170 @@ async def regenerate_plan_summary(
     )
 
 
+# ── Plan summary follow-up chat (#463) ─────────────────────────────────
+
+
+def _plan_summary_message_attr(msg: PlanSummaryMessage) -> dict:
+    """JSON:API attributes block for a single chat turn."""
+    return {
+        "role": msg.role,
+        "content": msg.content,
+        "model": msg.model,
+        "input-tokens": msg.input_tokens,
+        "output-tokens": msg.output_tokens,
+        "error-message": msg.error_message,
+        "created-at": _rfc3339(msg.created_at),
+    }
+
+
+async def _resolve_plan_summary_for_chat(
+    run_id: str, user: AuthenticatedUser, db: AsyncSession
+) -> tuple[Run, PlanSummary, Workspace]:
+    """Shared header for both chat endpoints.
+
+    Verifies the run exists, the user has workspace `read`, an
+    initial summary has landed (404 otherwise — can't chat against a
+    plan that hasn't been summarised), and returns the joined rows.
+    """
+    run = await _get_run(run_id, db)
+    await _require_run_ws_capability(run, cap.RUN_READ, user, db)
+    summary = (
+        await db.execute(select(PlanSummary).where(PlanSummary.run_id == run.id))
+    ).scalar_one_or_none()
+    if summary is None:
+        raise HTTPException(status_code=404, detail="no summary for this plan")
+    if summary.status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail=f"initial summary is '{summary.status}', not 'ready' — cannot start chat",
+        )
+    workspace = (
+        await db.execute(select(Workspace).where(Workspace.id == run.workspace_id))
+    ).scalar_one_or_none()
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="workspace not found")
+    return run, summary, workspace
+
+
+@extensions_router.get("/runs/{run_id}/plan-summary/messages")
+async def list_plan_summary_messages(
+    run_id: str = Path(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """Full transcript of the AI plan-summary chat thread (#463).
+
+    Returns the messages in chronological order. The initial
+    structured summary lives on the parent `PlanSummary` row
+    (`description` + `risk_factors`); this endpoint returns ONLY the
+    conversational follow-ups. The UI renders message[0] from the
+    parent summary and appends these.
+
+    Empty list when no follow-ups have been posted yet.
+    """
+    _run, summary, _ws = await _resolve_plan_summary_for_chat(run_id, user, db)
+    rows = (
+        (
+            await db.execute(
+                select(PlanSummaryMessage)
+                .where(PlanSummaryMessage.plan_summary_id == summary.id)
+                .order_by(PlanSummaryMessage.created_at, PlanSummaryMessage.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return JSONResponse(
+        content={
+            "data": [
+                {
+                    "id": f"plan-summary-message-{row.id}",
+                    "type": "plan-summary-messages",
+                    "attributes": _plan_summary_message_attr(row),
+                }
+                for row in rows
+            ],
+            "meta": {
+                "count": len(rows),
+            },
+        }
+    )
+
+
+@extensions_router.post("/runs/{run_id}/plan-summary/messages")
+async def post_plan_summary_message(
+    run_id: str = Path(...),
+    body: dict = Body(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """Post a user follow-up + get the synchronous assistant reply (#463).
+
+    Body: ``{"data": {"attributes": {"content": "..."}}}`` (JSON:API
+    shape, matches the rest of Terrapod's POST endpoints).
+
+    The service path persists the user row first (so a failed model
+    call still records what was asked), then calls the model with
+    the cacheable prefix the initial summary used (Anthropic /
+    Bedrock-Anthropic / Bedrock-Nova get the prompt-cache hit), then
+    persists the assistant turn + telemetry.
+
+    Returns 201 with the assistant message attributes. Authorisation
+    is read-on-workspace — anyone who can see the run can chat in
+    its thread (matches PR conversation semantics, not per-user
+    threads).
+    """
+    from terrapod.services.summariser import (
+        FollowupBudgetExhausted,
+        FollowupCapReached,
+        FollowupDisabled,
+        FollowupError,
+        post_followup,
+    )
+
+    content = ""
+    try:
+        attrs = body.get("data", {}).get("attributes", {}) or {}
+        content = str(attrs.get("content", "") or "")
+    except AttributeError:
+        raise HTTPException(status_code=400, detail="malformed body") from None
+
+    run, summary, workspace = await _resolve_plan_summary_for_chat(run_id, user, db)
+
+    try:
+        assistant_row = await post_followup(
+            db=db,
+            plan_summary=summary,
+            run=run,
+            workspace=workspace,
+            user_message_text=content,
+        )
+    except FollowupDisabled as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except FollowupCapReached as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except FollowupBudgetExhausted as e:
+        raise HTTPException(status_code=429, detail=str(e)) from e
+    except FollowupError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except (RuntimeError, ValueError) as e:
+        # Model HTTP / parse failure. The service has persisted both
+        # the user turn AND an errored assistant turn, so the
+        # transcript reflects the failure.
+        raise HTTPException(status_code=502, detail=f"model call failed: {e}") from e
+
+    return JSONResponse(
+        status_code=201,
+        content={
+            "data": {
+                "id": f"plan-summary-message-{assistant_row.id}",
+                "type": "plan-summary-messages",
+                "attributes": _plan_summary_message_attr(assistant_row),
+            }
+        },
+    )
+
+
 @extensions_router.get("/runs/{run_id}/plan")
 async def show_plan(
     run_id: str = Path(...),
@@ -1058,7 +1302,7 @@ async def show_plan(
 ) -> JSONResponse:
     """Show plan details including log URL."""
     run = await _get_run(run_id, db)
-    await _require_run_ws_permission(run, "read", user, db)
+    await _require_run_ws_capability(run, cap.RUN_READ, user, db)
     return JSONResponse(content=_plan_json(run))
 
 
@@ -1094,7 +1338,7 @@ async def show_apply_by_id(
     Apply IDs use the same UUID as the run with an 'apply-' prefix.
     """
     run = await _get_run(apply_id.replace("apply-", "run-"), db)
-    await _require_run_ws_permission(run, "read", user, db)
+    await _require_run_ws_capability(run, cap.RUN_READ, user, db)
     return JSONResponse(content=_apply_json(run))
 
 
@@ -1106,7 +1350,7 @@ async def show_apply(
 ) -> JSONResponse:
     """Show apply details including log URL."""
     run = await _get_run(run_id, db)
-    await _require_run_ws_permission(run, "read", user, db)
+    await _require_run_ws_capability(run, cap.RUN_READ, user, db)
     return JSONResponse(content=_apply_json(run))
 
 
@@ -1132,8 +1376,8 @@ async def run_events_stream(
 
     async with get_db_session() as db:
         ws = await _get_workspace(workspace_id, db)
-        perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
-        if not has_permission(perm, "read"):
+        caps = await resolve_workspace_capabilities_for(db, user, ws)
+        if not has_capability(caps, cap.RUN_READ):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Requires read permission on workspace",
@@ -1216,15 +1460,41 @@ async def next_run(
 
     resolved = await resolve_variables(db, run.workspace_id)
     env_vars = [{"key": v.key, "value": v.value} for v in resolved if v.category == "env"]
+    # `hcl` is forwarded so the runner renders the value correctly into the
+    # generated terrapod.auto.tfvars (raw HCL expression vs quoted string). All
+    # terraform vars — sensitive and not — are delivered uniformly via the
+    # per-run vars Secret (mounted as the tfvars file), never as plaintext env;
+    # there is no sensitivity split. See runner/phases/tfvars.py + the listener
+    # vars Secret.
     terraform_vars = [
-        {"key": v.key, "value": v.value} for v in resolved if v.category == "terraform"
+        {"key": v.key, "value": v.value, "hcl": v.hcl}
+        for v in resolved
+        if v.category == "terraform"
     ]
+
+    # Resolve execution hooks associated with this workspace (#619). Delivered
+    # alongside the vars via the per-run Secret; the runner runs each hook_point
+    # at its boundary. Enforced-empty for local execution never reaches here
+    # (next_run is the agent-mode listener endpoint).
+    #
+    # Kill-switch (#678): enforce `runners.hooksEnabled` HERE, server-side and
+    # authoritatively — when disabled the API serves NO hooks, so a custom
+    # listener that ignores the flag still never receives any hook script. The
+    # bundled listener also drops hooks when building the Job (defense in depth).
+    from terrapod.config import load_runner_config
+    from terrapod.services.execution_hook_service import resolve_hooks_for_workspace
+
+    if load_runner_config().hooks_enabled:
+        execution_hooks = await resolve_hooks_for_workspace(db, run.workspace_id)
+    else:
+        execution_hooks = []
 
     await db.commit()
 
     run_data = _run_json(run)
     run_data["data"]["attributes"]["env-vars"] = env_vars
     run_data["data"]["attributes"]["terraform-vars"] = terraform_vars
+    run_data["data"]["attributes"]["execution-hooks"] = execution_hooks
     run_data["data"]["attributes"]["var-files"] = ws.var_files if ws and ws.var_files else []
     run_data["data"]["attributes"]["working-directory"] = ws.working_directory if ws else ""
     run_data["data"]["attributes"]["phase"] = phase
@@ -1279,16 +1549,20 @@ async def update_run_status(
         run.has_changes = has_changes
 
     try:
-        run = await run_service.transition_run(db, run, target_status, error_message=error_message)
-
-        # No-op short-circuit: a plan with has_changes=False has nothing for an
-        # apply Job to do. Use the shared helper so this path stays in lockstep
-        # with the reconciler's `_handle_succeeded` no-op skip.
-        if target_status == "planned" and not run.plan_only and run.has_changes is False:
-            run = await run_service.complete_planned_as_noop(db, run)
-        # Auto-apply if configured
-        elif target_status == "planned" and run.auto_apply and not run.plan_only:
-            run = await run_service.transition_run(db, run, "confirmed")
+        if target_status == "planned" and not run.plan_only:
+            # Route a plan completion through the shared, guarded path — the
+            # SAME one the plan-result endpoint (report_plan_result) and the
+            # reconciler use — so it applies the post-plan gates, the no-op
+            # short-circuit, AND the #646/#647 auto-apply staleness +
+            # manual-lock guards. A bare transition_run(..., "confirmed") here
+            # bypassed those guards and could auto-apply a plan against state
+            # that moved since it was computed (#665). complete_plan is
+            # idempotent (no-ops unless the run is still `planning`).
+            run = await run_service.complete_plan(db, run, has_changes=has_changes)
+        else:
+            run = await run_service.transition_run(
+                db, run, target_status, error_message=error_message
+            )
 
         # Unlock workspace when plan-only run reaches planned
         # (plan-only runs don't mutate state, so no need to hold the lock)
@@ -1495,7 +1769,13 @@ async def upload_log_stream(
     )
 
     redis = get_redis_client()
-    await redis.setex(f"{LOG_STREAM_PREFIX}{run.id}:{phase}", 300, body_bytes)
+    # decode_responses=True on the Redis client means a bytes value
+    # going through SETEX gets stringified via str(bytes) — yielding
+    # the literal `b'…\\n…'` text. Decode to UTF-8 str so the value
+    # round-trips cleanly. errors=replace covers any stray non-UTF-8
+    # bytes (e.g. from a stack-trace's escape sequence).
+    body_text = body_bytes.decode("utf-8", errors="replace")
+    await redis.setex(f"{LOG_STREAM_PREFIX}{run.id}:{phase}", 300, body_text)
 
     # Notify frontend that fresh log data is available
     try:

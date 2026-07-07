@@ -19,15 +19,15 @@ import (
 // look at fields the tests don't set. Keeping fixtures small leaves
 // the tests readable.
 type workspaceFixtureServer struct {
-	t              *testing.T
-	server         *httptest.Server
-	createHandler  http.HandlerFunc
-	readHandler    http.HandlerFunc
-	updateHandler  http.HandlerFunc
-	deleteHandler  http.HandlerFunc
-	listHandler    http.HandlerFunc
-	byNameHandler  http.HandlerFunc
-	lastBody       []byte // captures the last request's body for inspection
+	t             *testing.T
+	server        *httptest.Server
+	createHandler http.HandlerFunc
+	readHandler   http.HandlerFunc
+	updateHandler http.HandlerFunc
+	deleteHandler http.HandlerFunc
+	listHandler   http.HandlerFunc
+	byNameHandler http.HandlerFunc
+	lastBody      []byte // captures the last request's body for inspection
 }
 
 func newWorkspaceFixtureServer(t *testing.T) *workspaceFixtureServer {
@@ -368,6 +368,121 @@ func TestWorkspaceFromResource_DriftFields(t *testing.T) {
 	}
 }
 
+// TestWorkspaceFromResource_ContractParity pins the read-side of the
+// API↔SDK contract for workspace attributes that were silently missing
+// before #480. Adding a new server attribute → extending the SDK
+// `Workspace` struct + this fixture is the path that keeps the
+// contract enforceable: if the server attribute is later renamed and
+// the SDK isn't updated to match, this test goes red.
+func TestWorkspaceFromResource_ContractParity(t *testing.T) {
+	body := `{"data": {
+	  "id": "ws-aaa",
+	  "type": "workspaces",
+	  "attributes": {
+	    "name": "api",
+	    "trigger-prefixes": ["terraform/auth0", "terraform/shared"],
+	    "drift-latest-run-id": "run-019eb151-4faf-71a9-9f1a-9841e8c993aa",
+	    "state-diverged": true,
+	    "lifecycle-state": "pending_deletion",
+	    "lifecycle-reason": "directory 'accounts/x' removed on 'main'",
+	    "vcs-last-polled-at": "2026-06-10T11:50:00Z",
+	    "vcs-last-error": "github app token expired",
+	    "vcs-last-error-at": "2026-06-10T11:45:00Z",
+	    "agent-pool-name": "dev-pool-1",
+	    "vcs-connection-name": "example-github"
+	  }
+	}}`
+	ws, err := parseWorkspace([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws.TriggerPrefixes) != 2 || ws.TriggerPrefixes[0] != "terraform/auth0" {
+		t.Errorf("TriggerPrefixes = %v", ws.TriggerPrefixes)
+	}
+	if ws.DriftLatestRunID != "run-019eb151-4faf-71a9-9f1a-9841e8c993aa" {
+		t.Errorf("DriftLatestRunID = %q", ws.DriftLatestRunID)
+	}
+	if !ws.StateDiverged {
+		t.Error("StateDiverged should be true")
+	}
+	if ws.LifecycleState != "pending_deletion" || ws.LifecycleReason == "" {
+		t.Errorf("lifecycle fields: state=%q reason=%q", ws.LifecycleState, ws.LifecycleReason)
+	}
+	if ws.VCSLastPolledAt == "" || ws.VCSLastError == "" || ws.VCSLastErrorAt == "" {
+		t.Errorf("vcs-poll status fields: polled=%q err=%q errAt=%q",
+			ws.VCSLastPolledAt, ws.VCSLastError, ws.VCSLastErrorAt)
+	}
+	if ws.AgentPoolName != "dev-pool-1" || ws.VCSConnectionName != "example-github" {
+		t.Errorf("derived names: pool=%q conn=%q", ws.AgentPoolName, ws.VCSConnectionName)
+	}
+}
+
+// TestWorkspaceCreate_TriggerPrefixes_Wire pins the write-side: when a
+// caller supplies TriggerPrefixes on CreateWorkspaceRequest, the SDK
+// MUST marshal it into the JSON:API attributes block as
+// `trigger-prefixes`. Was silently dropped before #480.
+func TestWorkspaceCreate_TriggerPrefixes_Wire(t *testing.T) {
+	var receivedBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/vnd.api+json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"data":{"id":"ws-new","type":"workspaces","attributes":{"name":"x","trigger-prefixes":["a","b"]}}}`))
+	}))
+	defer srv.Close()
+
+	c, err := NewClient(Options{BaseURL: srv.URL, Token: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.CreateWorkspace(context.Background(), CreateWorkspaceRequest{
+		Name:            "x",
+		ExecutionMode:   "agent",
+		TriggerPrefixes: []string{"a", "b"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(receivedBody), `"trigger-prefixes":["a","b"]`) {
+		t.Errorf("trigger-prefixes missing from request body: %s", receivedBody)
+	}
+}
+
+// TestWorkspaceTerragrunt_RoundTrip pins both sides of the terragrunt
+// contract (#534): the write side marshals terragrunt-enabled/-version into
+// the request, and the read side projects them back onto the Workspace.
+func TestWorkspaceTerragrunt_RoundTrip(t *testing.T) {
+	var receivedBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/vnd.api+json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"data":{"id":"ws-tg","type":"workspaces","attributes":{"name":"tg","terragrunt-enabled":true,"terragrunt-version":"1.0"}}}`))
+	}))
+	defer srv.Close()
+
+	c, err := NewClient(Options{BaseURL: srv.URL, Token: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	enabled := true
+	ws, err := c.CreateWorkspace(context.Background(), CreateWorkspaceRequest{
+		Name:              "tg",
+		ExecutionMode:     "agent",
+		TerragruntEnabled: &enabled,
+		TerragruntVersion: "1.0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(receivedBody), `"terragrunt-enabled":true`) ||
+		!strings.Contains(string(receivedBody), `"terragrunt-version":"1.0"`) {
+		t.Errorf("terragrunt fields missing from request body: %s", receivedBody)
+	}
+	if !ws.TerragruntEnabled || ws.TerragruntVersion != "1.0" {
+		t.Errorf("terragrunt not projected: enabled=%v version=%q", ws.TerragruntEnabled, ws.TerragruntVersion)
+	}
+}
+
 func TestWorkspaceFromResource_VCSConnectionRelationship(t *testing.T) {
 	body := `{"data": {
 	  "id": "ws-aaa",
@@ -386,27 +501,23 @@ func TestWorkspaceFromResource_VCSConnectionRelationship(t *testing.T) {
 	}
 }
 
-func TestWorkspaceCreate_RetryOn5xx(t *testing.T) {
-	// Belt-and-braces verification that the workspace-specific path
-	// still picks up Client's 5xx retry. The Client tests cover this
-	// abstractly; this confirms the path the migration tool actually
-	// drives.
+func TestWorkspaceCreate_DoesNotRetryOn5xx(t *testing.T) {
+	// Workspace creation is a POST (non-idempotent), so a 5xx must NOT
+	// be retried — a create that the server already processed but
+	// surfaced as a 5xx would otherwise be duplicated. This confirms the
+	// method-aware retry policy on the path the migration tool drives.
 	var calls int
 	f := newWorkspaceFixtureServer(t)
 	f.createHandler = func(w http.ResponseWriter, r *http.Request) {
 		calls++
-		if calls == 1 {
-			w.WriteHeader(http.StatusBadGateway)
-			return
-		}
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(minimalWorkspaceBody("ws-aaa", "api", nil)))
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"errors":[{"status":"502","detail":"bad gateway"}]}`))
 	}
 	c := f.client()
-	if _, err := c.CreateWorkspace(context.Background(), CreateWorkspaceRequest{Name: "api"}); err != nil {
-		t.Fatalf("retry should recover: %v", err)
+	if _, err := c.CreateWorkspace(context.Background(), CreateWorkspaceRequest{Name: "api"}); err == nil {
+		t.Fatal("expected the 502 to surface (POST must not retry)")
 	}
-	if calls != 2 {
-		t.Errorf("expected 2 calls (1 retry), got %d", calls)
+	if calls != 1 {
+		t.Errorf("POST must not retry on 5xx: expected 1 call, got %d", calls)
 	}
 }

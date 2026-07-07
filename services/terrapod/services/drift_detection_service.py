@@ -7,6 +7,7 @@ Triggered handler: handle_drift_run_completed() updates workspace drift_status b
 on the run outcome and fires drift_detected notifications when drift is found.
 """
 
+import asyncio
 import json
 import uuid
 
@@ -25,23 +26,55 @@ from terrapod.db.models import (
 from terrapod.db.session import get_db_session
 from terrapod.logging_config import get_logger
 from terrapod.services import run_service
-from terrapod.storage import get_storage
-from terrapod.storage.keys import config_version_key
 
 logger = get_logger(__name__)
 
-# States that indicate a run is still in progress
-ACTIVE_STATES = {"pending", "queued", "planning", "planned", "confirmed", "applying"}
+# Drift checks should skip workspaces where terraform is actively
+# running — a second concurrent plan against the same state could
+# observe inconsistent intermediate state and produce a false drift
+# signal. But "active" for that purpose is narrower than "non-terminal":
+# {planning, applying} are actively consuming a runner slot;
+# everything else (pending lock-acquire, queued for pickup, planned
+# awaiting confirm, confirmed awaiting transition) is either
+# instantaneous (pending, confirmed) or waits indefinitely on an
+# external trigger (planned awaits operator confirm/discard) and
+# does not conflict with a plan-only drift run on its own CV.
+#
+# This was previously a {pending, queued, planning, planned,
+# confirmed, applying} set, which made any workspace with a `planned`
+# run sitting awaiting confirmation skip drift forever — the
+# operator-visible status column shows the LATEST run (applied) so
+# the workspace looks healthy but `drift_status` quietly froze at
+# the first errored attempt (production incident: four workspaces
+# stuck for 1-7 weeks without a drift retry).
+RUNNER_BUSY_STATES = {"planning", "applying"}
 
 
-async def _is_workspace_busy(db: AsyncSession, workspace_id: uuid.UUID) -> bool:
-    """Check if a workspace has any active (non-terminal) runs."""
+async def _is_runner_busy(db: AsyncSession, workspace_id: uuid.UUID) -> bool:
+    """Workspace has a run that's actively executing on a runner.
+
+    NOTE — Code ↔ Tests contract (CLAUDE.md): the precise membership of
+    RUNNER_BUSY_STATES is pinned by
+    `tests/services/test_drift_detection_service.py::TestDriftCheckCycle::
+    test_is_runner_busy_only_counts_planning_or_applying`. Widening this
+    set (e.g. re-adding `planned`) reintroduces the production incident
+    where workspaces with stale `planned` peers froze drift forever.
+    Narrow it deliberately — and update both the source comment AND the
+    regression test together.
+
+    True only when terraform is mid-plan or mid-apply for this
+    workspace — running a parallel drift check then would produce a
+    racy/inconsistent observation. Runs in `planned` (awaiting
+    confirm/discard) or `confirmed` (awaiting applying transition)
+    do NOT count: they don't hold the runner, and a plan-only drift
+    run on its own CV doesn't conflict with them.
+    """
     result = await db.execute(
         select(func.count())
         .select_from(Run)
         .where(
             Run.workspace_id == workspace_id,
-            Run.status.in_(ACTIVE_STATES),
+            Run.status.in_(RUNNER_BUSY_STATES),
         )
     )
     return result.scalar_one() > 0
@@ -57,20 +90,116 @@ async def _has_state(db: AsyncSession, workspace_id: uuid.UUID) -> bool:
     return result.scalar_one() > 0
 
 
+async def _apply_drift_ignore_rules(run: Run, rules: list[str]) -> str:
+    """Run a drift-detection plan through `drift_ignore_classifier` (#482).
+
+    Fetches the plan JSON from storage, feeds it through the classifier
+    along with the workspace's rules, and returns the resulting drift
+    status — `"no_drift"` when every change is suppressed, `"drifted"`
+    otherwise. Any failure path (missing object, malformed JSON,
+    classifier crash) is logged and conservatively falls back to
+    `"drifted"` so a runtime hiccup never *silences* drift the
+    operator intended to surface.
+    """
+    from terrapod.services.drift_ignore_classifier import classify_drift
+    from terrapod.storage import get_storage
+    from terrapod.storage.keys import plan_json_output_key
+    from terrapod.storage.protocol import ObjectNotFoundError
+
+    storage = get_storage()
+    key = plan_json_output_key(str(run.workspace_id), str(run.id))
+    try:
+        raw = await storage.get(key)
+    except ObjectNotFoundError:
+        logger.warning(
+            "drift_ignore: plan JSON missing; treating as drift",
+            run_id=str(run.id),
+            key=key,
+        )
+        return "drifted"
+    except Exception as e:
+        logger.warning(
+            "drift_ignore: storage error; treating as drift",
+            run_id=str(run.id),
+            error=str(e),
+        )
+        return "drifted"
+
+    # Rule 13: parsing a multi-MB plan JSON and recursing every resource
+    # change in classify_drift is CPU-bound — run both off the event loop so
+    # this handler (driven by the drift_run_completed trigger on an API
+    # replica) never stalls /health while a large plan is classified.
+    try:
+        plan = await asyncio.to_thread(json.loads, raw)
+    except (ValueError, TypeError) as e:
+        logger.warning(
+            "drift_ignore: plan JSON unparseable; treating as drift",
+            run_id=str(run.id),
+            error=str(e),
+        )
+        return "drifted"
+
+    try:
+        still_drifted, suppressed = await asyncio.to_thread(classify_drift, plan, rules)
+    except Exception as e:
+        logger.warning(
+            "drift_ignore: classifier crashed; treating as drift",
+            run_id=str(run.id),
+            error=str(e),
+            exc_info=True,
+        )
+        return "drifted"
+
+    if not still_drifted and suppressed:
+        # Surface what we silenced so operators can audit the rule set
+        # against the run it just classified.
+        logger.info(
+            "drift_ignore: all changes suppressed by rules",
+            run_id=str(run.id),
+            suppressed=suppressed,
+            rules=rules,
+        )
+        return "no_drift"
+    if suppressed:
+        logger.info(
+            "drift_ignore: partial suppression — drift still flagged",
+            run_id=str(run.id),
+            suppressed=suppressed,
+            rules=rules,
+        )
+    return "drifted"
+
+
 async def _create_drift_run_vcs(
     db: AsyncSession,
     ws: Workspace,
 ) -> Run | None:
     """Create a drift detection run for a VCS-connected workspace.
 
-    Downloads the archive from VCS, creates a ConfigurationVersion,
-    and queues a plan-only drift run.
+    Goes through the same VCSArchiveCache / git_fetch pipeline that the
+    regular VCS-poll path uses (`_stream_cv_upload_from_cache`) — NOT
+    the raw `download_archive` provider API. The raw API returns a
+    tarball wrapped in a top-level `<owner>-<repo>-<sha>/` directory;
+    the runner's `chdir /workspace` after extraction lands one level
+    above the actual repo content, and any `var-files` referenced from
+    the workspace's settings (e.g. `envs/prod-us2.tfvars`) resolve as
+    missing. Pre-v0.35.1 this latent bug was masked because drift
+    detection rarely fired (the `_is_workspace_busy` gate was so wide
+    it skipped almost everything); when v0.35.1 narrowed the gate to
+    `RUNNER_BUSY_STATES`, drift started running on every drift-enabled
+    workspace and tripped on this immediately — every drift run errored
+    with `Given variables file <path> does not exist`.
+
+    Using `VCSArchiveCache.get_or_fetch` produces a clean, root-level
+    tarball identical to what regular VCS-poll runs use, so the runner
+    init step behaves the same as on a normal apply.
     """
+    from terrapod.services.vcs_archive_cache import VCSArchiveCache
     from terrapod.services.vcs_poller import (
-        _download_archive,
         _get_branch_sha,
         _parse_repo_url,
         _resolve_branch,
+        _stream_cv_upload_from_cache,
     )
 
     conn = await db.get(VCSConnection, ws.vcs_connection_id)
@@ -97,10 +226,19 @@ async def _create_drift_run_vcs(
     if not sha:
         return None
 
+    cache = VCSArchiveCache()
     try:
-        archive = await _download_archive(conn, owner, repo, sha)
+        # `paths=None` fetches the whole repo. Drift detection has no
+        # narrowing context (no trigger_prefixes equivalent for the
+        # drift-check-fires-on-its-own path); the full repo matches
+        # what a normal VCS-poll apply would have used. The cache is
+        # keyed by (conn, sha, paths) so other concurrent paths
+        # narrowing the same sha don't share this entry.
+        cache_storage_key = await cache.get_or_fetch(conn, owner, repo, sha, paths=None)
     except Exception as e:
-        logger.error("Failed to download archive for drift check", workspace=ws.name, error=str(e))
+        logger.error(
+            "Failed to fetch repo archive for drift check", workspace=ws.name, error=str(e)
+        )
         return None
 
     cv = await run_service.create_configuration_version(
@@ -112,9 +250,15 @@ async def _create_drift_run_vcs(
     )
     await db.flush()
 
-    storage = get_storage()
-    key = config_version_key(str(ws.id), str(cv.id))
-    await storage.put(key, archive, content_type="application/x-tar")
+    try:
+        await _stream_cv_upload_from_cache(cache_storage_key, ws.id, cv.id)
+    except Exception as e:
+        logger.error(
+            "Failed to materialise cached archive for drift CV",
+            workspace=ws.name,
+            error=str(e),
+        )
+        return None
 
     cv = await run_service.mark_configuration_uploaded(db, cv)
 
@@ -220,9 +364,16 @@ async def drift_check_cycle() -> None:
                     logger.debug("Skipping drift check: workspace locked", workspace=ws.name)
                     continue
 
-                # Skip workspaces with active runs
-                if await _is_workspace_busy(db, ws.id):
-                    logger.debug("Skipping drift check: active run", workspace=ws.name)
+                # Skip workspaces that are actively running terraform.
+                # NOT "any non-terminal run" — `planned` runs awaiting
+                # operator confirm can sit indefinitely and would have
+                # blocked drift forever (production incident on the
+                # mgmt deployment: workspaces with a `planned` run
+                # awaiting confirm froze drift_status at the first
+                # errored attempt; status column showed "applied" so
+                # the issue was invisible until Health Issues lit up).
+                if await _is_runner_busy(db, ws.id):
+                    logger.debug("Skipping drift check: runner busy", workspace=ws.name)
                     continue
 
                 # Skip workspaces with no state
@@ -282,7 +433,20 @@ async def handle_drift_run_completed(payload: dict) -> None:
         # Map run outcome to drift status
         if run.status == "planned":
             if run.has_changes is True:
-                ws.drift_status = "drifted"
+                # If the workspace has `drift_ignore_rules` configured (#482),
+                # filter the plan JSON before declaring drift. Every changed
+                # attribute is matched against the rule globs; if all
+                # match, the drift is suppressed and the status flips to
+                # no_drift. Empty rules → fall through to the historical
+                # "any change is drift" behaviour. Plan JSON has to be
+                # actually available (has_json_output=True) — runs that
+                # errored mid-upload are conservatively treated as drift.
+                if ws.drift_ignore_rules and run.has_json_output:
+                    ws.drift_status = await _apply_drift_ignore_rules(
+                        run, list(ws.drift_ignore_rules)
+                    )
+                else:
+                    ws.drift_status = "drifted"
             elif run.has_changes is False:
                 ws.drift_status = "no_drift"
             else:
@@ -296,6 +460,12 @@ async def handle_drift_run_completed(payload: dict) -> None:
         else:
             return
 
+        # Pin the run that produced this status so the workspace-list UI can
+        # link the badge to it. Updated for every status the badge can show
+        # (drifted / no_drift / errored) — that way the Errored badge also
+        # links to the drift run that produced the error, not to whichever
+        # earlier drift run set drift_latest_run_id last.
+        ws.drift_latest_run_id = run.id
         ws.drift_last_checked_at = now_utc()
         await db.commit()
 
@@ -359,3 +529,8 @@ async def _enqueue_drift_notification(run: Run) -> None:
         )
     except Exception as e:
         logger.warning("Failed to enqueue drift notification", error=str(e))
+
+    # Mirror to the Slack app (#556) — no-ops unless the workspace opted in.
+    from terrapod.services.slack_notify_service import enqueue_slack_notify
+
+    await enqueue_slack_notify(run, "run:drift_detected")

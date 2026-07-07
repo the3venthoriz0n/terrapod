@@ -3,9 +3,40 @@
  * Uses the API port (8000) directly, bypassing the BFF.
  */
 import { createHash, randomBytes } from 'crypto';
+import fs from 'fs';
+import path from 'path';
 
 const API_URL = process.env.API_URL || 'http://localhost:8000';
 const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
+
+/**
+ * Read the session token out of a saved storageState file (e.g. admin.json),
+ * so a spec can drive the API directly with the same identity its browser
+ * context uses. Centralises the localStorage-extraction the specs used to
+ * inline.
+ */
+export function getStoredToken(authFileName = 'admin.json'): string {
+  const authPath = path.join(__dirname, '..', '.auth', authFileName);
+  const authData = JSON.parse(fs.readFileSync(authPath, 'utf-8'));
+  const origin = authData.origins?.find((o: { origin: string }) =>
+    o.origin.includes('localhost'),
+  );
+  const entry = origin?.localStorage?.find(
+    (e: { name: string }) => e.name === 'terrapod_auth',
+  );
+  return entry ? JSON.parse(entry.value).token : '';
+}
+
+/**
+ * A process-unique, human-readable suffix for test resources. Within a shard
+ * the workers share ONE stack/DB, so every test MUST name its resources
+ * uniquely to avoid collisions — see the Code ↔ E2E Tests Contract in
+ * CLAUDE.md. Combines a timestamp with random bytes so even same-millisecond
+ * calls across workers don't collide.
+ */
+export function uniqueName(prefix: string): string {
+  return `${prefix}-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`;
+}
 
 function generatePKCE() {
   const verifier = randomBytes(32).toString('base64url');
@@ -100,11 +131,93 @@ export async function createUser(
 }
 
 /**
+ * Set the platform/custom roles for a (provider, email) pair. Replaces any
+ * existing assignments. Used in global setup to grant the audit user the
+ * read-only `audit` role for RBAC negative tests.
+ */
+export async function setRoleAssignments(
+  adminToken: string,
+  email: string,
+  roles: string[],
+  providerName = 'local',
+): Promise<void> {
+  const res = await fetch(`${API_URL}/api/terrapod/v1/role-assignments`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/vnd.api+json',
+      Authorization: `Bearer ${adminToken}`,
+    },
+    body: JSON.stringify({
+      data: {
+        type: 'role-assignments',
+        attributes: { 'provider-name': providerName, email, roles },
+      },
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Set role assignments failed for ${email}: ${res.status} ${body}`);
+  }
+}
+
+/**
+ * Create a custom role with a granular capability set (#585). Levels are not
+ * persisted — the role's grant IS its `capabilities`. `allowLabels` scopes the
+ * label RBAC so the role only applies to workspaces carrying those labels.
+ * Idempotent-ish: a 422 "already exists" is swallowed so re-runs don't fail.
+ */
+export async function createRole(
+  adminToken: string,
+  name: string,
+  capabilities: string[],
+  allowLabels: Record<string, string> = {},
+  description = 'E2E capability role',
+): Promise<void> {
+  const res = await fetch(`${API_URL}/api/terrapod/v1/roles`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/vnd.api+json',
+      Authorization: `Bearer ${adminToken}`,
+    },
+    body: JSON.stringify({
+      data: {
+        name,
+        type: 'roles',
+        attributes: {
+          description,
+          capabilities,
+          'allow-labels': allowLabels,
+        },
+      },
+    }),
+  });
+  if (!res.ok && res.status !== 422) {
+    const body = await res.text();
+    throw new Error(`Create role failed: ${res.status} ${body}`);
+  }
+}
+
+/**
+ * Delete a custom role (teardown helper). A 404 is fine — already gone.
+ */
+export async function deleteRole(adminToken: string, name: string): Promise<void> {
+  const res = await fetch(`${API_URL}/api/terrapod/v1/roles/${name}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${adminToken}` },
+  });
+  if (!res.ok && res.status !== 404) {
+    const body = await res.text();
+    throw new Error(`Delete role failed: ${res.status} ${body}`);
+  }
+}
+
+/**
  * Create a workspace via the admin API. Returns the workspace ID.
  */
 export async function createWorkspace(
   token: string,
   name: string,
+  attrs: Record<string, unknown> = {},
 ): Promise<string> {
   const res = await fetch(
     `${API_URL}/api/v2/organizations/default/workspaces`,
@@ -117,7 +230,7 @@ export async function createWorkspace(
       body: JSON.stringify({
         data: {
           type: 'workspaces',
-          attributes: { name },
+          attributes: { name, ...attrs },
         },
       }),
     },
@@ -142,6 +255,33 @@ export async function createWorkspace(
 
   const data = await res.json();
   return data.data.id;
+}
+
+/**
+ * Create a registry module via the management API. Returns the bare module
+ * UUID (usable directly as a catalog item's `module-id`).
+ */
+export async function createRegistryModule(
+  token: string,
+  name: string,
+  provider = 'aws',
+): Promise<string> {
+  const res = await fetch(`${API_URL}/api/terrapod/v1/registry-modules`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/vnd.api+json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      data: { type: 'registry-modules', attributes: { name, provider } },
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Create registry module failed: ${res.status} ${body}`);
+  }
+  const data = await res.json();
+  return data.data.id as string;
 }
 
 /**

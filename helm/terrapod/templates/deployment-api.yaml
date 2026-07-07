@@ -43,9 +43,12 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.api.extraInitContainers }}
+      {{- if or (eq (include "terrapod.caBundle.enabled" .) "true") .Values.api.extraInitContainers }}
       initContainers:
+        {{- include "terrapod.caBundle.initContainer" (dict "root" . "image" (include "terrapod.api.image" .) "pullPolicy" .Values.api.image.pullPolicy) | nindent 8 }}
+        {{- with .Values.api.extraInitContainers }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- end }}
       containers:
         - name: api
@@ -68,12 +71,37 @@ spec:
                   name: {{ include "terrapod.fullname" . }}-storage
                   key: hmac-secret
                   optional: true
-            {{- if .Values.postgresql.existingSecret }}
+            {{- if .Values.api.tokenSigningKey.existingSecret }}
+            - name: TERRAPOD_TOKEN_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.api.tokenSigningKey.existingSecret }}
+                  key: {{ .Values.api.tokenSigningKey.existingSecretKey | default "token_signing_key" }}
+            {{- end }}
+            {{- if (.Values.api.config.encryption).existingSecret }}
+            # App-layer encryption at rest (#553) — KEK secrets via secretKeyRef.
+            # optional:true so a single Secret can carry only the key the chosen
+            # provider needs (static → static_key, vault_transit → vault_token).
+            - name: TERRAPOD_ENCRYPTION__STATIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.api.config.encryption.existingSecret }}
+                  key: {{ .Values.api.config.encryption.staticKeyKey | default "static_key" }}
+                  optional: true
+            - name: TERRAPOD_ENCRYPTION__VAULT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.api.config.encryption.existingSecret }}
+                  key: {{ .Values.api.config.encryption.vaultTokenKey | default "vault_token" }}
+                  optional: true
+            {{- end }}
+            {{- $pgSecret := include "terrapod.postgresql.secretName" . }}
+            {{- if $pgSecret }}
             - name: TERRAPOD_DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.postgresql.existingSecret }}
-                  key: {{ .Values.postgresql.existingSecretKey | default "url" }}
+                  name: {{ $pgSecret }}
+                  key: {{ include "terrapod.postgresql.secretKey" . }}
             {{- else if .Values.postgresql.url }}
             - name: TERRAPOD_DATABASE_URL
               value: {{ .Values.postgresql.url | quote }}
@@ -84,9 +112,9 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.redis.existingSecret }}
                   key: {{ .Values.redis.existingSecretKey | default "url" }}
-            {{- else if .Values.redis.url }}
+            {{- else if (include "terrapod.redis.url" .) }}
             - name: TERRAPOD_REDIS_URL
-              value: {{ .Values.redis.url | quote }}
+              value: {{ include "terrapod.redis.url" . | quote }}
             {{- end }}
             {{- range .Values.api.config.auth.sso.oidc }}
             - name: TERRAPOD_{{ .name | upper }}_CLIENT_SECRET
@@ -102,6 +130,33 @@ spec:
                   name: {{ .Values.api.config.vcs.github.existingSecret }}
                   key: {{ .Values.api.config.vcs.github.existingSecretKey | default "webhook_secret" }}
             {{- end }}
+            {{- if (.Values.api.config.slack).existingSecret }}
+            # Slack integration (#556) — bot/app/signing tokens via secretKeyRef.
+            - name: TERRAPOD_SLACK__BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.api.config.slack.existingSecret }}
+                  key: {{ (.Values.api.config.slack.existingSecretKeys).botToken | default "bot-token" }}
+            - name: TERRAPOD_SLACK__APP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.api.config.slack.existingSecret }}
+                  key: {{ (.Values.api.config.slack.existingSecretKeys).appToken | default "app-token" }}
+            - name: TERRAPOD_SLACK__SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.api.config.slack.existingSecret }}
+                  key: {{ (.Values.api.config.slack.existingSecretKeys).signingSecret | default "signing-secret" }}
+            {{- end }}
+            {{- if and .Values.api.config.vcs.gitlab .Values.api.config.vcs.gitlab.existingSecret }}
+            - name: TERRAPOD_VCS__GITLAB__WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.api.config.vcs.gitlab.existingSecret }}
+                  key: {{ .Values.api.config.vcs.gitlab.existingSecretKey | default "webhook_secret" }}
+            {{- end }}
+            {{- include "terrapod.proxyEnv" . | nindent 12 }}
+            {{- include "terrapod.caBundle.env" . | nindent 12 }}
             {{- with .Values.api.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -129,6 +184,12 @@ spec:
             - name: storage
               mountPath: {{ .Values.api.config.storage.filesystem.root_dir }}
             {{- end }}
+            {{- if or .Values.api.databaseCA.inline .Values.api.databaseCA.existingConfigMap }}
+            - name: database-ca
+              mountPath: /etc/terrapod/db-ca
+              readOnly: true
+            {{- end }}
+            {{- include "terrapod.caBundle.volumeMounts" . | nindent 12 }}
             {{- with .Values.api.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -201,6 +262,12 @@ spec:
           emptyDir: {}
           {{- end }}
         {{- end }}
+        {{- if or .Values.api.databaseCA.inline .Values.api.databaseCA.existingConfigMap }}
+        - name: database-ca
+          configMap:
+            name: {{ .Values.api.databaseCA.existingConfigMap | default (printf "%s-database-ca" (include "terrapod.fullname" .)) }}
+        {{- end }}
+        {{- include "terrapod.caBundle.volumes" . | nindent 8 }}
         {{- with .Values.api.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

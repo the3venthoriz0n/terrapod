@@ -1,10 +1,11 @@
 'use client'
 
-import { Fragment, Suspense, useEffect, useRef, useState, useCallback, useMemo } from 'react'
+import { Suspense, useEffect, useRef, useState, useCallback, useMemo, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import NavBar from '@/components/nav-bar'
 import { PageHeader } from '@/components/page-header'
+import { ConnectionStatus } from '@/components/connection-status'
 import { LoadingSpinner } from '@/components/loading-spinner'
 import { ErrorBanner } from '@/components/error-banner'
 import { EmptyState } from '@/components/empty-state'
@@ -14,9 +15,9 @@ import { apiFetch } from '@/lib/api'
 import { useSortable } from '@/lib/use-sortable'
 import { useWorkspaceListEvents } from '@/lib/use-workspace-list-events'
 import {
-  type ParsedFilter,
   hasLabelTerm,
   hasStatusTerm,
+  HEALTH_ISSUE_STATUS,
   matchWorkspace,
   parseFilterQuery,
   removeTerm,
@@ -25,14 +26,6 @@ import {
   toggleStatusTerm,
 } from '@/lib/workspace-filter'
 import { WORKSPACE_STATUSES, resolveStatus } from '@/lib/workspace-status'
-import {
-  GroupMode,
-  WorkspaceGroup,
-  buildWorkspaceTree,
-  countWorkspaces,
-  parseGroupParam,
-  serializeGroupParam,
-} from '@/lib/workspace-grouping'
 
 interface LatestRun {
   id: string
@@ -61,6 +54,7 @@ interface Workspace {
     'agent-pool-name': string | null
     'drift-detection-enabled': boolean
     'drift-status': string
+    'drift-latest-run-id': string | null
     'state-diverged': boolean
     'vcs-last-error': string | null
     'health-conditions': HealthCondition[]
@@ -68,176 +62,12 @@ interface Workspace {
     'lifecycle-reason': string
     'latest-run': LatestRun | null
     'created-at': string
-    'working-directory'?: string
-    'vcs-repo-url'?: string
     labels?: Record<string, string> | null
   }
 }
 
 // Wrapped in <Suspense> at the bottom — `useSearchParams()` triggers Next.js's
 // CSR bailout, and without a boundary the whole page fails to build statically.
-function WorkspaceGroupRows({
-  groups,
-  collapsedGroups,
-  toggleGroup,
-  pathPrefix,
-  resolveStatus,
-  parsedFilter,
-  setFilterInput,
-  badgeColors,
-  depth = 0,
-}: {
-  groups: WorkspaceGroup[]
-  collapsedGroups: Set<string>
-  toggleGroup: (path: string) => void
-  pathPrefix: string
-  resolveStatus: (ws: Workspace) => { def: { label: string; color: string; pillClass?: string; filter?: string } | null; runId: string | null }
-  parsedFilter: ParsedFilter
-  setFilterInput: (v: string) => void
-  badgeColors: Record<string, string>
-  depth?: number
-}) {
-  return (
-    <>
-      {groups.map(group => {
-        const fullPath = pathPrefix ? `${pathPrefix}/${group.key}` : group.key
-        const isCollapsed = collapsedGroups.has(fullPath)
-        const count = countWorkspaces(group)
-
-        return (
-          <Fragment key={fullPath}>
-            {/* Group header row */}
-            <tr
-              tabIndex={0}
-              role="button"
-              aria-expanded={!isCollapsed}
-              className="hover:bg-slate-700/20 cursor-pointer transition-colors"
-              onClick={() => toggleGroup(fullPath)}
-              onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleGroup(fullPath) } }}
-            >
-              <td className="px-4 py-2" colSpan={6}>
-                <div className="flex items-center gap-2" style={{ paddingLeft: `${depth * 16}px` }}>
-                  <svg
-                    className={`w-3 h-3 text-slate-500 transition-transform ${isCollapsed ? '' : 'rotate-90'}`}
-                    fill="none" stroke="currentColor" viewBox="0 0 24 24"
-                  >
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                  </svg>
-                  <span className="text-sm text-slate-400">{group.label}/</span>
-                  <span className="text-xs text-slate-600 bg-slate-800 px-1.5 py-0.5 rounded-full">{count}</span>
-                </div>
-              </td>
-            </tr>
-
-            {/* Workspace rows */}
-            {!isCollapsed && group.workspaces.map(item => {
-              const ws = item.workspace as Workspace
-              const { def, runId } = resolveStatus(ws)
-              const dir = ws.attributes['working-directory'] || ''
-              const lastSegment = dir ? dir.split('/').pop() || dir : ''
-              const displayName = lastSegment || item.name
-              return (
-                <tr key={item.id} className="hover:bg-slate-700/20 transition-colors border-t border-slate-700/30">
-                  <td className="px-4 py-3">
-                    <div className="flex flex-col gap-1.5" style={{ paddingLeft: `${(depth + 1) * 16}px` }}>
-                      <Link
-                        href={`/workspaces/${item.id}`}
-                        className="text-sm font-medium text-brand-400 hover:text-brand-300"
-                      >
-                        {displayName}
-                      </Link>
-                      {ws.attributes.labels && Object.keys(ws.attributes.labels).length > 0 && (
-                        <div className="flex flex-wrap gap-1">
-                          {Object.entries(ws.attributes.labels as Record<string, string>).map(([k, v]) => {
-                            const active = hasLabelTerm(parsedFilter, k, v)
-                            return (
-                              <button
-                                key={`${k}=${v}`}
-                                type="button"
-                                onClick={() => setFilterInput(serializeFilter(toggleLabelTerm(parsedFilter, k, v)))}
-                                className={
-                                  'inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-mono transition-colors ' +
-                                  (active
-                                    ? 'bg-brand-700/60 text-brand-100 hover:bg-brand-700'
-                                    : 'bg-slate-700/40 text-slate-400 hover:bg-slate-700/80 hover:text-slate-200')
-                                }
-                              >
-                                <span className="text-slate-500">{k}:</span>
-                                <span className="ml-0.5">{v}</span>
-                              </button>
-                            )
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  </td>
-                  <td className="px-4 py-3 hidden sm:table-cell">
-                    <span className="text-xs text-slate-400">{ws.attributes['execution-mode']}</span>
-                  </td>
-                  <td className="px-4 py-3 hidden md:table-cell">
-                    <span className="text-xs text-slate-400">{ws.attributes['agent-pool-name'] || '—'}</span>
-                  </td>
-                  <td className="px-4 py-3 hidden lg:table-cell">
-                    <span className="text-xs text-slate-400">{ws.attributes['resource-cpu']} CPU / {ws.attributes['resource-memory']}</span>
-                  </td>
-                  <td className="px-4 py-3 hidden lg:table-cell">
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      {!def ? (
-                        <span className="text-xs text-slate-500">&mdash;</span>
-                      ) : runId ? (
-                        <Link
-                          href={`/workspaces/${ws.id}/runs/${runId}`}
-                          className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium whitespace-nowrap hover:opacity-80 transition-opacity ${badgeColors[def.color]}`}
-                        >
-                          {def.label}
-                        </Link>
-                      ) : (
-                        <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium whitespace-nowrap ${badgeColors[def.color]}`}>
-                          {def.label}
-                        </span>
-                      )}
-                      {ws.attributes['lifecycle-state'] === 'pending_deletion' && (
-                        <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium whitespace-nowrap ${badgeColors.amber}`}>
-                          Pending deletion
-                        </span>
-                      )}
-                      {ws.attributes['lifecycle-state'] === 'archived' && (
-                        <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium whitespace-nowrap ${badgeColors.slate}`}>
-                          Archived
-                        </span>
-                      )}
-                    </div>
-                  </td>
-                  <td className="px-4 py-3 hidden xl:table-cell">
-                    <span className="text-xs text-slate-500">
-                      {ws.attributes['created-at'] ? new Date(ws.attributes['created-at']).toLocaleDateString() : ''}
-                    </span>
-                  </td>
-                </tr>
-              )
-            })}
-
-            {/* Child groups */}
-            {!isCollapsed && group.children.length > 0 && (
-              <WorkspaceGroupRows
-                groups={group.children}
-                collapsedGroups={collapsedGroups}
-                toggleGroup={toggleGroup}
-                pathPrefix={fullPath}
-                resolveStatus={resolveStatus}
-                parsedFilter={parsedFilter}
-                setFilterInput={setFilterInput}
-                badgeColors={badgeColors}
-                depth={depth + 1}
-              />
-            )}
-          </Fragment>
-        )
-      })}
-    </>
-  )
-}
-
 function WorkspacesPageInner() {
   const router = useRouter()
   const searchParams = useSearchParams()
@@ -251,73 +81,6 @@ function WorkspacesPageInner() {
   // label key set. Mirrored to the URL via ?q=… so refresh + share work.
   const [filterInput, setFilterInput] = useState(searchParams.get('q') || '')
   const parsedFilter = useMemo(() => parseFilterQuery(filterInput), [filterInput])
-
-  // Grouping mode — URL param takes priority, localStorage as fallback.
-  // Initialized once via useState (matches filterInput pattern above).
-  const [groupMode, setGroupModeState] = useState<GroupMode>(() => {
-    const fromUrl = searchParams.get('group')
-    if (fromUrl) return parseGroupParam(fromUrl)
-    if (typeof window !== 'undefined') {
-      return parseGroupParam(localStorage.getItem('terrapod:workspace-group'))
-    }
-    return 'none'
-  })
-
-  const setGroupMode = useCallback((mode: GroupMode) => {
-    setGroupModeState(mode)
-    const serialized = serializeGroupParam(mode)
-    if (typeof window !== 'undefined') {
-      if (serialized) localStorage.setItem('terrapod:workspace-group', serialized)
-      else localStorage.removeItem('terrapod:workspace-group')
-    }
-    const q = serializeFilter(parsedFilter)
-    const params = new URLSearchParams()
-    if (q) params.set('q', q)
-    if (serialized) params.set('group', serialized)
-    const qs = params.toString()
-    router.replace(qs ? `/workspaces?${qs}` : '/workspaces', { scroll: false })
-  }, [parsedFilter, router])
-
-  // Group by dropdown
-  const [groupMenuOpen, setGroupMenuOpen] = useState(false)
-  const groupMenuRef = useRef<HTMLDivElement>(null)
-  useEffect(() => {
-    if (!groupMenuOpen) return
-    const onClick = (e: MouseEvent) => {
-      if (groupMenuRef.current && !groupMenuRef.current.contains(e.target as Node)) {
-        setGroupMenuOpen(false)
-      }
-    }
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setGroupMenuOpen(false)
-    }
-    document.addEventListener('mousedown', onClick)
-    document.addEventListener('keydown', onKey)
-    return () => {
-      document.removeEventListener('mousedown', onClick)
-      document.removeEventListener('keydown', onKey)
-    }
-  }, [groupMenuOpen])
-
-  // Collapsed groups state — persisted in localStorage
-  const [collapsedGroups, setCollapsedGroupsRaw] = useState<Set<string>>(() => {
-    if (typeof window !== 'undefined') {
-      const stored = localStorage.getItem('terrapod:workspace-collapsed')
-      if (stored) {
-        try { return new Set(JSON.parse(stored)) } catch { /* ignore */ }
-      }
-    }
-    return new Set()
-  })
-  const setCollapsedGroups = useCallback((update: Set<string> | ((prev: Set<string>) => Set<string>)) => {
-    setCollapsedGroupsRaw(prev => {
-      const next = typeof update === 'function' ? update(prev) : update
-      if (typeof window !== 'undefined') {
-        localStorage.setItem('terrapod:workspace-collapsed', JSON.stringify([...next]))
-      }
-      return next
-    })
-  }, [])
 
   // Status dropdown state. Closes on outside-click and Escape — same pattern
   // used for the run-actions menu so the page feels consistent.
@@ -368,10 +131,32 @@ function WorkspacesPageInner() {
     }
   }, [labelMenuOpen, labelMenuKey])
 
+  // Inline filter typeahead — AWS-style faceted suggestions popped under the
+  // free-text input as you type, while still letting you type anything. The
+  // dropdown suggests `key:value` labels, `status:…`, label keys (to drill),
+  // and matching workspace names; clicking one inserts the chip.
+  const [suggestOpen, setSuggestOpen] = useState(false)
+  // -1 = nothing highlighted. A suggestion is only applied on an explicit
+  // pick (click, or arrow-key to highlight + Enter); a bare Enter keeps the
+  // free text the user typed.
+  const [suggestIndex, setSuggestIndex] = useState(-1)
+  const filterInputRef = useRef<HTMLInputElement>(null)
+  const suggestWrapRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!suggestOpen) return
+    const onClick = (e: MouseEvent) => {
+      if (suggestWrapRef.current && !suggestWrapRef.current.contains(e.target as Node)) {
+        setSuggestOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', onClick)
+    return () => document.removeEventListener('mousedown', onClick)
+  }, [suggestOpen])
+
   // Sync the input to the URL whenever the parsed filter changes — debounced.
   //
   // Each `router.replace` triggers a Next.js RSC prefetch for the new URL.
-  // Firing per-keystroke (e.g. typing "repo:tf-data-pipelines") cascades
+  // Firing per-keystroke (e.g. typing "repo:data-pipelines") cascades
   // ~20 prefetches in a few hundred ms, overwhelms Next's dev server with
   // 503s, and can leave the address bar stuck on an early keystroke when
   // a later prefetch wins the race. We debounce to a single replace once
@@ -393,15 +178,13 @@ function WorkspacesPageInner() {
     if (lastSyncedQueryRef.current === serialized) return
     const timer = setTimeout(() => {
       lastSyncedQueryRef.current = serialized
-      const params = new URLSearchParams()
-      if (serialized) params.set('q', serialized)
-      const groupSerialized = serializeGroupParam(groupMode)
-      if (groupSerialized) params.set('group', groupSerialized)
-      const qs = params.toString()
-      router.replace(qs ? `/workspaces?${qs}` : '/workspaces', { scroll: false })
+      const url = serialized
+        ? `/workspaces?q=${encodeURIComponent(serialized)}`
+        : '/workspaces'
+      router.replace(url, { scroll: false })
     }, 250)
     return () => clearTimeout(timer)
-  }, [parsedFilter, groupMode, router])
+  }, [parsedFilter, router])
 
   const filteredWorkspaces = useMemo(() => {
     if (parsedFilter.terms.length === 0) return workspaces
@@ -412,61 +195,6 @@ function WorkspacesPageInner() {
       return matchWorkspace(ws, parsedFilter, resolveStatus(ws).def?.filter ?? undefined)
     })
   }, [workspaces, parsedFilter])
-
-  const workspaceTree = useMemo(
-    () => buildWorkspaceTree(filteredWorkspaces, groupMode),
-    [filteredWorkspaces, groupMode]
-  )
-
-  // All group paths for collapse/expand logic
-  const allGroupPaths = useMemo(() => {
-    const paths = new Set<string>()
-    const collect = (groups: WorkspaceGroup[], prefix: string) => {
-      for (const g of groups) {
-        const p = prefix ? `${prefix}/${g.key}` : g.key
-        paths.add(p)
-        collect(g.children, p)
-      }
-    }
-    collect(workspaceTree, '')
-    return paths
-  }, [workspaceTree])
-
-  // Restore saved collapsed state when switching back to grouped mode
-  const lastGroupModeRef = useRef(groupMode)
-  useEffect(() => {
-    if (groupMode !== lastGroupModeRef.current) {
-      lastGroupModeRef.current = groupMode
-      if (groupMode !== 'none') {
-        const stored = localStorage.getItem('terrapod:workspace-collapsed')
-        if (stored) {
-          try { setCollapsedGroups(new Set(JSON.parse(stored))); return } catch { /* fall through */ }
-        }
-        setCollapsedGroups(new Set(allGroupPaths))
-      }
-    }
-  }, [groupMode, allGroupPaths])
-
-  // Initialize collapsed on first render if grouped and no saved state exists
-  const initializedRef = useRef(false)
-  useEffect(() => {
-    if (!initializedRef.current && groupMode !== 'none' && allGroupPaths.size > 0) {
-      initializedRef.current = true
-      const hasSavedState = typeof window !== 'undefined' && localStorage.getItem('terrapod:workspace-collapsed')
-      if (!hasSavedState) {
-        setCollapsedGroups(new Set(allGroupPaths))
-      }
-    }
-  }, [allGroupPaths, groupMode])
-
-  const toggleGroup = useCallback((path: string) => {
-    setCollapsedGroups(prev => {
-      const next = new Set(prev)
-      if (next.has(path)) next.delete(path)
-      else next.add(path)
-      return next
-    })
-  }, [])
 
   // Create form
   const [showCreate, setShowCreate] = useState(false)
@@ -536,6 +264,111 @@ function WorkspacesPageInner() {
     [labelIndex],
   )
 
+  // The token being typed = text after the last space (filter tokens are
+  // space-separated). Suggestions are computed against just that token, so
+  // earlier chips in the box are left untouched.
+  const currentToken = useMemo(() => {
+    const parts = filterInput.split(' ')
+    return parts[parts.length - 1]
+  }, [filterInput])
+
+  interface FilterSuggestion {
+    kind: 'label' | 'label-key' | 'status' | 'name'
+    insert: string
+    display: string
+    hint: string
+    count?: number
+    dot?: string
+  }
+
+  const suggestions = useMemo<FilterSuggestion[]>(() => {
+    const tok = currentToken.trim()
+    if (!tok) return []
+    const lower = tok.toLowerCase()
+    const out: FilterSuggestion[] = []
+    // Aggregate health-issues count for the `status:unhealthy` suggestion.
+    const unhealthyCount = workspaces.filter(
+      ws => (ws.attributes['health-conditions'] || []).length > 0,
+    ).length
+    const sepIdx = tok.search(/[:=]/)
+    if (sepIdx >= 0) {
+      // `key:partial` → suggest values for that key.
+      const key = tok.slice(0, sepIdx)
+      const partial = tok.slice(sepIdx + 1).toLowerCase()
+      if (key === 'status') {
+        for (const s of WORKSPACE_STATUSES) {
+          if (!partial || s.filter.toLowerCase().includes(partial) || s.label.toLowerCase().includes(partial))
+            out.push({ kind: 'status', insert: `status:${s.filter}`, display: `status:${s.filter}`, hint: 'status', dot: s.dot, count: statusCounts[s.filter] || 0 })
+        }
+        if (unhealthyCount > 0 && (!partial || HEALTH_ISSUE_STATUS.includes(partial) || 'health issues'.includes(partial)))
+          out.push({ kind: 'status', insert: `status:${HEALTH_ISSUE_STATUS}`, display: `status:${HEALTH_ISSUE_STATUS}`, hint: 'health', dot: 'bg-red-400', count: unhealthyCount })
+      } else {
+        const values = labelIndex.get(key)
+        if (values) {
+          for (const [v, c] of values) {
+            if (!partial || v.toLowerCase().includes(partial))
+              out.push({ kind: 'label', insert: `${key}:${v}`, display: `${key}:${v}`, hint: 'label', count: c })
+          }
+        }
+      }
+    } else {
+      // Bare token → match label keys (drill), key:value pairs, statuses, names.
+      for (const k of sortedLabelKeys) {
+        if (k.toLowerCase().includes(lower))
+          out.push({ kind: 'label-key', insert: `${k}:`, display: `${k}:`, hint: 'label key' })
+      }
+      for (const k of sortedLabelKeys) {
+        for (const [v, c] of labelIndex.get(k)!) {
+          if (v.toLowerCase().includes(lower) || k.toLowerCase().includes(lower))
+            out.push({ kind: 'label', insert: `${k}:${v}`, display: `${k}:${v}`, hint: 'label', count: c })
+        }
+      }
+      for (const s of WORKSPACE_STATUSES) {
+        if (s.filter.toLowerCase().includes(lower) || s.label.toLowerCase().includes(lower))
+          out.push({ kind: 'status', insert: `status:${s.filter}`, display: `status:${s.filter}`, hint: 'status', dot: s.dot, count: statusCounts[s.filter] || 0 })
+      }
+      if (unhealthyCount > 0 && (HEALTH_ISSUE_STATUS.includes(lower) || 'health'.includes(lower) || 'issues'.includes(lower)))
+        out.push({ kind: 'status', insert: `status:${HEALTH_ISSUE_STATUS}`, display: `status:${HEALTH_ISSUE_STATUS}`, hint: 'health', dot: 'bg-red-400', count: unhealthyCount })
+      for (const ws of workspaces) {
+        const n = ws.attributes.name
+        if (n.toLowerCase().includes(lower))
+          out.push({ kind: 'name', insert: n, display: n, hint: 'name' })
+      }
+    }
+    // Dedup by inserted text; cap so the menu stays usable.
+    const seen = new Set<string>()
+    return out.filter(s => (seen.has(s.insert) ? false : (seen.add(s.insert), true))).slice(0, 12)
+  }, [currentToken, sortedLabelKeys, labelIndex, statusCounts, workspaces])
+
+  function applyFilterSuggestion(s: FilterSuggestion) {
+    const parts = filterInput.split(' ')
+    parts[parts.length - 1] = s.insert
+    // A label-key suggestion (`env:`) leaves the cursor mid-token so you keep
+    // typing/picking the value; everything else completes the chip + a space.
+    const drill = s.kind === 'label-key'
+    setFilterInput(parts.join(' ') + (drill ? '' : ' '))
+    setSuggestIndex(-1)
+    setSuggestOpen(drill)
+    filterInputRef.current?.focus()
+  }
+
+  function onFilterKeyDown(e: ReactKeyboardEvent<HTMLInputElement>) {
+    if (e.key === 'ArrowDown' && (!suggestOpen || suggestions.length === 0)) {
+      if (currentToken.trim()) { setSuggestOpen(true); setSuggestIndex(0) }
+      return
+    }
+    if (!suggestOpen || suggestions.length === 0) return
+    if (e.key === 'ArrowDown') { e.preventDefault(); setSuggestIndex(i => (i + 1) % suggestions.length) }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setSuggestIndex(i => (i <= 0 ? suggestions.length - 1 : i - 1)) }
+    else if (e.key === 'Enter') {
+      // Apply ONLY a suggestion the user explicitly highlighted with the
+      // arrow keys. A bare Enter (nothing highlighted) keeps the typed text.
+      if (suggestIndex >= 0) { e.preventDefault(); applyFilterSuggestion(suggestions[suggestIndex]); }
+      else setSuggestOpen(false)
+    }
+    else if (e.key === 'Escape') { e.preventDefault(); setSuggestOpen(false) }
+  }
+
   const badgeColors: Record<string, string> = {
     amber: 'bg-amber-900/50 text-amber-300',
     red: 'bg-red-900/50 text-red-300',
@@ -564,8 +397,11 @@ function WorkspacesPageInner() {
     loadWorkspaces()
   }, [router])
 
-  // Real-time workspace list updates via SSE
-  useWorkspaceListEvents(workspaces.length > 0, useCallback(() => {
+  // Real-time workspace list updates via SSE. Always-on (not gated on
+  // workspaces.length) so the FIRST workspace created from another tab / the
+  // CLI / a VCS push live-appears on an empty org instead of requiring a
+  // manual refresh — the empty state is exactly where live-update matters most.
+  const { connected: sseConnected } = useWorkspaceListEvents(true, useCallback(() => {
     loadWorkspaces()
   }, []))
 
@@ -678,12 +514,15 @@ function WorkspacesPageInner() {
           title="Workspaces"
           description="Manage Terraform workspaces, state, and runs"
           actions={
-            <button
-              onClick={() => setShowCreate(!showCreate)}
-              className="px-4 py-2 rounded-lg text-sm font-medium bg-brand-600 hover:bg-brand-500 text-white transition-colors btn-smoke"
-            >
-              {showCreate ? 'Cancel' : 'New Workspace'}
-            </button>
+            <div className="flex items-center gap-3">
+              <ConnectionStatus connected={sseConnected} />
+              <button
+                onClick={() => setShowCreate(!showCreate)}
+                className="px-4 py-2 rounded-lg text-sm font-medium bg-brand-600 hover:bg-brand-500 text-white transition-colors btn-smoke"
+              >
+                {showCreate ? 'Cancel' : 'New Workspace'}
+              </button>
+            </div>
           }
         />
 
@@ -872,16 +711,41 @@ function WorkspacesPageInner() {
           const total = workspaces.length
           const withConditions = workspaces.filter(ws => (ws.attributes['health-conditions'] || []).length > 0).length
           const locked = workspaces.filter(ws => ws.attributes.locked).length
+          const healthFilterActive = hasStatusTerm(parsedFilter, HEALTH_ISSUE_STATUS)
           return (
             <div className="grid grid-cols-3 gap-4 mb-6">
               <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 p-4">
                 <p className="text-xs text-slate-500 uppercase tracking-wider">Total</p>
                 <p className="text-2xl font-semibold text-slate-100 mt-1">{total}</p>
               </div>
-              <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 p-4">
-                <p className="text-xs text-slate-500 uppercase tracking-wider">Health Issues</p>
-                <p className={`text-2xl font-semibold mt-1 ${withConditions > 0 ? 'text-red-400' : 'text-slate-100'}`}>{withConditions}</p>
-              </div>
+              {/* Clicking a non-zero Health Issues count toggles the
+                  `status:unhealthy` filter so the operator can jump straight to
+                  the affected workspaces (and click again to clear). When the
+                  count is zero there's nothing to filter to, so it stays a
+                  plain card. */}
+              {withConditions > 0 ? (
+                <button
+                  type="button"
+                  aria-pressed={healthFilterActive}
+                  aria-label={healthFilterActive ? 'Clear health issues filter' : 'Filter to workspaces with health issues'}
+                  title={healthFilterActive ? 'Clear health issues filter' : 'Filter to workspaces with health issues'}
+                  onClick={() => setFilterInput(serializeFilter(toggleStatusTerm(parsedFilter, HEALTH_ISSUE_STATUS)))}
+                  className={
+                    'text-left rounded-lg border p-4 transition-colors focus:outline-none focus:ring-2 focus:ring-brand-500 ' +
+                    (healthFilterActive
+                      ? 'bg-red-500/10 border-red-500/50'
+                      : 'bg-slate-800/50 border-slate-700/50 hover:bg-slate-700/40 hover:border-slate-600')
+                  }
+                >
+                  <p className="text-xs text-slate-500 uppercase tracking-wider">Health Issues</p>
+                  <p className="text-2xl font-semibold mt-1 text-red-400">{withConditions}</p>
+                </button>
+              ) : (
+                <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 p-4">
+                  <p className="text-xs text-slate-500 uppercase tracking-wider">Health Issues</p>
+                  <p className="text-2xl font-semibold mt-1 text-slate-100">{withConditions}</p>
+                </div>
+              )}
               <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 p-4">
                 <p className="text-xs text-slate-500 uppercase tracking-wider">Locked</p>
                 <p className={`text-2xl font-semibold mt-1 ${locked > 0 ? 'text-amber-400' : 'text-slate-100'}`}>{locked}</p>
@@ -891,18 +755,70 @@ function WorkspacesPageInner() {
         })()}
 
         {!loading && workspaces.length > 0 && (() => {
-          const activeStatusCount = parsedFilter.terms.filter(t => t.kind === 'status').length
+          // The aggregate `unhealthy` term is driven by the Health Issues card
+          // + its filter chip, not the Status dropdown, so it doesn't count
+          // toward the dropdown's active badge (which would otherwise show a
+          // count with no matching checked row inside).
+          const activeStatusCount = parsedFilter.terms.filter(
+            t => t.kind === 'status' && t.value !== HEALTH_ISSUE_STATUS,
+          ).length
           return (
             <div className="mb-4">
               <div className="flex items-center gap-2">
-                <input
-                  type="text"
-                  value={filterInput}
-                  onChange={e => setFilterInput(e.target.value)}
-                  placeholder='Filter by name, label, or status — e.g. "eu1", "env:prod", "status:errored"'
-                  aria-label="Filter workspaces"
-                  className="flex-1 px-3 py-2 rounded-lg bg-slate-800/50 border border-slate-700/50 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-brand-500"
-                />
+                <div className="relative flex-1" ref={suggestWrapRef}>
+                  <input
+                    type="text"
+                    value={filterInput}
+                    onChange={e => { setFilterInput(e.target.value); setSuggestOpen(true); setSuggestIndex(-1) }}
+                    onFocus={() => { if (currentToken.trim()) setSuggestOpen(true) }}
+                    onKeyDown={onFilterKeyDown}
+                    ref={filterInputRef}
+                    placeholder='Filter by name, label, or status — e.g. "eu1", "env:prod", "status:errored"'
+                    aria-label="Filter workspaces"
+                    role="combobox"
+                    aria-expanded={suggestOpen && suggestions.length > 0}
+                    aria-autocomplete="list"
+                    autoComplete="off"
+                    className="w-full px-3 py-2 rounded-lg bg-slate-800/50 border border-slate-700/50 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-brand-500"
+                  />
+                  {suggestOpen && suggestions.length > 0 && (
+                    <div
+                      role="listbox"
+                      data-testid="filter-suggestions"
+                      className="absolute left-0 right-0 z-20 mt-1 rounded-lg bg-slate-800 border border-slate-700 shadow-xl py-1 max-h-72 overflow-y-auto"
+                    >
+                      {suggestions.map((s, i) => (
+                        <button
+                          key={`${s.kind}:${s.insert}`}
+                          type="button"
+                          role="option"
+                          aria-selected={i === suggestIndex}
+                          // onMouseDown (not onClick) so it fires before the input blur closes the menu.
+                          // Clicking applies THIS suggestion directly (independent of the
+                          // keyboard-highlight index), so a hover never hijacks a bare Enter.
+                          onMouseDown={e => { e.preventDefault(); applyFilterSuggestion(s) }}
+                          className={
+                            'w-full flex items-center gap-2 px-3 py-1.5 text-sm transition-colors text-left border-l-2 ' +
+                            (i === suggestIndex
+                              ? 'bg-brand-600/40 text-white border-brand-300 font-semibold ring-1 ring-inset ring-brand-400/60'
+                              : 'border-transparent text-slate-300 hover:bg-slate-700/40')
+                          }
+                        >
+                          {s.dot ? (
+                            <span className={'w-1.5 h-1.5 rounded-full ' + s.dot} />
+                          ) : (
+                            <span className="w-1.5" />
+                          )}
+                          <span className="flex-1 font-mono text-xs">{s.display}</span>
+                          {typeof s.count === 'number' && (
+                            <span className="text-[10px] text-slate-500">{s.count}</span>
+                          )}
+                          <span className="text-[10px] uppercase tracking-wide text-slate-500">{s.hint}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
                 {/* Status dropdown — single entry point for all status presets.
                     Picks any combination via toggle; the existing chips below
                     show what's active and let the user remove individually. */}
@@ -1056,53 +972,6 @@ function WorkspacesPageInner() {
                     )
                   })()}
                 </div>
-                {/* Group by dropdown */}
-                <div className="relative" ref={groupMenuRef}>
-                  <button
-                    type="button"
-                    aria-haspopup="menu"
-                    aria-expanded={groupMenuOpen}
-                    onClick={() => setGroupMenuOpen(o => !o)}
-                    className={
-                      'inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium border transition-colors ' +
-                      (groupMode !== 'none'
-                        ? 'bg-slate-700/60 text-slate-100 border-slate-600'
-                        : 'bg-slate-800/50 text-slate-300 border-slate-700/50 hover:bg-slate-700/60')
-                    }
-                  >
-                    <span>Group</span>
-                    {groupMode !== 'none' && (
-                      <span className="inline-flex items-center justify-center min-w-5 px-1.5 rounded-full text-[10px] font-semibold bg-brand-600 text-white">
-                        1
-                      </span>
-                    )}
-                    <svg className={'w-3 h-3 transition-transform ' + (groupMenuOpen ? 'rotate-180' : '')} viewBox="0 0 12 12" fill="currentColor" aria-hidden>
-                      <path d="M3 4.5l3 3 3-3" stroke="currentColor" strokeWidth="1.5" fill="none" strokeLinecap="round" strokeLinejoin="round" />
-                    </svg>
-                  </button>
-                  {groupMenuOpen && (
-                    <div role="menu" className="absolute right-0 z-10 mt-1 w-52 rounded-lg bg-slate-800 border border-slate-700 shadow-xl py-1 max-h-96 overflow-y-auto">
-                      <button
-                        type="button"
-                        role="menuitemradio"
-                        aria-checked={groupMode === 'none'}
-                        onClick={() => { setGroupMode('none'); setGroupMenuOpen(false) }}
-                        className={'w-full flex items-center px-3 py-1.5 text-sm transition-colors ' + (groupMode === 'none' ? 'text-brand-400 bg-slate-700/30' : 'text-slate-300 hover:bg-slate-700/40')}
-                      >
-                        None (flat list)
-                      </button>
-                      <button
-                        type="button"
-                        role="menuitemradio"
-                        aria-checked={groupMode === 'path'}
-                        onClick={() => { setGroupMode('path'); setGroupMenuOpen(false) }}
-                        className={'w-full flex items-center px-3 py-1.5 text-sm transition-colors ' + (groupMode === 'path' ? 'text-brand-400 bg-slate-700/30' : 'text-slate-300 hover:bg-slate-700/40')}
-                      >
-                        Path
-                      </button>
-                    </div>
-                  )}
-                </div>
                 {parsedFilter.terms.length > 0 && (
                   <button
                     type="button"
@@ -1152,48 +1021,6 @@ function WorkspacesPageInner() {
           <EmptyState message="No workspaces yet. Create one to get started." />
         ) : filteredWorkspaces.length === 0 ? (
           <EmptyState message="No workspaces match this filter." />
-        ) : groupMode !== 'none' && workspaceTree.length > 0 ? (
-          <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 overflow-hidden">
-            <div className="flex items-center justify-end px-4 py-2 border-b border-slate-700/50">
-              <button
-                type="button"
-                onClick={() => {
-                  if (collapsedGroups.size === 0) {
-                    setCollapsedGroups(new Set(allGroupPaths))
-                  } else {
-                    setCollapsedGroups(new Set())
-                  }
-                }}
-                className="text-xs text-slate-400 hover:text-slate-200 transition-colors"
-              >
-                {collapsedGroups.size === 0 ? 'Collapse all' : 'Expand all'}
-              </button>
-            </div>
-            <table className="w-full">
-              <thead>
-                <tr className="border-b border-slate-700/50">
-                  <th className="text-left px-4 py-3 text-slate-400 font-medium text-sm">Name</th>
-                  <th className="text-left px-4 py-3 text-slate-400 font-medium text-sm hidden sm:table-cell">Mode</th>
-                  <th className="text-left px-4 py-3 text-slate-400 font-medium text-sm hidden md:table-cell">Pool</th>
-                  <th className="text-left px-4 py-3 text-slate-400 font-medium text-sm hidden lg:table-cell">Resources</th>
-                  <th className="text-left px-4 py-3 text-slate-400 font-medium text-sm hidden lg:table-cell">Status</th>
-                  <th className="text-left px-4 py-3 text-slate-400 font-medium text-sm hidden xl:table-cell">Created</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-700/30">
-                <WorkspaceGroupRows
-                  groups={workspaceTree}
-                  collapsedGroups={collapsedGroups}
-                  toggleGroup={toggleGroup}
-                  pathPrefix=""
-                  resolveStatus={resolveStatus}
-                  parsedFilter={parsedFilter}
-                  setFilterInput={setFilterInput}
-                  badgeColors={badgeColors}
-                />
-              </tbody>
-            </table>
-          </div>
         ) : (
           <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 overflow-hidden">
             <table className="w-full">

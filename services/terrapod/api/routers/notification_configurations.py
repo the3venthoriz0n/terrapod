@@ -24,6 +24,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from terrapod.api.dependencies import AuthenticatedUser, get_current_user
+from terrapod.auth import capabilities as cap
+from terrapod.auth.capabilities import has_capability
 from terrapod.db.models import NotificationConfiguration, Workspace
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
@@ -33,7 +35,9 @@ from terrapod.services.notification_service import (
     deliver_notification,
     record_delivery_response,
 )
-from terrapod.services.workspace_rbac_service import has_permission, resolve_workspace_permission
+from terrapod.services.workspace_rbac_service import (
+    resolve_workspace_capabilities_for,
+)
 
 router = APIRouter(tags=["notification-configurations"])
 logger = get_logger(__name__)
@@ -84,14 +88,14 @@ async def _get_workspace(workspace_id: str, db: AsyncSession) -> Workspace:
     return ws
 
 
-async def _require_ws_permission(
+async def _require_ws_capability(
     ws: Workspace, required: str, user: AuthenticatedUser, db: AsyncSession
 ) -> None:
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
-    if not has_permission(perm, required):
+    caps = await resolve_workspace_capabilities_for(db, user, ws)
+    if not has_capability(caps, required):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Requires {required} permission on workspace",
+            detail=f"Requires {required} capability on workspace",
         )
 
 
@@ -116,7 +120,7 @@ async def create_notification_configuration(
 ) -> JSONResponse:
     """Create a notification configuration. Requires admin on the workspace."""
     ws = await _get_workspace(workspace_id, db)
-    await _require_ws_permission(ws, "admin", user, db)
+    await _require_ws_capability(ws, cap.NOTIFICATION_MANAGE, user, db)
 
     attrs = body.get("data", {}).get("attributes", {})
     name = attrs.get("name", "").strip()
@@ -158,6 +162,10 @@ async def create_notification_configuration(
     await db.refresh(nc, attribute_names=["workspace"])
     await db.commit()
 
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(str(ws.id), "workspace_notification_change")
+
     logger.info(
         "Notification configuration created",
         nc_id=str(nc.id),
@@ -176,7 +184,7 @@ async def list_notification_configurations(
 ) -> JSONResponse:
     """List notification configs for a workspace. Requires read."""
     ws = await _get_workspace(workspace_id, db)
-    await _require_ws_permission(ws, "read", user, db)
+    await _require_ws_capability(ws, cap.NOTIFICATION_READ, user, db)
 
     result = await db.execute(
         select(NotificationConfiguration)
@@ -211,7 +219,7 @@ async def show_notification_configuration(
 ) -> JSONResponse:
     """Show a notification configuration. Requires read on the workspace."""
     nc = await _get_nc(nc_id, db)
-    await _require_ws_permission(nc.workspace, "read", user, db)
+    await _require_ws_capability(nc.workspace, cap.NOTIFICATION_READ, user, db)
     return JSONResponse(content={"data": _nc_json(nc)})
 
 
@@ -224,7 +232,7 @@ async def update_notification_configuration(
 ) -> JSONResponse:
     """Update a notification configuration. Requires admin on the workspace."""
     nc = await _get_nc(nc_id, db)
-    await _require_ws_permission(nc.workspace, "admin", user, db)
+    await _require_ws_capability(nc.workspace, cap.NOTIFICATION_MANAGE, user, db)
 
     attrs = body.get("data", {}).get("attributes", {})
 
@@ -256,6 +264,10 @@ async def update_notification_configuration(
     # Reload for serialization
     await db.refresh(nc, attribute_names=["workspace"])
 
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(str(nc.workspace_id), "workspace_notification_change")
+
     logger.info("Notification configuration updated", nc_id=str(nc.id))
 
     return JSONResponse(content={"data": _nc_json(nc)})
@@ -269,10 +281,16 @@ async def delete_notification_configuration(
 ) -> None:
     """Delete a notification configuration. Requires admin on the workspace."""
     nc = await _get_nc(nc_id, db)
-    await _require_ws_permission(nc.workspace, "admin", user, db)
+    await _require_ws_capability(nc.workspace, cap.NOTIFICATION_MANAGE, user, db)
+
+    nc_ws_id = str(nc.workspace_id)
 
     await db.delete(nc)
     await db.commit()
+
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(nc_ws_id, "workspace_notification_change")
 
     logger.info("Notification configuration deleted", nc_id=nc_id)
 
@@ -285,7 +303,7 @@ async def verify_notification_configuration(
 ) -> JSONResponse:
     """Send a test notification. Requires admin on the workspace."""
     nc = await _get_nc(nc_id, db)
-    await _require_ws_permission(nc.workspace, "admin", user, db)
+    await _require_ws_capability(nc.workspace, cap.NOTIFICATION_MANAGE, user, db)
 
     payload = build_verification_payload(nc.name)
 

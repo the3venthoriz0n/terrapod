@@ -26,11 +26,14 @@ def _runner_user(run_id: uuid.UUID) -> AuthenticatedUser:
     )
 
 
-def _mock_run(run_id=None, ws_id=None):
+def _mock_run(run_id=None, ws_id=None, is_drift_detection=False):
     run = MagicMock()
     run.id = run_id or uuid.uuid4()
     run.workspace_id = ws_id or uuid.uuid4()
     run.created_by = "matt@example.com"
+    # Default False so the AI-summary tests see exactly one enqueue; the
+    # drift-reclassify path (#482) is opt-in per test via True.
+    run.is_drift_detection = is_drift_detection
     return run
 
 
@@ -160,7 +163,142 @@ class TestUploadStateDuplicateSerial:
 
         assert resp.status_code == 204
         mock_db.add.assert_called_once()
-        mock_storage.put.assert_called_once()
+        # State is streamed from a PVC tempfile into storage (CLAUDE.md #14),
+        # never buffered in RAM, so `put_stream` is the call — not `put`.
+        mock_storage.put_stream.assert_called_once()
+        mock_storage.put.assert_not_called()
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    @patch("terrapod.api.routers.run_artifacts.get_storage")
+    async def test_existing_serial_same_md5_is_idempotent_200(self, mock_get_storage, *_mocks):
+        """A serial-neutral no-op apply (state byte-identical to the recorded
+        state at the same serial) is NOT a divergence. The API treats it as an
+        idempotent success (200), does NOT insert a new row, does NOT store the
+        blob, and clears any stale state_diverged flag — so the runner never
+        signals state-diverged. This is the defence-in-depth half of the
+        auth0-perpetual-diff fix (the runner also skips the upload entirely)."""
+        import hashlib
+
+        run_id = uuid.uuid4()
+        ws_id = uuid.uuid4()
+        run = _mock_run(run_id=run_id, ws_id=ws_id)
+
+        state_json = json.dumps({"version": 4, "serial": 8, "lineage": "abc"})
+        body_md5 = hashlib.md5(state_json.encode()).hexdigest()  # noqa: S324
+        body_sha = hashlib.sha256(state_json.encode()).hexdigest()
+
+        mock_db = AsyncMock()
+        # The existing state version at serial 8 has the SAME content hash.
+        # The divergence check prefers sha256 (collision-resistant); md5 stays
+        # for the go-tfe contract.
+        existing_sv = MagicMock(spec=StateVersion)
+        existing_sv.md5 = body_md5
+        existing_sv.sha256 = body_sha
+        ws = MagicMock()
+        ws.state_diverged = True  # stale flag from a prior mis-fire
+        # db.get: first _get_run(Run), then db.get(Workspace) in the no-op branch.
+        mock_db.get.side_effect = [run, ws]
+        lookup = MagicMock()
+        lookup.scalar_one_or_none.return_value = existing_sv
+        mock_db.execute.return_value = lookup
+
+        mock_storage = AsyncMock()
+        mock_get_storage.return_value = mock_storage
+
+        app = _make_app(_runner_user(run_id), mock_db)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as client:
+            resp = await client.put(
+                f"/api/terrapod/v1/runs/{run.id}/artifacts/state",
+                content=state_json,
+                headers={**_AUTH, "Content-Type": "application/json"},
+            )
+
+        assert resp.status_code == 200
+        # No new row, no blob write — there is nothing to persist.
+        mock_db.add.assert_not_called()
+        mock_storage.put.assert_not_called()
+        # Stale divergence flag cleared.
+        assert ws.state_diverged is False
+        mock_db.commit.assert_awaited()
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    @patch("terrapod.api.routers.run_artifacts.get_storage")
+    async def test_legacy_row_without_sha256_falls_back_to_md5(self, mock_get_storage, *_mocks):
+        """A row written before the sha256 column existed has sha256 == "".
+        The divergence check must fall back to md5 for it (so a pre-upgrade
+        no-op apply is still recognised as idempotent, not flagged diverged)."""
+        import hashlib
+
+        run_id = uuid.uuid4()
+        ws_id = uuid.uuid4()
+        run = _mock_run(run_id=run_id, ws_id=ws_id)
+
+        state_json = json.dumps({"version": 4, "serial": 8, "lineage": "abc"})
+        body_md5 = hashlib.md5(state_json.encode()).hexdigest()  # noqa: S324
+
+        mock_db = AsyncMock()
+        existing_sv = MagicMock(spec=StateVersion)
+        existing_sv.md5 = body_md5
+        existing_sv.sha256 = ""  # legacy row, pre-sha256-column
+        ws = MagicMock()
+        ws.state_diverged = False
+        mock_db.get.side_effect = [run, ws]
+        lookup = MagicMock()
+        lookup.scalar_one_or_none.return_value = existing_sv
+        mock_db.execute.return_value = lookup
+        mock_get_storage.return_value = AsyncMock()
+
+        app = _make_app(_runner_user(run_id), mock_db)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as client:
+            resp = await client.put(
+                f"/api/terrapod/v1/runs/{run.id}/artifacts/state",
+                content=state_json,
+                headers={**_AUTH, "Content-Type": "application/json"},
+            )
+
+        assert resp.status_code == 200
+        mock_db.add.assert_not_called()
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    @patch("terrapod.api.routers.run_artifacts.get_storage")
+    async def test_existing_serial_different_sha256_is_divergence_409(
+        self, mock_get_storage, *_mocks
+    ):
+        """Same serial but a DIFFERENT sha256 is a genuine divergence — the
+        whole reason for the sha256 column (an md5 collision must not let it
+        slip through as an idempotent no-op). It must 409, not 200."""
+        run_id = uuid.uuid4()
+        ws_id = uuid.uuid4()
+        run = _mock_run(run_id=run_id, ws_id=ws_id)
+
+        state_json = json.dumps({"version": 4, "serial": 8, "lineage": "abc"})
+
+        mock_db = AsyncMock()
+        existing_sv = MagicMock(spec=StateVersion)
+        existing_sv.md5 = "deadbeef"
+        existing_sv.sha256 = "a-different-sha256-than-the-upload"
+        mock_db.get.return_value = run
+        lookup = MagicMock()
+        lookup.scalar_one_or_none.return_value = existing_sv
+        mock_db.execute.return_value = lookup
+        mock_get_storage.return_value = AsyncMock()
+
+        app = _make_app(_runner_user(run_id), mock_db)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as client:
+            resp = await client.put(
+                f"/api/terrapod/v1/runs/{run.id}/artifacts/state",
+                content=state_json,
+                headers={**_AUTH, "Content-Type": "application/json"},
+            )
+        assert resp.status_code == 409
+        mock_db.add.assert_not_called()
 
 
 # ── upload_plan_json_output (#280) ─────────────────────────────────────
@@ -190,10 +328,13 @@ class TestUploadPlanJsonOutput:
             )
 
         assert resp.status_code == 204
-        mock_storage.put.assert_called_once()
-        key, payload = mock_storage.put.call_args.args
+        # Plan JSON is streamed from a PVC tempfile into storage (CLAUDE.md
+        # #14), so `put_stream` carries the canonical key + an async chunk
+        # iterator — not the raw bytes.
+        mock_storage.put_stream.assert_called_once()
+        mock_storage.put.assert_not_called()
+        key = mock_storage.put_stream.call_args.args[0]
         assert key == f"plans/{ws_id}/{run_id}.json-output"
-        assert payload == body
         # Flag flip is the source of truth for `_plan_json` advertising the URL.
         assert run.has_json_output is True
         mock_db.commit.assert_awaited_once()
@@ -355,6 +496,76 @@ class TestUploadPlanJsonOutput:
         assert resp.status_code == 204
         mock_enq.assert_not_called()
 
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    @patch("terrapod.api.routers.run_artifacts.get_storage")
+    @patch("terrapod.api.routers.run_artifacts.settings")
+    @patch("terrapod.services.scheduler.enqueue_trigger", new_callable=AsyncMock)
+    async def test_reenqueues_drift_completion_for_drift_run(
+        self, mock_enq, mock_settings, mock_get_storage, *_mocks
+    ):
+        """A drift-detection run must re-fire drift_run_completed AFTER the
+        plan JSON lands (#482). handle_drift_run_completed first runs on
+        the planned transition — before this upload — when has_json_output
+        is still False, so the ignore-rule classifier can't read the plan
+        and conservatively leaves drift_status='drifted'. Re-enqueuing here
+        lets it re-run with the JSON available and flip to no_drift. Was
+        the v0.36.1 fix.
+        """
+        mock_settings.ai_summary.enabled = False  # isolate the drift enqueue
+        run_id = uuid.uuid4()
+        ws_id = uuid.uuid4()
+        run = _mock_run(run_id=run_id, ws_id=ws_id, is_drift_detection=True)
+        mock_db = AsyncMock()
+        mock_db.get.return_value = run
+        mock_get_storage.return_value = AsyncMock()
+
+        app = _make_app(_runner_user(run_id), mock_db)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as client:
+            resp = await client.put(
+                f"/api/terrapod/v1/runs/{run.id}/artifacts/plan-json-output",
+                content=b'{"resource_changes":[]}',
+                headers={**_AUTH, "Content-Type": "application/json"},
+            )
+
+        assert resp.status_code == 204
+        mock_enq.assert_awaited_once()
+        args, kwargs = mock_enq.call_args
+        assert args[0] == "drift_run_completed"
+        assert args[1] == {"run_id": str(run_id), "workspace_id": str(ws_id)}
+        # Distinct dedup key from the transition-time enqueue (drift:{id})
+        # so this re-trigger isn't swallowed by the 60s dedup window.
+        assert kwargs.get("dedup_key") == f"drift_postjson:{run_id}"
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    @patch("terrapod.api.routers.run_artifacts.get_storage")
+    @patch("terrapod.api.routers.run_artifacts.settings")
+    @patch("terrapod.services.scheduler.enqueue_trigger", new_callable=AsyncMock)
+    async def test_no_drift_reenqueue_for_normal_run(
+        self, mock_enq, mock_settings, mock_get_storage, *_mocks
+    ):
+        """A normal (non-drift) run must NOT re-enqueue drift_run_completed."""
+        mock_settings.ai_summary.enabled = False
+        run_id = uuid.uuid4()
+        run = _mock_run(run_id=run_id, is_drift_detection=False)
+        mock_db = AsyncMock()
+        mock_db.get.return_value = run
+        mock_get_storage.return_value = AsyncMock()
+
+        app = _make_app(_runner_user(run_id), mock_db)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as client:
+            resp = await client.put(
+                f"/api/terrapod/v1/runs/{run.id}/artifacts/plan-json-output",
+                content=b'{"resource_changes":[]}',
+                headers={**_AUTH, "Content-Type": "application/json"},
+            )
+
+        assert resp.status_code == 204
+        mock_enq.assert_not_called()
+
 
 # ── lock-file (#306) ─────────────────────────────────────────────────────
 
@@ -387,10 +598,12 @@ class TestLockFile:
             )
 
         assert resp.status_code == 204
-        mock_storage.put.assert_called_once()
-        key, payload = mock_storage.put.call_args.args
+        # Lock file is streamed straight from the request into storage
+        # (CLAUDE.md #14) — `put_stream` with the canonical key, not `put`.
+        mock_storage.put_stream.assert_called_once()
+        mock_storage.put.assert_not_called()
+        key = mock_storage.put_stream.call_args.args[0]
         assert key == f"plans/{ws_id}/{run_id}.terraform.lock.hcl"
-        assert payload == body
 
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")

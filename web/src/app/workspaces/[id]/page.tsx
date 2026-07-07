@@ -4,6 +4,7 @@ import { useEffect, useState, useCallback, Suspense } from 'react'
 import { useRouter, useParams, useSearchParams } from 'next/navigation'
 import NavBar from '@/components/nav-bar'
 import { PageHeader } from '@/components/page-header'
+import { ConnectionStatus } from '@/components/connection-status'
 import { LoadingSpinner } from '@/components/loading-spinner'
 import { ErrorBanner } from '@/components/error-banner'
 import { EmptyState } from '@/components/empty-state'
@@ -11,6 +12,8 @@ import { SortableHeader } from '@/components/sortable-header'
 import { LabelsEditor } from '@/components/labels-editor'
 import { HealthConditions } from '@/components/health-conditions'
 import { PlanSummaryBadges } from '@/components/plan-summary-badges'
+import { WorkspacePicker } from '@/components/workspace-picker'
+import { SensitiveValueInput } from '@/components/sensitive-value-input'
 import { getAuthState, isAdmin } from '@/lib/auth'
 import { apiFetch } from '@/lib/api'
 import { useSortable } from '@/lib/use-sortable'
@@ -36,6 +39,8 @@ interface WorkspaceAttrs {
   'execution-backend': string
   'auto-apply': boolean
   'terraform-version': string
+  'terragrunt-enabled': boolean
+  'terragrunt-version': string
   'working-directory': string
   locked: boolean
   'resource-cpu': string
@@ -46,6 +51,7 @@ interface WorkspaceAttrs {
   'owner-email': string
   'var-files': string[]
   'trigger-prefixes': string[]
+  'drift-ignore-rules': string[]
   'vcs-repo-url': string
   'vcs-branch': string
   'vcs-connection-id': string | null
@@ -55,8 +61,10 @@ interface WorkspaceAttrs {
   'auto-merge-strategy': 'merge' | 'squash' | 'rebase'
   'ai-summary-mode': 'default' | 'enabled' | 'disabled'
   'ai-summary-context': string
+  'slack-channel': string
   'drift-detection-enabled': boolean
   'drift-detection-interval-seconds': number
+  'plan-expiry-seconds': number | null
   'drift-last-checked-at': string
   'drift-status': string
   'state-diverged': boolean
@@ -245,6 +253,8 @@ function WorkspaceDetailContent() {
   const [editExecMode, setEditExecMode] = useState('')
   const [editBackend, setEditBackend] = useState('')
   const [editVersion, setEditVersion] = useState('')
+  const [editTerragruntEnabled, setEditTerragruntEnabled] = useState(false)
+  const [editTerragruntVersion, setEditTerragruntVersion] = useState('')
   const [editPoolId, setEditPoolId] = useState<string | null>(null)
   const [editLabels, setEditLabels] = useState<Record<string, string>>({})
   const [editOwner, setEditOwner] = useState('')
@@ -252,6 +262,8 @@ function WorkspaceDetailContent() {
   const [newVarFile, setNewVarFile] = useState('')
   const [editTriggerPrefixes, setEditTriggerPrefixes] = useState<string[]>([])
   const [newTriggerPrefix, setNewTriggerPrefix] = useState('')
+  const [editDriftIgnoreRules, setEditDriftIgnoreRules] = useState<string[]>([])
+  const [newDriftIgnoreRule, setNewDriftIgnoreRule] = useState('')
   const [editWorkingDir, setEditWorkingDir] = useState('')
   const [editVcsConnectionId, setEditVcsConnectionId] = useState<string | null>(null)
   const [editVcsRepoUrl, setEditVcsRepoUrl] = useState('')
@@ -337,6 +349,7 @@ function WorkspaceDetailContent() {
 
   // Drift detection
   const [savingDrift, setSavingDrift] = useState(false)
+  const [savingPlanExpiry, setSavingPlanExpiry] = useState(false)
   const [checkingDrift, setCheckingDrift] = useState(false)
   const [dismissingDrift, setDismissingDrift] = useState(false)
 
@@ -345,6 +358,11 @@ function WorkspaceDetailContent() {
   // dropdown change directly.
   const [savingAiSummary, setSavingAiSummary] = useState(false)
   const [aiSummaryContextDraft, setAiSummaryContextDraft] = useState<string | null>(null)
+
+  // Slack run notifications (#556). Local draft for the channel input,
+  // autosaved on blur. Opt-in: empty channel = this workspace stays silent.
+  const [savingSlackChannel, setSavingSlackChannel] = useState(false)
+  const [slackChannelDraft, setSlackChannelDraft] = useState<string | null>(null)
 
   // Delete confirmation
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
@@ -366,7 +384,7 @@ function WorkspaceDetailContent() {
   const [rscOutbound, setRscOutbound] = useState<RemoteStateEdge[]>([])
   const [rscInbound, setRscInbound] = useState<RemoteStateEdge[]>([])
   const [rscLoading, setRscLoading] = useState(false)
-  const [rscAddName, setRscAddName] = useState('')
+  const [rscAddingId, setRscAddingId] = useState('')
   const [rscAdding, setRscAdding] = useState(false)
 
   // Run Triggers — cross-workspace apply-fires-plan dependency edges
@@ -381,7 +399,7 @@ function WorkspaceDetailContent() {
   const [trgInbound, setTrgInbound] = useState<RunTriggerEdge[]>([])
   const [trgOutbound, setTrgOutbound] = useState<RunTriggerEdge[]>([])
   const [trgLoading, setTrgLoading] = useState(false)
-  const [trgAddName, setTrgAddName] = useState('')
+  const [trgAddingId, setTrgAddingId] = useState('')
   const [trgAdding, setTrgAdding] = useState(false)
 
   // Notifications
@@ -410,6 +428,7 @@ function WorkspaceDetailContent() {
   const [rtHmacKey, setRtHmacKey] = useState('')
   const [addingRunTask, setAddingRunTask] = useState(false)
   const [deleteRtId, setDeleteRtId] = useState<string | null>(null)
+  const [deleteVarId, setDeleteVarId] = useState<string | null>(null)
 
   // Sorting for runs tab
   type RunSortKey = 'id' | 'status' | 'type' | 'source' | 'created-by' | 'created-at'
@@ -532,10 +551,17 @@ function WorkspaceDetailContent() {
   }, [vcsRef])
 
   // Real-time workspace events via SSE (run status, lock/unlock, state, settings)
-  useRunEvents(workspaceId, useCallback((event) => {
+  const { connected: sseConnected } = useRunEvents(workspaceId, useCallback((event) => {
     loadWorkspace()
+    const ev = event.event
+    const reconnect = ev === 'reconnect'
     if (activeTab === 'runs') loadRuns()
-    if (activeTab === 'state' && (event.event === 'state_version_created' || event.event === 'reconnect')) loadStateVersions()
+    if (activeTab === 'state' && (ev === 'state_version_created' || reconnect)) loadStateVersions()
+    if (activeTab === 'variables' && (ev === 'workspace_variable_change' || reconnect)) loadVariables()
+    if (activeTab === 'notifications' && (ev === 'workspace_notification_change' || reconnect)) loadNotifications()
+    if (activeTab === 'run-tasks' && (ev === 'workspace_run_task_change' || reconnect)) loadRunTasks()
+    if (activeTab === 'run-triggers' && (ev === 'run_trigger_change' || reconnect)) loadRunTriggers()
+    if (activeTab === 'sharing' && (ev === 'remote_state_consumer_change' || reconnect)) loadRemoteStateConsumers()
   }, [activeTab, loadRuns, loadWorkspace]))
 
   async function loadVariables() {
@@ -710,20 +736,11 @@ function WorkspaceDetailContent() {
     }
   }
 
-  async function addRemoteStateConsumer() {
-    const name = rscAddName.trim()
-    if (!name) return
+  async function addRemoteStateConsumer(consumerId: string) {
+    if (!consumerId) return
+    setRscAddingId(consumerId)
     setRscAdding(true)
     try {
-      // Resolve consumer workspace name → id via the by-name endpoint.
-      const lookup = await apiFetch(`/api/v2/organizations/default/workspaces/${encodeURIComponent(name)}`)
-      if (!lookup.ok) {
-        throw new Error(lookup.status === 404 ? `Workspace "${name}" not found` : 'Failed to resolve consumer workspace')
-      }
-      const wsBody = await lookup.json()
-      const consumerId = wsBody.data?.id
-      if (!consumerId) throw new Error('Workspace lookup returned no id')
-
       const res = await apiFetch(
         `/api/terrapod/v1/workspaces/${workspaceId}/remote-state-consumers`,
         {
@@ -738,12 +755,12 @@ function WorkspaceDetailContent() {
         const err = await res.json().catch(() => ({ detail: 'Failed to authorize consumer' }))
         throw new Error(err.detail || 'Failed to authorize consumer')
       }
-      setRscAddName('')
       await loadRemoteStateConsumers()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to authorize consumer')
     } finally {
       setRscAdding(false)
+      setRscAddingId('')
     }
   }
 
@@ -792,19 +809,11 @@ function WorkspaceDetailContent() {
     }
   }
 
-  async function addRunTrigger() {
-    const name = trgAddName.trim()
-    if (!name) return
+  async function addRunTrigger(sourceId: string) {
+    if (!sourceId) return
+    setTrgAddingId(sourceId)
     setTrgAdding(true)
     try {
-      const lookup = await apiFetch(`/api/v2/organizations/default/workspaces/${encodeURIComponent(name)}`)
-      if (!lookup.ok) {
-        throw new Error(lookup.status === 404 ? `Workspace "${name}" not found` : 'Failed to resolve source workspace')
-      }
-      const wsBody = await lookup.json()
-      const sourceId = wsBody.data?.id
-      if (!sourceId) throw new Error('Workspace lookup returned no id')
-
       const res = await apiFetch(
         `/api/terrapod/v1/workspaces/${workspaceId}/run-triggers`,
         {
@@ -819,12 +828,12 @@ function WorkspaceDetailContent() {
         const err = await res.json().catch(() => ({ detail: 'Failed to add run trigger' }))
         throw new Error(err.detail || 'Failed to add run trigger')
       }
-      setTrgAddName('')
       await loadRunTriggers()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to add run trigger')
     } finally {
       setTrgAdding(false)
+      setTrgAddingId('')
     }
   }
 
@@ -927,6 +936,8 @@ function WorkspaceDetailContent() {
     setEditExecMode(workspace.attributes['execution-mode'])
     setEditBackend(workspace.attributes['execution-backend'] || 'tofu')
     setEditVersion(workspace.attributes['terraform-version'] || '')
+    setEditTerragruntEnabled(workspace.attributes['terragrunt-enabled'] ?? false)
+    setEditTerragruntVersion(workspace.attributes['terragrunt-version'] || '')
     setEditPoolId(workspace.attributes['agent-pool-id'])
     setEditLabels(workspace.attributes.labels || {})
     setEditOwner(workspace.attributes['owner-email'] || '')
@@ -934,6 +945,8 @@ function WorkspaceDetailContent() {
     setNewVarFile('')
     setEditTriggerPrefixes(workspace.attributes['trigger-prefixes'] || [])
     setNewTriggerPrefix('')
+    setEditDriftIgnoreRules(workspace.attributes['drift-ignore-rules'] || [])
+    setNewDriftIgnoreRule('')
     setEditWorkingDir(workspace.attributes['working-directory'] || '')
     setEditVcsConnectionId(workspace.attributes['vcs-connection-id'] || null)
     setEditVcsRepoUrl(workspace.attributes['vcs-repo-url'] || '')
@@ -986,10 +999,13 @@ function WorkspaceDetailContent() {
               'execution-mode': editExecMode,
               'execution-backend': editBackend,
               'terraform-version': editVersion,
+              'terragrunt-enabled': editTerragruntEnabled,
+              'terragrunt-version': editTerragruntVersion || '1.0',
               'agent-pool-id': editPoolId,
               'working-directory': editWorkingDir,
               'var-files': editVarFiles,
               'trigger-prefixes': editTriggerPrefixes,
+              'drift-ignore-rules': editDriftIgnoreRules,
               'vcs-repo-url': editVcsRepoUrl,
               'vcs-branch': editVcsBranch,
               'vcs-workflow': editVcsWorkflow,
@@ -1065,6 +1081,32 @@ function WorkspaceDetailContent() {
     }
   }
 
+  // Slack run notifications (#556)
+  async function handleSlackChannelUpdate(channel: string) {
+    if (!workspace) return
+    setSavingSlackChannel(true)
+    try {
+      const res = await apiFetch(`/api/v2/workspaces/${workspaceId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/vnd.api+json' },
+        body: JSON.stringify({
+          data: { type: 'workspaces', attributes: { 'slack-channel': channel } },
+        }),
+      })
+      if (!res.ok) {
+        const body = await res.text()
+        throw new Error(body || 'Failed to update Slack channel')
+      }
+      const data = await res.json()
+      setWorkspace(data.data)
+      setSlackChannelDraft(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update Slack channel')
+    } finally {
+      setSavingSlackChannel(false)
+    }
+  }
+
   async function handleDriftToggle() {
     if (!workspace) return
     setSavingDrift(true)
@@ -1104,6 +1146,30 @@ function WorkspaceDetailContent() {
       setError(err instanceof Error ? err.message : 'Failed to update drift interval')
     } finally {
       setSavingDrift(false)
+    }
+  }
+
+  // Plan expiry TTL (#646): 0 / empty disables (sent as null).
+  async function handlePlanExpiryChange(seconds: number) {
+    setSavingPlanExpiry(true)
+    try {
+      const res = await apiFetch(`/api/v2/workspaces/${workspaceId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/vnd.api+json' },
+        body: JSON.stringify({
+          data: {
+            type: 'workspaces',
+            attributes: { 'plan-expiry-seconds': seconds > 0 ? seconds : null },
+          },
+        }),
+      })
+      if (!res.ok) throw new Error('Failed to update plan expiry')
+      const data = await res.json()
+      setWorkspace(data.data)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update plan expiry')
+    } finally {
+      setSavingPlanExpiry(false)
     }
   }
 
@@ -1220,6 +1286,7 @@ function WorkspaceDetailContent() {
     try {
       const res = await apiFetch(`/api/v2/workspaces/${workspaceId}/vars/${varId}`, { method: 'DELETE' })
       if (!res.ok) throw new Error('Failed to delete variable')
+      setDeleteVarId(null)
       await loadVariables()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to delete variable')
@@ -1497,6 +1564,17 @@ function WorkspaceDetailContent() {
     { label: '7 days', value: 604800 },
   ]
 
+  // #646 plan-expiry TTL choices; 0 = disabled (the default).
+  const PLAN_EXPIRY_OPTIONS = [
+    { label: 'Disabled', value: 0 },
+    { label: '1 hour', value: 3600 },
+    { label: '4 hours', value: 14400 },
+    { label: '12 hours', value: 43200 },
+    { label: '24 hours', value: 86400 },
+    { label: '3 days', value: 259200 },
+    { label: '7 days', value: 604800 },
+  ]
+
   function stageBadge(s: string): string {
     switch (s) {
       case 'pre_plan': return 'bg-amber-900/50 text-amber-300'
@@ -1536,6 +1614,7 @@ function WorkspaceDetailContent() {
         <PageHeader
           title={attrs.name}
           description={`${attrs['execution-mode']} execution mode`}
+          actions={<ConnectionStatus connected={sseConnected} />}
         />
 
         {error && <ErrorBanner message={error} />}
@@ -1699,6 +1778,25 @@ function WorkspaceDetailContent() {
                     </>
                   ) : (
                     <dd className="mt-1 text-sm text-slate-200">{attrs['terraform-version'] || 'Default'}</dd>
+                  )}
+                </div>
+                <div>
+                  <dt className="text-xs text-slate-500">Terragrunt</dt>
+                  {editing ? (
+                    <div className="mt-1 space-y-2">
+                      <label className="flex items-center gap-2">
+                        <input type="checkbox" checked={editTerragruntEnabled} onChange={(e) => setEditTerragruntEnabled(e.target.checked)} className="rounded border-slate-600 bg-slate-700 text-brand-600" />
+                        <span className="text-sm text-slate-200">{editTerragruntEnabled ? 'Enabled (agent mode)' : 'Disabled'}</span>
+                      </label>
+                      {editTerragruntEnabled && (
+                        <input type="text" value={editTerragruntVersion} onChange={(e) => setEditTerragruntVersion(e.target.value)} placeholder="e.g. 1.0"
+                          pattern="[0-9]+\.[0-9]+(\.[0-9]+)?"
+                          title="Terragrunt version in X.Y or X.Y.Z format (e.g. 1.0)"
+                          className="w-full px-2 py-1 text-sm border border-slate-600 rounded bg-slate-700 text-slate-100 focus:outline-none focus:ring-1 focus:ring-brand-500" />
+                      )}
+                    </div>
+                  ) : (
+                    <dd className="mt-1 text-sm text-slate-200">{attrs['terragrunt-enabled'] ? `Enabled (v${attrs['terragrunt-version'] || '1.0'})` : 'Disabled'}</dd>
                   )}
                 </div>
                 <div>
@@ -1991,6 +2089,68 @@ function WorkspaceDetailContent() {
                     </dd>
                   )}
                 </div>
+                <div className="sm:col-span-2">
+                  <dt className="text-xs text-slate-500 mb-1">Drift Ignore Rules</dt>
+                  {editing && perms['can-update'] ? (
+                    <div className="space-y-2">
+                      <p className="text-xs text-slate-400">
+                        Glob-aware Terraform address + attribute paths suppressed by the drift classifier. <code className="text-[10px] bg-slate-800 px-1">*</code> matches zero or more non-<code className="text-[10px] bg-slate-800 px-1">.</code> chars (spans <code className="text-[10px] bg-slate-800 px-1">[N]</code> indices); <code className="text-[10px] bg-slate-800 px-1">[*]</code> matches any bracketed index. A bare address with no attribute suffix silences any change to that resource — including destroys. Affects drift only, not regular plan/apply. See <a href="https://github.com/mattrobinsonsre/terrapod/blob/main/docs/drift-ignore-rules.md" target="_blank" rel="noreferrer" className="text-brand-400 hover:underline">drift-ignore-rules.md</a> for the full grammar.
+                      </p>
+                      {editDriftIgnoreRules.map((r, i) => (
+                        <div key={`${r}-${i}`} className="flex items-center gap-2">
+                          <code className="text-sm text-slate-200 bg-slate-700 px-2 py-0.5 rounded flex-1 truncate">{r}</code>
+                          <button
+                            onClick={() => setEditDriftIgnoreRules(editDriftIgnoreRules.filter((_, j) => j !== i))}
+                            className="text-xs text-red-400 hover:text-red-300"
+                          >Remove</button>
+                        </div>
+                      ))}
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          value={newDriftIgnoreRule}
+                          onChange={(e) => setNewDriftIgnoreRule(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && newDriftIgnoreRule.trim()) {
+                              e.preventDefault()
+                              const v = newDriftIgnoreRule.trim()
+                              if (v && !editDriftIgnoreRules.includes(v)) {
+                                setEditDriftIgnoreRules([...editDriftIgnoreRules, v])
+                              }
+                              setNewDriftIgnoreRule('')
+                            }
+                          }}
+                          placeholder="e.g. module.eks*.argocd_cluster.*.config.tls_client_config.ca_data"
+                          className="flex-1 px-2 py-1 text-sm border border-slate-600 rounded bg-slate-700 text-slate-100 focus:outline-none focus:ring-1 focus:ring-brand-500 font-mono"
+                        />
+                        <button
+                          onClick={() => {
+                            if (newDriftIgnoreRule.trim()) {
+                              const v = newDriftIgnoreRule.trim()
+                              if (v && !editDriftIgnoreRules.includes(v)) {
+                                setEditDriftIgnoreRules([...editDriftIgnoreRules, v])
+                              }
+                              setNewDriftIgnoreRule('')
+                            }
+                          }}
+                          className="text-xs text-brand-400 hover:text-brand-300"
+                        >Add</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <dd className="mt-1 text-sm text-slate-200">
+                      {(attrs['drift-ignore-rules'] || []).length > 0 ? (
+                        <div className="flex flex-col gap-1">
+                          {attrs['drift-ignore-rules'].map((r) => (
+                            <code key={r} className="bg-slate-700 px-2 py-0.5 rounded text-xs font-mono">{r}</code>
+                          ))}
+                        </div>
+                      ) : (
+                        <span className="text-slate-500">None (every plan diff counts as drift)</span>
+                      )}
+                    </dd>
+                  )}
+                </div>
               </dl>
               {lockoutWarning && (
                 <div className="mt-4 p-3 bg-amber-900/30 border border-amber-700/50 rounded-lg">
@@ -2117,6 +2277,35 @@ function WorkspaceDetailContent() {
               </dl>
             </div>
 
+            {/* Plan Expiry (#646) */}
+            <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 p-6">
+              <div className="mb-4">
+                <h3 className="text-sm font-medium text-slate-300">Plan Expiry</h3>
+                <p className="text-xs text-slate-500 mt-1">
+                  Auto-discard an unconfirmed plan once it is older than this, so a stale
+                  plan can&apos;t be applied against a moved world. Off by default; the plan
+                  must then be re-run. (Applies to apply-capable runs only.)
+                </p>
+              </div>
+              <dl>
+                <div>
+                  <dt className="text-xs text-slate-500">Expire after</dt>
+                  <dd className="mt-1">
+                    <select
+                      value={attrs['plan-expiry-seconds'] || 0}
+                      onChange={(e) => handlePlanExpiryChange(Number(e.target.value))}
+                      disabled={savingPlanExpiry}
+                      className="w-full px-2 py-1 text-sm border border-slate-600 rounded bg-slate-700 text-slate-100 focus:outline-none focus:ring-1 focus:ring-brand-500"
+                    >
+                      {PLAN_EXPIRY_OPTIONS.map((o) => (
+                        <option key={o.value} value={o.value}>{o.label}</option>
+                      ))}
+                    </select>
+                  </dd>
+                </div>
+              </dl>
+            </div>
+
             {/* AI Plan Summary (#401) */}
             <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 p-6">
               <div className="flex items-center justify-between mb-4">
@@ -2194,6 +2383,53 @@ function WorkspaceDetailContent() {
               </dl>
             </div>
 
+            {/* Slack notifications (#556) */}
+            <div className="bg-slate-800/50 rounded-lg border border-slate-700 p-6">
+              <h3 className="text-sm font-medium text-slate-200">Slack notifications</h3>
+              <p className="text-sm text-slate-400 mt-1">
+                Opt this workspace into Slack run notifications — approval requests, applies,
+                errors, and drift. Leave the channel empty and this workspace stays silent
+                (there is no deployment-wide fan-out). Requires the Slack app to be enabled
+                by an administrator.
+              </p>
+              <dl className="mt-4">
+                <div>
+                  <dt className="text-xs text-slate-500">Channel</dt>
+                  <dd className="mt-1">
+                    {perms['can-update'] ? (
+                      <input
+                        type="text"
+                        value={slackChannelDraft ?? attrs['slack-channel'] ?? ''}
+                        onChange={(e) => setSlackChannelDraft(e.target.value)}
+                        onBlur={() => {
+                          if (
+                            slackChannelDraft !== null &&
+                            slackChannelDraft !== (attrs['slack-channel'] ?? '')
+                          ) {
+                            handleSlackChannelUpdate(slackChannelDraft.trim())
+                          } else {
+                            setSlackChannelDraft(null)
+                          }
+                        }}
+                        placeholder="#deploys or a channel ID (e.g. C0123ABCD)"
+                        maxLength={128}
+                        disabled={savingSlackChannel}
+                        className="w-full sm:w-96 px-3 py-2 text-sm border border-slate-600 rounded bg-slate-700 text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-brand-500 font-mono"
+                      />
+                    ) : attrs['slack-channel'] ? (
+                      <p className="text-sm text-slate-200 font-mono">{attrs['slack-channel']}</p>
+                    ) : (
+                      <p className="text-sm text-slate-500 italic">Not set — silent.</p>
+                    )}
+                    <p className="text-xs text-slate-500 mt-1">
+                      The Slack app must already be a member of the channel.
+                      {savingSlackChannel && <span className="ml-2 text-brand-400">Saving…</span>}
+                    </p>
+                  </dd>
+                </div>
+              </dl>
+            </div>
+
             {/* Delete */}
             {perms['can-destroy'] && (
               <div className="bg-slate-800/50 rounded-lg border border-red-900/30 p-6">
@@ -2252,7 +2488,7 @@ function WorkspaceDetailContent() {
                   </div>
                   <div>
                     <label htmlFor="var-val" className="block text-sm font-medium text-slate-300 mb-1">Value</label>
-                    <textarea id="var-val" value={varValue} onChange={(e) => setVarValue(e.target.value)} placeholder="us-east-1" rows={2} className="w-full px-3 py-2 border border-slate-600 rounded-lg bg-slate-700 text-slate-100 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent resize-y" />
+                    <SensitiveValueInput id="var-val" value={varValue} onChange={setVarValue} sensitive={varSensitive} placeholder="us-east-1" rows={2} className="w-full px-3 py-2 border border-slate-600 rounded-lg bg-slate-700 text-slate-100 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent resize-y" />
                   </div>
                   <div>
                     <label htmlFor="var-cat" className="block text-sm font-medium text-slate-300 mb-1">Category</label>
@@ -2302,7 +2538,8 @@ function WorkspaceDetailContent() {
                               className="w-full px-2 py-1 text-sm border border-slate-600 rounded bg-slate-700 text-slate-100 font-mono focus:outline-none focus:ring-1 focus:ring-brand-500" />
                           </td>
                           <td className="px-4 py-3">
-                            <textarea value={editVarValue} onChange={(e) => setEditVarValue(e.target.value)}
+                            <SensitiveValueInput value={editVarValue} onChange={setEditVarValue}
+                              sensitive={editVarSensitive}
                               placeholder={editVarSensitive ? 'Enter new value' : ''}
                               rows={2}
                               className="w-full px-2 py-1 text-sm border border-slate-600 rounded bg-slate-700 text-slate-100 font-mono focus:outline-none focus:ring-1 focus:ring-brand-500 resize-y" />
@@ -2352,7 +2589,14 @@ function WorkspaceDetailContent() {
                             <td className="px-4 py-3 text-right">
                               <div className="flex justify-end gap-2">
                                 <button onClick={() => startEditingVar(v)} className="text-xs text-brand-400 hover:text-brand-300">Edit</button>
-                                <button onClick={() => handleDeleteVariable(v.id)} className="text-xs text-red-400 hover:text-red-300">Delete</button>
+                                {deleteVarId === v.id ? (
+                                  <>
+                                    <button onClick={() => setDeleteVarId(null)} className="text-xs text-slate-400 hover:text-slate-200">Cancel</button>
+                                    <button onClick={() => handleDeleteVariable(v.id)} className="text-xs text-red-400 hover:text-red-300">Confirm</button>
+                                  </>
+                                ) : (
+                                  <button onClick={() => setDeleteVarId(v.id)} className="text-xs text-red-400 hover:text-red-300">Delete</button>
+                                )}
                               </div>
                             </td>
                           )}
@@ -3275,26 +3519,15 @@ function WorkspaceDetailContent() {
               )}
 
               {perms['can-update'] && (
-                <form
-                  onSubmit={(e) => { e.preventDefault(); addRunTrigger() }}
-                  className="mt-3 flex items-center gap-2"
-                >
-                  <input
-                    type="text"
-                    value={trgAddName}
-                    onChange={(e) => setTrgAddName(e.target.value)}
-                    placeholder="Add source workspace by name"
-                    className="flex-1 rounded border border-slate-700 bg-slate-900 px-3 py-1.5 text-sm text-slate-200 placeholder-slate-500"
+                <div className="mt-3" data-testid="run-trigger-picker">
+                  <WorkspacePicker
+                    placeholder="Search workspaces to add as a source…"
+                    excludeIds={[workspaceId, ...trgInbound.map((e) => e.sourceableId)]}
+                    busyId={trgAddingId}
                     disabled={trgAdding}
+                    onSelect={(ws) => addRunTrigger(ws.id)}
                   />
-                  <button
-                    type="submit"
-                    disabled={trgAdding || !trgAddName.trim()}
-                    className="rounded bg-brand-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-brand-500 disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    {trgAdding ? 'Adding…' : 'Add'}
-                  </button>
-                </form>
+                </div>
               )}
             </div>
 
@@ -3367,26 +3600,15 @@ function WorkspaceDetailContent() {
               )}
 
               {perms['can-update'] && (
-                <form
-                  onSubmit={(e) => { e.preventDefault(); addRemoteStateConsumer() }}
-                  className="mt-3 flex items-center gap-2"
-                >
-                  <input
-                    type="text"
-                    value={rscAddName}
-                    onChange={(e) => setRscAddName(e.target.value)}
-                    placeholder="Authorize consumer workspace by name"
-                    className="flex-1 rounded border border-slate-700 bg-slate-900 px-3 py-1.5 text-sm text-slate-200 placeholder-slate-500"
+                <div className="mt-3" data-testid="remote-state-consumer-picker">
+                  <WorkspacePicker
+                    placeholder="Search workspaces to authorize as a consumer…"
+                    excludeIds={[workspaceId, ...rscOutbound.map((e) => e.consumerId)]}
+                    busyId={rscAddingId}
                     disabled={rscAdding}
+                    onSelect={(ws) => addRemoteStateConsumer(ws.id)}
                   />
-                  <button
-                    type="submit"
-                    disabled={rscAdding || !rscAddName.trim()}
-                    className="rounded bg-brand-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-brand-500 disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    {rscAdding ? 'Authorizing…' : 'Authorize'}
-                  </button>
-                </form>
+                </div>
               )}
             </div>
 

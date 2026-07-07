@@ -20,6 +20,35 @@ data:
     token_ttl_seconds: {{ .Values.runners.tokenTTLSeconds }}
     max_token_ttl_seconds: {{ .Values.runners.maxTokenTTLSeconds }}
     stale_timeout_seconds: {{ .Values.runners.staleTimeoutSeconds }}
+    drift_max_duration_seconds: {{ .Values.runners.driftMaxDurationSeconds | default 1800 }}
+    lifecycle_destroy_retries: {{ .Values.runners.lifecycleDestroyRetries | default 2 }}
+    lifecycle_destroy_retry_backoff_seconds: {{ .Values.runners.lifecycleDestroyRetryBackoffSeconds | default 45 }}
+    default_terraform_version: {{ .Values.runners.defaultTerraformVersion | default "1.12" | quote }}
+    default_execution_backend: {{ .Values.runners.defaultExecutionBackend | default "tofu" | quote }}
+    launch_timeout_seconds: {{ .Values.runners.launchTimeoutSeconds | default 300 }}
+    {{- /* Execution-hooks kill-switch (#619). `dig` gives a correct default-true
+       bool: an explicit `hooksEnabled: false` is preserved (a `| default true`
+       would wrongly coerce it back to true). */}}
+    hooks_enabled: {{ dig "hooksEnabled" true .Values.runners }}
+    {{- /*
+    Listener operational settings (#617): non-sensitive, so they flow through
+    this ConfigMap instead of TERRAPOD_* env on the listener Deployment. The
+    listener reads them from RunnerConfig (layered defaults → runners.yaml →
+    env). Secrets (join token) + runtime values (POD_NAME) stay Deployment env.
+    */}}
+    listener_name: {{ .Values.listener.name | default "listener" | quote }}
+    runner_namespace: {{ include "terrapod.runnerNamespace" . | quote }}
+    listener_namespace: {{ .Release.Namespace | quote }}
+    credentials_secret_name: {{ include "terrapod.listenerCredentialsSecretName" . | quote }}
+    health_port: {{ .Values.listener.healthPort | default 8081 }}
+    public_api_url: {{ .Values.listener.publicApiUrl | default .Values.api.config.external_url | default "" | quote }}
+    listener_cert_ttl_seconds: {{ .Values.api.config.agent_pools.listener_cert_ttl_seconds | default 3600 }}
+    heartbeat_interval: {{ .Values.listener.heartbeatInterval | default 60 }}
+    max_concurrent: {{ .Values.listener.maxConcurrent | default 3 }}
+    poll_interval: {{ .Values.listener.pollInterval | default 30 }}
+    sse_read_timeout: {{ .Values.listener.sseReadTimeout | default 30 }}
+    sse_max_age: {{ .Values.listener.sseMaxAge | default 600 }}
+    sse_retry_interval: {{ .Values.listener.sseRetryInterval | default 5 }}
     {{- with .Values.runners.imagePullSecrets }}
     image_pull_secrets:
       {{- toYaml . | nindent 6 }}
@@ -58,5 +87,40 @@ data:
     {{- with .Values.runners.extraEnvFrom }}
     extra_env_from:
       {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- /*
+    Forward proxy (#592): the runner Job fetches PUBLIC registry/git modules
+    directly, which is the egress the proxy is for. When a proxy is configured
+    the listener injects HTTP(S)_PROXY/NO_PROXY into the Job.
+
+    no_proxy carries the cluster-local defaults (loopback, the *.svc /
+    *.cluster.local domains, and the bare in-cluster Service names). We do NOT
+    assume the runner→API hop is always proxy-exempt: in the ARC split-cluster
+    topology the listener+runner live in a DIFFERENT cluster from the API and
+    reach it over the PUBLIC URL — that hop SHOULD traverse the proxy, and it
+    does because the public host isn't in this list. The bare Service name
+    `<release>-api` only matches (and only needs to bypass) when the API really
+    is in-cluster; in split-cluster it simply never matches. Operators who have
+    a direct path to a remote API can add its host to proxy.noProxy.
+    */}}
+    {{- if .Values.proxy.enabled }}
+    {{- $fn := include "terrapod.fullname" . }}
+    {{- $defaults := list "localhost" "127.0.0.1" ".svc" ".svc.cluster.local" ".cluster.local" (printf "%s-api" $fn) (printf "%s-web" $fn) (printf "%s-postgresql" $fn) (printf "%s-redis" $fn) }}
+    proxy:
+      http_proxy: {{ .Values.proxy.httpProxy | quote }}
+      https_proxy: {{ .Values.proxy.httpsProxy | quote }}
+      no_proxy: {{ join "," (concat $defaults (.Values.proxy.noProxy | default (list))) | quote }}
+    {{- end }}
+    {{- /*
+    Custom CA trust bundle (#592): the listener reads its OWN mounted raw CA
+    source file (path below) and ships it into a per-run Secret in the runner
+    namespace; the runner Job's init container merges it with the runner image's
+    own system roots. We deliver the raw source (not the listener's merged
+    bundle) so the runner trusts runner-system-roots + custom-CA, not the
+    listener image's roots.
+    */}}
+    {{- if eq (include "terrapod.caBundle.enabled" .) "true" }}
+    ca_bundle_enabled: true
+    ca_bundle_source_path: {{ printf "/etc/terrapod-ca-src/%s" (include "terrapod.caBundle.key" .) | quote }}
     {{- end }}
 {{- end }}

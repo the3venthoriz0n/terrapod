@@ -25,6 +25,8 @@ def _mock_run(**kwargs):
     run.job_namespace = kwargs.get("job_namespace", "terrapod-runners")
     run.plan_started_at = kwargs.get("plan_started_at", None)
     run.plan_finished_at = kwargs.get("plan_finished_at", None)
+    run.plan_state_serial = kwargs.get("plan_state_serial", None)
+    run.discard_reason = kwargs.get("discard_reason", None)
     run.apply_started_at = kwargs.get("apply_started_at", None)
     run.apply_finished_at = kwargs.get("apply_finished_at", None)
     run.auto_apply = kwargs.get("auto_apply", False)
@@ -168,6 +170,9 @@ class TestHandleSucceeded:
         self, mock_transition, mock_stage, mock_persist
     ):
         db = AsyncMock()
+        # Auto-apply respects a manual lock — return an unlocked workspace so
+        # the auto-confirm proceeds.
+        db.get.return_value = MagicMock(locked=False, plan_expiry_seconds=None)
         run = _mock_run(status="planning", auto_apply=True)
         mock_stage.return_value = None
         # First call returns planned run, second returns confirmed
@@ -180,6 +185,30 @@ class TestHandleSucceeded:
         assert mock_transition.call_count == 2
         assert mock_transition.call_args_list[0].args[2] == "planned"
         assert mock_transition.call_args_list[1].args[2] == "confirmed"
+
+    @patch(_PERSIST_PATCH, new_callable=AsyncMock)
+    @patch("terrapod.services.run_task_service.create_task_stage", new_callable=AsyncMock)
+    @patch("terrapod.services.run_service.transition_run", new_callable=AsyncMock)
+    async def test_auto_apply_blocked_by_manual_lock_stays_planned(
+        self, mock_transition, mock_stage, mock_persist
+    ):
+        """A manually locked workspace must not auto-apply: the run settles in
+        `planned` (one transition) and is NOT auto-confirmed."""
+        db = AsyncMock()
+        db.get.return_value = MagicMock(
+            locked=True, plan_expiry_seconds=None
+        )  # workspace is locked
+        db.scalar.return_value = None  # no newer run (isolate the lock behaviour)
+        run = _mock_run(status="planning", auto_apply=True)
+        mock_stage.return_value = None
+        planned_run = _mock_run(status="planned", auto_apply=True, plan_only=False)
+        mock_transition.side_effect = [planned_run]
+
+        await _handle_succeeded(db, run)
+
+        # Only the planned transition fired — no auto-confirm past the lock.
+        assert mock_transition.call_count == 1
+        assert mock_transition.call_args_list[0].args[2] == "planned"
 
     @patch(_PERSIST_PATCH, new_callable=AsyncMock)
     @patch("terrapod.services.run_task_service.create_task_stage", new_callable=AsyncMock)
@@ -206,6 +235,7 @@ class TestHandleSucceeded:
         mock_transition.side_effect = [planned_run, applied_run]
         ws = MagicMock()
         ws.locked = True
+        ws.plan_expiry_seconds = None
         db.get.return_value = ws
 
         await _handle_succeeded(db, run)
@@ -238,7 +268,7 @@ class TestHandleSucceeded:
             status="applied", auto_apply=True, plan_only=False, has_changes=False
         )
         mock_transition.side_effect = [planned_run, applied_run]
-        db.get.return_value = MagicMock(locked=False)
+        db.get.return_value = MagicMock(locked=False, plan_expiry_seconds=None)
 
         await _handle_succeeded(db, run)
 
@@ -258,6 +288,7 @@ class TestHandleSucceeded:
         mock_transition.return_value = planned_run
         ws = MagicMock()
         ws.locked = True
+        ws.plan_expiry_seconds = None
         ws.lock_id = "lock-123"
         db.get.return_value = ws
 
@@ -274,6 +305,7 @@ class TestHandleSucceeded:
         mock_transition.return_value = run
         ws = MagicMock()
         ws.locked = True
+        ws.plan_expiry_seconds = None
         db.get.return_value = ws
 
         await _handle_succeeded(db, run)
@@ -316,6 +348,7 @@ class TestHandleFailed:
         mock_transition.return_value = run
         ws = MagicMock()
         ws.locked = True
+        ws.plan_expiry_seconds = None
         db.get.return_value = ws
 
         await _handle_failed(db, run, "Job failed")
@@ -498,6 +531,113 @@ class TestCheckStale:
 
         mock_handle.assert_called_once()
         assert "stale" in mock_handle.call_args.args[2].lower()
+
+
+# ── drift-detection max-duration cap ─────────────────────────────────
+
+
+class TestDriftMaxDuration:
+    """Independent cap for drift runs.
+
+    Distinct from the generic stale_timeout (which only fires when a
+    listener stops reporting): this cap fires on a drift run that's
+    legitimately running too long for a background plan-only check.
+    The motivating incident: a github-provider state refresh ran past
+    50 min on terrapod-config and silently blocked drift on that
+    workspace; the listener was still reporting and the runner pod was
+    healthy, so neither stale_timeout nor launch_timeout caught it.
+    """
+
+    @patch("terrapod.services.run_reconciler.load_runner_config")
+    @patch("terrapod.services.run_reconciler._handle_failed", new_callable=AsyncMock)
+    async def test_drift_planning_over_cap_gets_errored(self, mock_handle, mock_config):
+        mock_config.return_value = MagicMock(
+            stale_timeout_seconds=DEFAULT_STALE_TIMEOUT_SECONDS,
+            launch_timeout_seconds=300,
+            drift_max_duration_seconds=1800,
+        )
+        db = AsyncMock()
+        # 35 min in — over the 30-min default drift cap
+        run = _mock_run(
+            status="planning",
+            is_drift_detection=True,
+            plan_started_at=datetime.now(UTC) - timedelta(minutes=35),
+        )
+
+        await _check_stale(db, run)
+
+        mock_handle.assert_called_once()
+        assert "drift" in mock_handle.call_args.args[2].lower()
+        assert "max duration" in mock_handle.call_args.args[2].lower()
+
+    @patch("terrapod.services.run_reconciler.load_runner_config")
+    @patch("terrapod.services.run_reconciler._handle_failed", new_callable=AsyncMock)
+    async def test_drift_under_cap_is_not_errored(self, mock_handle, mock_config):
+        mock_config.return_value = MagicMock(
+            stale_timeout_seconds=DEFAULT_STALE_TIMEOUT_SECONDS,
+            launch_timeout_seconds=300,
+            drift_max_duration_seconds=1800,
+        )
+        db = AsyncMock()
+        run = _mock_run(
+            status="planning",
+            is_drift_detection=True,
+            plan_started_at=datetime.now(UTC) - timedelta(minutes=10),
+        )
+
+        await _check_stale(db, run)
+
+        mock_handle.assert_not_called()
+
+    @patch("terrapod.services.run_reconciler.load_runner_config")
+    @patch("terrapod.services.run_reconciler._handle_failed", new_callable=AsyncMock)
+    async def test_drift_cap_disabled_falls_through_to_stale(self, mock_handle, mock_config):
+        """drift_max_duration_seconds=0 disables the cap.
+
+        The run can still be errored by the generic stale_timeout, but
+        not by the drift-specific cap. With a 1h stale timeout and a
+        35-min-old run, neither fires.
+        """
+        mock_config.return_value = MagicMock(
+            stale_timeout_seconds=DEFAULT_STALE_TIMEOUT_SECONDS,
+            launch_timeout_seconds=300,
+            drift_max_duration_seconds=0,
+        )
+        db = AsyncMock()
+        run = _mock_run(
+            status="planning",
+            is_drift_detection=True,
+            plan_started_at=datetime.now(UTC) - timedelta(minutes=35),
+        )
+
+        await _check_stale(db, run)
+
+        mock_handle.assert_not_called()
+
+    @patch("terrapod.services.run_reconciler.load_runner_config")
+    @patch("terrapod.services.run_reconciler._handle_failed", new_callable=AsyncMock)
+    async def test_non_drift_run_ignores_cap(self, mock_handle, mock_config):
+        """Regular (non-drift) runs MUST NOT be subject to the drift cap.
+
+        A real interactive plan/apply can legitimately exceed 30 min;
+        only the drift cohort is constrained by it.
+        """
+        mock_config.return_value = MagicMock(
+            stale_timeout_seconds=DEFAULT_STALE_TIMEOUT_SECONDS,
+            launch_timeout_seconds=300,
+            drift_max_duration_seconds=1800,
+        )
+        db = AsyncMock()
+        run = _mock_run(
+            status="planning",
+            is_drift_detection=False,
+            plan_started_at=datetime.now(UTC) - timedelta(minutes=35),
+        )
+
+        await _check_stale(db, run)
+
+        # Below the 1h stale timeout, drift cap doesn't apply → no error
+        mock_handle.assert_not_called()
 
 
 # ── launch_timeout (no job_name) cohort ──────────────────────────────

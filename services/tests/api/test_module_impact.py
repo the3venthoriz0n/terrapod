@@ -8,6 +8,7 @@ from httpx import ASGITransport, AsyncClient
 
 from terrapod.api.app import create_application as create_app
 from terrapod.api.dependencies import AuthenticatedUser, get_current_user
+from terrapod.auth.capabilities import caps_for_level
 from terrapod.db.session import get_db
 from terrapod.storage import get_storage
 
@@ -102,6 +103,8 @@ def _mock_run(
     run.plan_only = False
     run.execution_backend = "tofu"
     run.terraform_version = "1.11"
+    run.terragrunt_enabled = False
+    run.terragrunt_version = ""
     run.error_message = ""
     run.is_drift_detection = False
     run.has_changes = None
@@ -111,6 +114,8 @@ def _mock_run(
     run.created_at = datetime(2026, 1, 1, tzinfo=UTC)
     run.updated_at = datetime(2026, 1, 1, tzinfo=UTC)
     run.plan_started_at = None
+    run.plan_state_serial = None
+    run.discard_reason = None
     run.plan_finished_at = None
     run.apply_started_at = None
     run.apply_finished_at = None
@@ -156,12 +161,12 @@ class TestRunJsonModuleOverrides:
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
     @patch("terrapod.api.routers.runs.run_service.get_run")
-    @patch("terrapod.api.routers.runs.resolve_workspace_permission")
+    @patch("terrapod.api.routers.runs.resolve_workspace_capabilities_for")
     async def test_run_json_includes_module_overrides(self, mock_resolve, mock_get_run, *mocks):
         overrides = {"default/eks/aws": "module_overrides/abc123/default/eks/aws.tar.gz"}
         run = _mock_run(module_overrides=overrides, source="module-test")
         mock_get_run.return_value = run
-        mock_resolve.return_value = "read"
+        mock_resolve.return_value = caps_for_level("read")
 
         mock_db = AsyncMock()
         mock_db.get.return_value = _mock_workspace(ws_id=run.workspace_id)
@@ -265,7 +270,7 @@ class TestRetryRunCopiesOverrides:
     @patch("terrapod.api.routers.runs.run_service.queue_run")
     @patch("terrapod.api.routers.runs.run_service.create_run")
     @patch("terrapod.api.routers.runs.run_service.get_run")
-    @patch("terrapod.api.routers.runs.resolve_workspace_permission")
+    @patch("terrapod.api.routers.runs.resolve_workspace_capabilities_for")
     async def test_retry_copies_module_overrides(
         self, mock_resolve, mock_get_run, mock_create_run, mock_queue, *mocks
     ):
@@ -276,7 +281,7 @@ class TestRetryRunCopiesOverrides:
             module_overrides=overrides,
         )
         mock_get_run.return_value = original
-        mock_resolve.return_value = "plan"
+        mock_resolve.return_value = caps_for_level("plan")
 
         new_run = _mock_run()
         mock_create_run.return_value = new_run
@@ -304,12 +309,12 @@ class TestWorkspaceLinkCRUD:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.registry_modules.resolve_registry_permission")
+    @patch("terrapod.api.routers.registry_modules.resolve_registry_capabilities_for")
     @patch("terrapod.api.routers.registry_modules.get_module")
     async def test_list_workspace_links(self, mock_get_module, mock_resolve, *mocks):
         module = _mock_module()
         mock_get_module.return_value = module
-        mock_resolve.return_value = "read"
+        mock_resolve.return_value = caps_for_level("read")
 
         link = _mock_link(module_id=module.id)
 
@@ -333,14 +338,14 @@ class TestWorkspaceLinkCRUD:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.registry_modules.resolve_registry_permission")
+    @patch("terrapod.api.routers.registry_modules.resolve_registry_capabilities_for")
     @patch("terrapod.api.routers.registry_modules.get_module")
     async def test_create_workspace_link_requires_admin(
         self, mock_get_module, mock_resolve, *mocks
     ):
         module = _mock_module()
         mock_get_module.return_value = module
-        mock_resolve.return_value = "write"  # Not admin
+        mock_resolve.return_value = caps_for_level("write")  # Not admin
 
         app, _ = _make_app(_admin_user())
         async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as client:

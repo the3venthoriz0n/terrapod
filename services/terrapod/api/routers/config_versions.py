@@ -29,12 +29,16 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from terrapod.api.dependencies import AuthenticatedUser, get_current_user
+from terrapod.auth import capabilities as cap
 from terrapod.auth import download_tickets
+from terrapod.auth.capabilities import has_capability
 from terrapod.db.models import ConfigurationVersion, Run, Workspace
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
 from terrapod.services import cv_diff_service, run_service
-from terrapod.services.workspace_rbac_service import has_permission, resolve_workspace_permission
+from terrapod.services.workspace_rbac_service import (
+    resolve_workspace_capabilities_for,
+)
 from terrapod.storage import get_storage
 from terrapod.storage.keys import config_version_key
 from terrapod.storage.protocol import ObjectNotFoundError
@@ -110,8 +114,21 @@ async def create_configuration_version(
 ) -> JSONResponse:
     """Create a configuration version. Requires write on workspace."""
     ws = await _get_workspace(workspace_id, db)
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
-    if not has_permission(perm, "write"):
+    # Config-managed guardrail (#535): catalog-managed workspaces run a
+    # server-generated wrapper config. Direct CV uploads would diverge the
+    # workspace from its catalog item — reject. Re-provisioning goes through
+    # the catalog surface, which generates the CV internally.
+    if ws.catalog_item_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This workspace is managed by the service catalog; its configuration "
+                "is generated automatically. Manage it through the catalog, not by "
+                "uploading configuration versions."
+            ),
+        )
+    caps = await resolve_workspace_capabilities_for(db, user, ws)
+    if not has_capability(caps, cap.CONFIG_UPLOAD):
         raise HTTPException(status_code=403, detail="Requires write permission on workspace")
 
     attrs = body.get("data", {}).get("attributes", {})
@@ -157,8 +174,8 @@ async def list_configuration_versions(
     RBAC: requires `read` on the workspace.
     """
     ws = await _get_workspace(workspace_id, db)
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
-    if not has_permission(perm, "read"):
+    caps = await resolve_workspace_capabilities_for(db, user, ws)
+    if not has_capability(caps, cap.CONFIG_READ):
         raise HTTPException(status_code=404, detail="Workspace not found")
 
     total = await db.scalar(
@@ -237,8 +254,8 @@ async def download_configuration_version(
     if ws is None:
         # Workspace deleted out from under us — treat as gone.
         raise HTTPException(status_code=404, detail="Configuration version not found")
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
-    if not has_permission(perm, "read"):
+    caps = await resolve_workspace_capabilities_for(db, user, ws)
+    if not has_capability(caps, cap.CONFIG_READ):
         raise HTTPException(status_code=404, detail="Configuration version not found")
 
     storage = get_storage()
@@ -294,8 +311,8 @@ async def mint_download_ticket(
     ws = await db.get(Workspace, cv.workspace_id)
     if ws is None:
         raise HTTPException(status_code=404, detail="Configuration version not found")
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
-    if not has_permission(perm, "read"):
+    caps = await resolve_workspace_capabilities_for(db, user, ws)
+    if not has_capability(caps, cap.CONFIG_READ):
         raise HTTPException(status_code=404, detail="Configuration version not found")
 
     attrs = (body or {}).get("data", {}).get("attributes", {}) if body else {}
@@ -440,8 +457,8 @@ async def diff_configuration_versions(
     ws = await db.get(Workspace, from_cv.workspace_id)
     if ws is None:
         raise HTTPException(status_code=404, detail="Configuration version not found")
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
-    if not has_permission(perm, "read"):
+    caps = await resolve_workspace_capabilities_for(db, user, ws)
+    if not has_capability(caps, cap.CONFIG_READ):
         raise HTTPException(status_code=404, detail="Configuration version not found")
 
     if from_cv.status != "uploaded" or to_cv.status != "uploaded":
@@ -499,14 +516,17 @@ async def upload_configuration(
     if cv.status == "uploaded":
         raise HTTPException(status_code=409, detail="Configuration already uploaded")
 
-    data = await request.body()
-    if not data:
-        raise HTTPException(status_code=422, detail="Upload data is required")
-
-    # Store tarball
+    # Stream the tarball straight to storage — never buffer the whole thing in
+    # the API's RAM. A monorepo configuration tarball can be hundreds of MB;
+    # `await request.body()` here loads it all into one allocation and OOM-kills
+    # the API pod (rule 14). storage.put_stream consumes the request body in
+    # chunks and writes them straight through to the backend.
     storage = get_storage()
     key = config_version_key(str(cv.workspace_id), str(cv.id))
-    await storage.put(key, data, content_type="application/x-tar")
+    meta = await storage.put_stream(key, request.stream(), content_type="application/x-tar")
+    if meta.size_bytes == 0:
+        await storage.delete(key)
+        raise HTTPException(status_code=422, detail="Upload data is required")
 
     # Mark as uploaded
     cv = await run_service.mark_configuration_uploaded(db, cv)
@@ -529,7 +549,7 @@ async def upload_configuration(
     logger.info(
         "Configuration uploaded",
         cv_id=str(cv.id),
-        size=len(data),
+        size=meta.size_bytes,
     )
 
     return Response(status_code=200)

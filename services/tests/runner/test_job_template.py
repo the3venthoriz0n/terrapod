@@ -22,10 +22,18 @@ def _runner_config():
     cfg.topology_spread_constraints = []
     cfg.pod_security_context = {}
     cfg.pod_annotations = {}
+    # Proxy + CA off by default (#592) — explicit None/False so the truthy
+    # MagicMock defaults don't inject phantom proxy env into every test.
+    cfg.proxy = None
+    cfg.ca_bundle_enabled = False
+    # Listener/runner settings the job template reads off RunnerConfig (#617),
+    # not os.environ. Real string defaults so `or`/`.strip()` behave.
+    cfg.server_url = "http://terrapod-api:8000"
+    cfg.public_api_url = ""
+    cfg.runner_namespace = "terrapod-runners"
 
     default_def = MagicMock()
     default_def.name = "default"
-    default_def.setup_script = ""
     cfg.definitions = [default_def]
 
     return cfg
@@ -104,6 +112,61 @@ class TestVarFilesInjection:
         container = spec["spec"]["template"]["spec"]["containers"][0]
         env_names = {e["name"] for e in container["env"]}
         assert "TP_VAR_FILES" not in env_names
+
+
+class TestExecutionHooksMount:
+    """Execution hooks (#619) mount as an extra item in the per-run vars Secret."""
+
+    def _spec(self, *, execution_hooks, terraform_vars, vars_secret_name):
+        from terrapod.runner.job_template import build_job_spec
+
+        return build_job_spec(
+            run_id="abc123",
+            phase="plan",
+            runner_config=_runner_config(),
+            auth_secret_name="tprun-abc12345-auth",
+            env_vars=[],
+            terraform_vars=terraform_vars,
+            execution_hooks=execution_hooks,
+            vars_secret_name=vars_secret_name,
+        )
+
+    def _tfvars_volume(self, spec):
+        vols = spec["spec"]["template"]["spec"]["volumes"]
+        return next((v for v in vols if v["name"] == "tfvars"), None)
+
+    def test_hooks_added_as_secret_item(self):
+        spec = self._spec(
+            execution_hooks=[{"hook_point": "pre_init", "name": "a", "script": "true"}],
+            terraform_vars=[],
+            vars_secret_name="tprun-abc12345-plan-vars",
+        )
+        vol = self._tfvars_volume(spec)
+        assert vol is not None
+        keys = {i["key"] for i in vol["secret"]["items"]}
+        assert "execution-hooks.json" in keys
+        # No terraform vars → only the hooks item.
+        assert "terraform.tfvars.json" not in keys
+        mounts = spec["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
+        assert any(m["mountPath"] == "/var/run/terrapod/vars" for m in mounts)
+
+    def test_hooks_and_tfvars_both_mounted(self):
+        spec = self._spec(
+            execution_hooks=[{"hook_point": "pre_plan", "name": "a", "script": "true"}],
+            terraform_vars=[{"key": "region", "value": "eu", "hcl": False}],
+            vars_secret_name="tprun-abc12345-plan-vars",
+        )
+        vol = self._tfvars_volume(spec)
+        keys = {i["key"] for i in vol["secret"]["items"]}
+        assert keys == {"terraform.tfvars.json", "execution-hooks.json"}
+
+    def test_no_volume_when_no_hooks_no_vars(self):
+        spec = self._spec(
+            execution_hooks=[],
+            terraform_vars=[],
+            vars_secret_name="",
+        )
+        assert self._tfvars_volume(spec) is None
 
 
 class TestPodFailurePolicy:
@@ -222,15 +285,14 @@ class TestPublicApiUrl:
     def _build(self, monkeypatch, api_url, public_api_url):
         from terrapod.runner.job_template import build_job_spec
 
-        monkeypatch.setenv("TERRAPOD_API_URL", api_url)
-        if public_api_url is None:
-            monkeypatch.delenv("TERRAPOD_PUBLIC_API_URL", raising=False)
-        else:
-            monkeypatch.setenv("TERRAPOD_PUBLIC_API_URL", public_api_url)
+        # server_url / public_api_url come off RunnerConfig (#617), not env.
+        cfg = _runner_config()
+        cfg.server_url = api_url
+        cfg.public_api_url = "" if public_api_url is None else public_api_url
         spec = build_job_spec(
             run_id="abc123",
             phase="plan",
-            runner_config=_runner_config(),
+            runner_config=cfg,
             auth_secret_name="tprun-abc12345-auth",
             env_vars=[],
             terraform_vars=[],
@@ -289,3 +351,179 @@ class TestPublicApiUrl:
         )
         env_names = {e["name"] for e in env}
         assert "TP_PUBLIC_API_URL" not in env_names
+
+
+class TestVarsSecretDelivery:
+    """Workspace variable values are delivered via the per-run vars Secret —
+    terraform vars as a mounted tfvars file, env vars via secretKeyRef — so
+    NOTHING is plaintext in the Job spec (the security contract)."""
+
+    def _spec(self, **kw):
+        from terrapod.runner.job_template import build_job_spec
+
+        return build_job_spec(
+            run_id="abc123def456",
+            phase="plan",
+            runner_config=_runner_config(),
+            auth_secret_name="tprun-abc123def456-plan-auth",
+            **kw,
+        )
+
+    def test_terraform_var_mounts_tfvars_volume_no_plaintext(self):
+        spec = self._spec(
+            env_vars=[],
+            terraform_vars=[{"key": "secret", "value": "s3cr3t", "hcl": False}],
+            vars_secret_name="tprun-abc123def456-plan-vars",
+        )
+        pod = spec["spec"]["template"]["spec"]
+        # Volume + mount present, referencing the vars Secret's tfvars key.
+        vol = next(v for v in pod["volumes"] if v["name"] == "tfvars")
+        assert vol["secret"]["secretName"] == "tprun-abc123def456-plan-vars"
+        assert vol["secret"]["items"][0]["key"] == "terraform.tfvars.json"
+        mount = next(m for m in pod["containers"][0]["volumeMounts"] if m["name"] == "tfvars")
+        assert mount["readOnly"] is True
+        # The secret value never appears as a plaintext env value, and no
+        # TF_VAR_ env is emitted.
+        env = pod["containers"][0]["env"]
+        assert not any(e["name"].startswith("TF_VAR_") for e in env)
+        assert not any(e.get("value") == "s3cr3t" for e in env)
+
+    def test_env_var_via_secret_key_ref_not_plaintext(self):
+        spec = self._spec(
+            env_vars=[{"key": "AWS_SECRET_ACCESS_KEY", "value": "AKIAsecret"}],
+            terraform_vars=[],
+            vars_secret_name="tprun-abc123def456-plan-vars",
+        )
+        env = spec["spec"]["template"]["spec"]["containers"][0]["env"]
+        aws = next(e for e in env if e["name"] == "AWS_SECRET_ACCESS_KEY")
+        # secretKeyRef into the vars Secret, NOT a plaintext value.
+        assert "value" not in aws
+        assert aws["valueFrom"]["secretKeyRef"]["name"] == "tprun-abc123def456-plan-vars"
+        assert aws["valueFrom"]["secretKeyRef"]["key"] == "AWS_SECRET_ACCESS_KEY"
+        # The plaintext value appears nowhere in the spec.
+        assert "AKIAsecret" not in str(spec)
+
+    def test_no_volume_when_no_terraform_vars(self):
+        spec = self._spec(
+            env_vars=[{"key": "FOO", "value": "bar"}],
+            terraform_vars=[],
+            vars_secret_name="tprun-abc123def456-plan-vars",
+        )
+        pod = spec["spec"]["template"]["spec"]
+        assert not any(v["name"] == "tfvars" for v in pod["volumes"])
+
+
+class TestProxyInjection:
+    """#592 — forward-proxy env injected into runner Jobs."""
+
+    def _spec(self, proxy):
+        from terrapod.runner.job_template import build_job_spec
+
+        cfg = _runner_config()
+        cfg.proxy = proxy
+        return build_job_spec(
+            run_id="abc123def456",
+            phase="plan",
+            runner_config=cfg,
+            auth_secret_name="tprun-abc123def456-plan-auth",
+            env_vars=[],
+            terraform_vars=[],
+        )
+
+    def test_proxy_env_upper_and_lower(self):
+        proxy = MagicMock()
+        proxy.http_proxy = "http://proxy:3128"
+        proxy.https_proxy = "http://proxy:3128"
+        proxy.no_proxy = "localhost,terrapod-api"
+        spec = self._spec(proxy)
+        env = {
+            e["name"]: e.get("value")
+            for e in spec["spec"]["template"]["spec"]["containers"][0]["env"]
+        }
+        # Both upper (Go/terraform) and lower (libs) forms.
+        for name in (
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ):
+            assert name in env, name
+        assert env["HTTP_PROXY"] == "http://proxy:3128"
+        assert env["no_proxy"] == "localhost,terrapod-api"
+
+    def test_no_proxy_env_when_disabled(self):
+        spec = self._spec(None)
+        env_names = {e["name"] for e in spec["spec"]["template"]["spec"]["containers"][0]["env"]}
+        assert "HTTP_PROXY" not in env_names
+        assert "http_proxy" not in env_names
+
+    def test_blank_proxy_values_skipped(self):
+        proxy = MagicMock()
+        proxy.http_proxy = ""
+        proxy.https_proxy = "http://proxy:3128"
+        proxy.no_proxy = ""
+        spec = self._spec(proxy)
+        env_names = {e["name"] for e in spec["spec"]["template"]["spec"]["containers"][0]["env"]}
+        assert "HTTP_PROXY" not in env_names  # empty → skipped
+        assert "HTTPS_PROXY" in env_names
+        assert "NO_PROXY" not in env_names
+
+
+class TestCABundleInjection:
+    """#592 — custom CA trust bundle delivered to runner Jobs."""
+
+    def _spec(self, ca_secret_name, ca_enabled=True):
+        from terrapod.runner.job_template import build_job_spec
+
+        cfg = _runner_config()
+        cfg.ca_bundle_enabled = ca_enabled
+        return build_job_spec(
+            run_id="abc123def456",
+            phase="plan",
+            runner_config=cfg,
+            auth_secret_name="tprun-abc123def456-plan-auth",
+            env_vars=[],
+            terraform_vars=[],
+            ca_secret_name=ca_secret_name,
+        )
+
+    def test_ca_env_volumes_and_init_container(self):
+        spec = self._spec("tprun-abc123def456-plan-ca")
+        pod = spec["spec"]["template"]["spec"]
+        container = pod["containers"][0]
+        env = {e["name"]: e.get("value") for e in container["env"]}
+        # TLS env all point at the merged bundle.
+        for name in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO"):
+            assert env[name] == "/etc/terrapod-ca/ca-bundle.crt"
+        # Source Secret + merged emptyDir volumes present.
+        vols = {v["name"]: v for v in pod["volumes"]}
+        assert vols["ca-src"]["secret"]["secretName"] == "tprun-abc123def456-plan-ca"
+        assert "emptyDir" in vols["ca-merged"]
+        # Runner mounts the MERGED bundle read-only.
+        mounts = {m["name"]: m for m in container["volumeMounts"]}
+        assert mounts["ca-merged"]["mountPath"] == "/etc/terrapod-ca"
+        assert mounts["ca-merged"]["readOnly"] is True
+        # Init container merges system roots + custom CA into the writable emptyDir.
+        init = next(c for c in pod["initContainers"] if c["name"] == "ca-merge")
+        assert "/etc/ssl/certs/ca-certificates.crt" in init["command"][2]
+        assert init["command"][2].endswith("> /etc/terrapod-ca/ca-bundle.crt")
+        assert init["securityContext"]["readOnlyRootFilesystem"] is True
+        assert init["securityContext"]["runAsNonRoot"] is True
+
+    def test_no_ca_when_secret_unset(self):
+        spec = self._spec("")  # listener provided no CA (none configured)
+        pod = spec["spec"]["template"]["spec"]
+        env_names = {e["name"] for e in pod["containers"][0]["env"]}
+        assert "SSL_CERT_FILE" not in env_names
+        assert not any(v["name"] == "ca-src" for v in pod["volumes"])
+        assert "initContainers" not in pod or not any(
+            c["name"] == "ca-merge" for c in pod.get("initContainers", [])
+        )
+
+    def test_no_ca_when_bundle_disabled(self):
+        # ca_secret_name set but bundle disabled in config → still skipped.
+        spec = self._spec("tprun-abc-ca", ca_enabled=False)
+        pod = spec["spec"]["template"]["spec"]
+        assert not any(v["name"] == "ca-src" for v in pod["volumes"])

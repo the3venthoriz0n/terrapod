@@ -22,10 +22,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from terrapod.api.dependencies import AuthenticatedUser, get_current_user
+from terrapod.auth import capabilities as cap
+from terrapod.auth.capabilities import has_capability
 from terrapod.db.models import RunTrigger, Workspace
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
-from terrapod.services.workspace_rbac_service import has_permission, resolve_workspace_permission
+from terrapod.services.workspace_rbac_service import (
+    resolve_workspace_capabilities_for,
+)
 
 router = APIRouter(tags=["run-triggers"])
 logger = get_logger(__name__)
@@ -76,14 +80,14 @@ async def _get_workspace(workspace_id: str, db: AsyncSession) -> Workspace:
     return ws
 
 
-async def _require_ws_permission(
+async def _require_ws_capability(
     ws: Workspace, required: str, user: AuthenticatedUser, db: AsyncSession
 ) -> None:
-    perm = await resolve_workspace_permission(db, user.email, user.roles, ws)
-    if not has_permission(perm, required):
+    caps = await resolve_workspace_capabilities_for(db, user, ws)
+    if not has_capability(caps, required):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Requires {required} permission on workspace",
+            detail=f"Requires {required} capability on workspace",
         )
 
 
@@ -96,7 +100,7 @@ async def create_run_trigger(
 ) -> JSONResponse:
     """Create a run trigger. Requires admin on the destination workspace."""
     ws = await _get_workspace(workspace_id, db)
-    await _require_ws_permission(ws, "admin", user, db)
+    await _require_ws_capability(ws, cap.RUN_TRIGGER_MANAGE, user, db)
 
     # Extract source workspace from relationships
     relationships = body.get("data", {}).get("relationships", {})
@@ -144,6 +148,14 @@ async def create_run_trigger(
 
     await db.commit()
 
+    # Live-update both endpoints' Run Triggers tabs: the destination gets a new
+    # outbound edge, the source a new inbound edge. The inbound edge in
+    # particular would otherwise never appear without a manual refresh.
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(str(ws.id), "run_trigger_change")
+    await publish_workspace_event(str(source_ws.id), "run_trigger_change")
+
     logger.info(
         "Run trigger created",
         trigger_id=str(trigger.id),
@@ -163,7 +175,7 @@ async def list_run_triggers(
 ) -> JSONResponse:
     """List run triggers for a workspace (inbound or outbound). Requires read."""
     ws = await _get_workspace(workspace_id, db)
-    await _require_ws_permission(ws, "read", user, db)
+    await _require_ws_capability(ws, cap.RUN_TRIGGER_READ, user, db)
 
     if filter_type not in ("inbound", "outbound"):
         raise HTTPException(
@@ -210,7 +222,7 @@ async def show_run_trigger(
         raise HTTPException(status_code=404, detail="Run trigger not found")
 
     ws = trigger.workspace
-    await _require_ws_permission(ws, "read", user, db)
+    await _require_ws_capability(ws, cap.RUN_TRIGGER_READ, user, db)
 
     return JSONResponse(content={"data": _trigger_json(trigger)})
 
@@ -233,9 +245,19 @@ async def delete_run_trigger(
         raise HTTPException(status_code=404, detail="Run trigger not found")
 
     ws = trigger.workspace
-    await _require_ws_permission(ws, "admin", user, db)
+    await _require_ws_capability(ws, cap.RUN_TRIGGER_MANAGE, user, db)
+
+    # Capture both endpoint ids before the row is gone.
+    dest_id = str(trigger.workspace_id)
+    source_id = str(trigger.source_workspace_id)
+    trigger_id = str(trigger.id)
 
     await db.delete(trigger)
     await db.commit()
 
-    logger.info("Run trigger deleted", trigger_id=str(trigger.id))
+    from terrapod.redis.client import publish_workspace_event
+
+    await publish_workspace_event(dest_id, "run_trigger_change")
+    await publish_workspace_event(source_id, "run_trigger_change")
+
+    logger.info("Run trigger deleted", trigger_id=trigger_id)

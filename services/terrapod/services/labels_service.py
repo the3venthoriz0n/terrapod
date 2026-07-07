@@ -22,12 +22,12 @@ for mass-mutating workspaces / pools / modules / providers.
 
 RBAC
 ----
-Each entity type has its own permission resolver
-(`resolve_workspace_permission`, `resolve_pool_permission`,
-`resolve_registry_permission`). We only surface labels on entities
-the caller has at least `read` on. The four resolvers each support
-`preloaded_roles=` to avoid an N+1 DB hit when iterating over many
-entities; we pre-load roles once per entity type.
+Each entity type has its own capability resolver
+(`resolve_workspace_capabilities_for`, `resolve_pool_capabilities_for`,
+`resolve_registry_capabilities_for`). We only surface labels on entities
+the caller holds the axis read capability on (`has_capability(caps, *_READ)`).
+The resolvers each support `preloaded_roles=` to avoid an N+1 DB hit when
+iterating over many entities; we pre-load roles once per entity type.
 """
 
 from __future__ import annotations
@@ -62,16 +62,17 @@ async def _readable_workspaces(db: AsyncSession, user: AuthenticatedUser) -> lis
     result = await db.execute(select(Workspace).order_by(Workspace.name))
     workspaces = list(result.scalars().all())
     preloaded = await workspace_rbac_service.fetch_custom_roles(db, user.roles)
+    token_preloaded = await workspace_rbac_service.fetch_custom_roles(db, user.pinned_roles or [])
     out: list[Workspace] = []
     for ws in workspaces:
-        perm = await workspace_rbac_service.resolve_workspace_permission(
+        caps = await workspace_rbac_service.resolve_workspace_capabilities_for(
             db,
-            user_email=user.email,
-            user_roles=user.roles,
-            workspace=ws,
+            user,
+            ws,
             preloaded_roles=preloaded,
+            token_preloaded_roles=token_preloaded,
         )
-        if perm is not None:
+        if caps:
             out.append(ws)
     return out
 
@@ -80,18 +81,19 @@ async def _readable_pools(db: AsyncSession, user: AuthenticatedUser) -> list[Age
     result = await db.execute(select(AgentPool).order_by(AgentPool.name))
     pools = list(result.scalars().all())
     preloaded = await pool_rbac_service.fetch_custom_roles(db, user.roles)
+    token_preloaded = await pool_rbac_service.fetch_custom_roles(db, user.pinned_roles or [])
     out: list[AgentPool] = []
     for p in pools:
-        perm = await pool_rbac_service.resolve_pool_permission(
+        caps = await pool_rbac_service.resolve_pool_capabilities_for(
             db,
-            user_email=user.email,
-            user_roles=user.roles,
+            user,
             pool_name=p.name,
             pool_labels=p.labels or {},
             owner_email=p.owner_email or "",
             preloaded_roles=preloaded,
+            token_preloaded_roles=token_preloaded,
         )
-        if perm is not None:
+        if caps:
             out.append(p)
     return out
 
@@ -100,18 +102,19 @@ async def _readable_modules(db: AsyncSession, user: AuthenticatedUser) -> list[R
     result = await db.execute(select(RegistryModule).order_by(RegistryModule.name))
     modules = list(result.scalars().all())
     preloaded = await registry_rbac_service.fetch_custom_roles(db, user.roles)
+    token_preloaded = await registry_rbac_service.fetch_custom_roles(db, user.pinned_roles or [])
     out: list[RegistryModule] = []
     for m in modules:
-        perm = await registry_rbac_service.resolve_registry_permission(
+        caps = await registry_rbac_service.resolve_registry_capabilities_for(
             db,
-            user_email=user.email,
-            user_roles=user.roles,
+            user,
             resource_name=m.name,
             resource_labels=m.labels or {},
             owner_email=m.owner_email or "",
             preloaded_roles=preloaded,
+            token_preloaded_roles=token_preloaded,
         )
-        if perm is not None:
+        if caps:
             out.append(m)
     return out
 
@@ -120,18 +123,19 @@ async def _readable_providers(db: AsyncSession, user: AuthenticatedUser) -> list
     result = await db.execute(select(RegistryProvider).order_by(RegistryProvider.name))
     providers = list(result.scalars().all())
     preloaded = await registry_rbac_service.fetch_custom_roles(db, user.roles)
+    token_preloaded = await registry_rbac_service.fetch_custom_roles(db, user.pinned_roles or [])
     out: list[RegistryProvider] = []
     for p in providers:
-        perm = await registry_rbac_service.resolve_registry_permission(
+        caps = await registry_rbac_service.resolve_registry_capabilities_for(
             db,
-            user_email=user.email,
-            user_roles=user.roles,
+            user,
             resource_name=p.name,
             resource_labels=p.labels or {},
             owner_email=p.owner_email or "",
             preloaded_roles=preloaded,
+            token_preloaded_roles=token_preloaded,
         )
-        if perm is not None:
+        if caps:
             out.append(p)
     return out
 

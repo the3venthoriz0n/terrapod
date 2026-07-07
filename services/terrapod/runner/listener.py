@@ -32,6 +32,7 @@ import time
 import httpx
 
 from terrapod.config import load_runner_config
+from terrapod.http_retry import arequest_with_retry
 from terrapod.logging_config import configure_logging, get_logger
 
 logger = get_logger(__name__)
@@ -39,18 +40,15 @@ logger = get_logger(__name__)
 # Shutdown flag
 _shutdown = asyncio.Event()
 
-# SSE read watchdog: API sends a keepalive comment every 1s, so any stretch
-# of silence longer than this means the stream has gone silent even though
-# the TCP socket is still open (e.g. API-side Redis pubsub detached, proxy
-# buffering). 30s is generous enough to absorb network jitter without
-# accidentally killing healthy streams.
-_SSE_READ_TIMEOUT = int(os.environ.get("TERRAPOD_SSE_READ_TIMEOUT", "30"))
-
-# Mandatory periodic reconnect — even a healthy connection is torn down
-# and rebuilt at this interval to guarantee no stale subscription state
-# survives forever. 10 minutes balances "cheap to reconnect" against
-# "don't churn unnecessarily."
-_SSE_MAX_AGE = int(os.environ.get("TERRAPOD_SSE_MAX_AGE", "600"))
+# SSE tuning lives on RunnerConfig (sse_read_timeout / sse_max_age), layered
+# from runners.yaml + env. The listener reads them via self._sse_read_timeout /
+# self._sse_max_age (set in __init__) rather than module-level env constants.
+#
+# - read watchdog (sse_read_timeout): the API sends a keepalive comment every
+#   1s, so silence longer than this means the stream has gone quiet even though
+#   the TCP socket is open (API-side Redis pubsub detached, proxy buffering).
+# - mandatory reconnect (sse_max_age): even a healthy connection is rebuilt at
+#   this interval so no stale subscription state survives forever.
 
 
 class RunnerListener:
@@ -58,12 +56,18 @@ class RunnerListener:
 
     def __init__(self):
         self.identity = None
+        # Single layered config object (defaults → runners.yaml → env) — the
+        # listener reads ALL its non-sensitive settings from here, never from
+        # os.environ. Only secrets (join token) + runtime values (POD_NAME)
+        # remain as Deployment env (read at their point of use).
         self.runner_config = load_runner_config()
-        self._heartbeat_interval = int(os.environ.get("TERRAPOD_HEARTBEAT_INTERVAL", "60"))
-        self._max_concurrent = int(os.environ.get("TERRAPOD_MAX_CONCURRENT", "3"))
-        self._health_port = int(os.environ.get("TERRAPOD_HEALTH_PORT", "8081"))
-        self._sse_retry_interval = int(os.environ.get("TERRAPOD_SSE_RETRY_INTERVAL", "5"))
-        self._poll_interval = int(os.environ.get("TERRAPOD_POLL_INTERVAL", "30"))
+        self._heartbeat_interval = self.runner_config.heartbeat_interval
+        self._max_concurrent = self.runner_config.max_concurrent
+        self._health_port = self.runner_config.health_port
+        self._sse_retry_interval = self.runner_config.sse_retry_interval
+        self._poll_interval = self.runner_config.poll_interval
+        self._sse_read_timeout = self.runner_config.sse_read_timeout
+        self._sse_max_age = self.runner_config.sse_max_age
         self._identity_ready = False
         self._last_heartbeat_at: float | None = None
         self._active_launches = 0  # count of concurrent launch operations
@@ -119,7 +123,7 @@ class RunnerListener:
         """Establish or re-establish listener identity."""
         from terrapod.runner.identity import establish_identity
 
-        self.identity = await establish_identity()
+        self.identity = await establish_identity(self.runner_config)
         self._identity_ready = True
         # Drop any cached headers so the next call re-encodes against the new cert.
         self._cached_auth_headers_for_cert = None
@@ -181,9 +185,11 @@ class RunnerListener:
             renew_loop,
         )
 
-        cert_validity_seconds = int(os.environ.get("TERRAPOD_LISTENER_CERT_TTL_SECONDS", "3600"))
-        secret_name = _credentials_secret_name(self.identity.name)
-        namespace = _read_in_pod_namespace()
+        cert_validity_seconds = self.runner_config.listener_cert_ttl_seconds
+        secret_name = _credentials_secret_name(
+            self.identity.name, self.runner_config.credentials_secret_name
+        )
+        namespace = _read_in_pod_namespace(self.runner_config.listener_namespace)
 
         await renew_loop(
             self,
@@ -217,7 +223,7 @@ class RunnerListener:
             listener_id=str(self.identity.listener_id) if self.identity else "<unknown>",
             name=self.identity.name if self.identity else "<unknown>",
         )
-        clear_credentials_secret()
+        clear_credentials_secret(self.runner_config)
         await self._establish_identity()
 
         # Recreate HTTP clients with the new identity base URL
@@ -365,8 +371,11 @@ class RunnerListener:
         name — but is not guaranteed by every CRI, so non-Helm operators
         running this listener should set POD_NAME explicitly.
         """
-        await self._http_client.post(
+        await arequest_with_retry(
+            self._http_client,
+            "POST",
             f"/api/terrapod/v1/listeners/listener-{self.identity.listener_id}/heartbeat",
+            idempotent=True,  # idempotent presence upsert — safe to retry on timeout/5xx
             json={
                 "capacity": self._max_concurrent,
                 "active_runs": self._active_launches,
@@ -476,17 +485,21 @@ class RunnerListener:
                 # Mandatory periodic reconnect — return cleanly so the outer
                 # loop reopens a fresh connection (and a fresh Redis pubsub
                 # subscription on the API side).
-                if time.monotonic() - connected_at > _SSE_MAX_AGE:
-                    logger.info("SSE max-age reached, reconnecting", age=_SSE_MAX_AGE)
+                if time.monotonic() - connected_at > self._sse_max_age:
+                    logger.info("SSE max-age reached, reconnecting", age=self._sse_max_age)
                     return
 
                 try:
-                    line = await asyncio.wait_for(line_iter.__anext__(), timeout=_SSE_READ_TIMEOUT)
+                    line = await asyncio.wait_for(
+                        line_iter.__anext__(), timeout=self._sse_read_timeout
+                    )
                 except StopAsyncIteration:
                     return  # Stream closed by server — outer loop reconnects
                 except TimeoutError:
                     # Silent stall — kill the connection, outer loop reconnects.
-                    logger.warning("SSE read timeout — stream stalled", timeout=_SSE_READ_TIMEOUT)
+                    logger.warning(
+                        "SSE read timeout — stream stalled", timeout=self._sse_read_timeout
+                    )
                     return
 
                 if line.startswith("event:"):
@@ -572,7 +585,9 @@ class RunnerListener:
         if self._active_launches >= self._max_concurrent:
             return
 
-        response = await self._http_client.get(
+        response = await arequest_with_retry(
+            self._http_client,
+            "GET",
             f"/api/terrapod/v1/listeners/listener-{self.identity.listener_id}/runs/next",
             headers=self._auth_headers(),
         )
@@ -616,8 +631,24 @@ class RunnerListener:
 
         env_vars = [{"key": v["key"], "value": v["value"]} for v in attrs.get("env-vars", [])]
         terraform_vars = [
-            {"key": v["key"], "value": v["value"]} for v in attrs.get("terraform-vars", [])
+            {"key": v["key"], "value": v["value"], "hcl": bool(v.get("hcl"))}
+            for v in attrs.get("terraform-vars", [])
         ]
+        # Execution hooks (#619). The kill-switch (runners.hooks.enabled) is
+        # enforced HERE at the Job-build boundary: when disabled, drop all hooks
+        # so no hooks file is written and the runner has nothing to run.
+        execution_hooks = (
+            [
+                {
+                    "hook_point": h.get("hook_point", ""),
+                    "name": h.get("name", ""),
+                    "script": h.get("script", ""),
+                }
+                for h in attrs.get("execution-hooks", [])
+            ]
+            if self.runner_config.hooks_enabled
+            else []
+        )
 
         run_short = run_id[:16]
         # Phase is part of the Secret name to avoid a 409 AlreadyExists when
@@ -627,18 +658,38 @@ class RunnerListener:
         # own. Per-phase names mean plan and apply have independent Secrets
         # that GC at their own pace and never collide.
         auth_secret_name = f"tprun-{run_short}-{phase}-auth"
+        # Per-run vars Secret holds ALL workspace variable values (terraform +
+        # env, sensitive and non — handled uniformly). The Job mounts the
+        # terraform vars as a tfvars file and sources env vars via secretKeyRef,
+        # so no variable value is ever plaintext in the Job spec. Per-phase name
+        # mirrors the auth Secret; ownerReference GCs it with the Job.
+        vars_secret_name = (
+            f"tprun-{run_short}-{phase}-vars"
+            if (env_vars or terraform_vars or execution_hooks)
+            else ""
+        )
+        # Per-run CA Secret (#592): ships the custom outbound CA into the runner
+        # namespace so the Job's init container can merge it with the runner
+        # image's system roots. Only when a CA bundle is configured AND the
+        # listener can actually read its own mounted copy.
+        ca_pem = self._read_ca_bundle_pem()
+        ca_secret_name = f"tprun-{run_short}-{phase}-ca" if ca_pem else ""
 
         spec = build_job_spec(
             run_id=run_id,
             phase=phase,
             runner_config=self.runner_config,
             auth_secret_name=auth_secret_name,
+            vars_secret_name=vars_secret_name,
             env_vars=env_vars,
             terraform_vars=terraform_vars,
+            execution_hooks=execution_hooks,
             resource_cpu=attrs.get("resource-cpu", "1"),
             resource_memory=attrs.get("resource-memory", "2Gi"),
             terraform_version=attrs.get("terraform-version", ""),
             execution_backend=attrs.get("execution-backend", "tofu"),
+            terragrunt_enabled=attrs.get("terragrunt-enabled", False),
+            terragrunt_version=attrs.get("terragrunt-version", ""),
             plan_only=attrs.get("plan-only", False),
             var_files=attrs.get("var-files", []),
             target_addrs=attrs.get("target-addrs"),
@@ -648,20 +699,23 @@ class RunnerListener:
             allow_empty_apply=attrs.get("allow-empty-apply", False),
             is_destroy=attrs.get("is-destroy", False),
             working_directory=attrs.get("working-directory", ""),
+            ca_secret_name=ca_secret_name,
         )
 
-        namespace = os.environ.get("TERRAPOD_RUNNER_NAMESPACE", "terrapod-runners")
+        namespace = self.runner_config.runner_namespace
 
         try:
-            job_name = await create_job(spec)
+            job_name = await create_job(spec, namespace=namespace)
         except Exception as e:
             logger.error("Failed to create Job", run_id=run_id, error=str(e))
             await self._report_launch_failed(run_id, f"Failed to create K8s Job: {e}")
             return
 
-        # Create auth Secret with ownerReference to the Job
+        # Create auth Secret with ownerReference to the Job. Pass the namespace
+        # explicitly (from runner_config) — never rely on job_manager's fallback,
+        # which is decoupled from the configured runner namespace.
         try:
-            job_uid = await get_job_uid(job_name)
+            job_uid = await get_job_uid(job_name, namespace=namespace)
             await self._create_auth_secret(
                 auth_secret_name, run_id, runner_token, job_name, job_uid
             )
@@ -670,11 +724,42 @@ class RunnerListener:
             await self._report_launch_failed(run_id, f"Failed to create runner auth Secret: {e}")
             return
 
+        # Create the vars Secret (same ownerReference GC as the auth Secret).
+        if vars_secret_name:
+            try:
+                await self._create_vars_secret(
+                    vars_secret_name,
+                    run_id,
+                    terraform_vars,
+                    env_vars,
+                    job_name,
+                    job_uid,
+                    execution_hooks=execution_hooks,
+                )
+            except Exception as e:
+                logger.error("Failed to create vars secret", run_id=run_id, error=str(e))
+                await self._report_launch_failed(run_id, f"Failed to create variables Secret: {e}")
+                return
+
+        # Create the per-run CA Secret (#592) — same ownerReference GC as the
+        # auth/vars Secrets. Holds the custom outbound CA the runner's init
+        # container merges with its image roots.
+        if ca_secret_name:
+            try:
+                await self._create_ca_secret(ca_secret_name, run_id, ca_pem, job_name, job_uid)
+            except Exception as e:
+                logger.error("Failed to create CA secret", run_id=run_id, error=str(e))
+                await self._report_launch_failed(run_id, f"Failed to create CA Secret: {e}")
+                return
+
         # Report Job launched to the API
         try:
-            await self._http_client.post(
+            await arequest_with_retry(
+                self._http_client,
+                "POST",
                 f"/api/terrapod/v1/listeners/listener-{self.identity.listener_id}"
                 f"/runs/run-{run_id}/job-launched",
+                idempotent=True,  # idempotent upsert of the run's job_name — safe to retry
                 json={"job_name": job_name, "job_namespace": namespace},
                 headers=self._auth_headers(),
             )
@@ -702,8 +787,11 @@ class RunnerListener:
         report-failure call cascade and break the listener's event loop.
         """
         try:
-            await self._http_client.patch(
+            await arequest_with_retry(
+                self._http_client,
+                "PATCH",
                 f"/api/terrapod/v1/listeners/listener-{self.identity.listener_id}/runs/run-{run_id}",
+                idempotent=True,  # idempotent status set (errored) — safe to retry on timeout/5xx
                 json={"status": "errored", "error_message": error_message},
                 headers=self._auth_headers(),
             )
@@ -779,9 +867,12 @@ class RunnerListener:
                 )
 
         try:
-            await self._http_client.post(
+            await arequest_with_retry(
+                self._http_client,
+                "POST",
                 f"/api/terrapod/v1/listeners/listener-{self.identity.listener_id}"
                 f"/runs/run-{run_id}/job-status",
+                idempotent=True,  # idempotent status report — safe to retry on timeout/5xx
                 json=body,
                 headers=self._auth_headers(),
             )
@@ -830,7 +921,9 @@ class RunnerListener:
         del logs  # Release the string copy immediately
 
         try:
-            await self._http_client.put(
+            await arequest_with_retry(
+                self._http_client,
+                "PUT",  # PUT is idempotent by spec — retries on all transient failures
                 f"/api/terrapod/v1/listeners/listener-{self.identity.listener_id}"
                 f"/runs/run-{run_id}/log-stream",
                 params={"phase": phase},
@@ -872,9 +965,12 @@ class RunnerListener:
 
     async def _get_runner_token(self, run_id: str) -> str:
         """Request a short-lived runner token from the API."""
-        response = await self._http_client.post(
+        response = await arequest_with_retry(
+            self._http_client,
+            "POST",
             f"/api/terrapod/v1/listeners/listener-{self.identity.listener_id}"
             f"/runs/run-{run_id}/runner-token",
+            idempotent=True,  # per-run token mint is safe/repeatable — retry on timeout/5xx
             json={},
             headers=self._auth_headers(),
         )
@@ -894,7 +990,7 @@ class RunnerListener:
 
         from terrapod.runner.job_manager import _get_core_api
 
-        namespace = os.environ.get("TERRAPOD_RUNNER_NAMESPACE", "terrapod-runners")
+        namespace = self.runner_config.runner_namespace
 
         secret = k8s_client.V1Secret(
             metadata=k8s_client.V1ObjectMeta(
@@ -921,7 +1017,154 @@ class RunnerListener:
         core_api = _get_core_api()
         core_api.create_namespaced_secret(namespace=namespace, body=secret)
         logger.info("Created auth secret", secret=secret_name, job=job_name)
+
+    async def _create_vars_secret(
+        self,
+        secret_name: str,
+        run_id: str,
+        terraform_vars: list[dict],
+        env_vars: list[dict],
+        job_name: str,
+        job_uid: str,
+        execution_hooks: list[dict] | None = None,
+    ) -> None:
+        """Create a K8s Secret holding all workspace variable values, with an
+        ownerReference to the Job (cascade-GC'd with it, like the auth Secret).
+
+        Data keys:
+          - `terraform.tfvars.json`: JSON blob [{key, value, hcl}] — mounted as
+            a file; the entrypoint renders terrapod.auto.tfvars from it.
+          - `execution-hooks.json`: JSON blob [{hook_point, name, script}] (#619)
+            — mounted as a file; the entrypoint runs each hook at its boundary.
+          - one key per env-category var — sourced via secretKeyRef in the Job.
+
+        Values never appear in the Job spec, so they aren't readable via
+        `kubectl describe job` / etcd.
+        """
+        from kubernetes import client as k8s_client
+
+        from terrapod.runner.job_manager import _get_core_api
+
+        namespace = self.runner_config.runner_namespace
+
+        string_data: dict[str, str] = {}
+        if terraform_vars:
+            string_data["terraform.tfvars.json"] = json.dumps(
+                [
+                    {"key": v["key"], "value": v["value"], "hcl": bool(v.get("hcl"))}
+                    for v in terraform_vars
+                ]
+            )
+        if execution_hooks:
+            string_data["execution-hooks.json"] = json.dumps(
+                [
+                    {
+                        "hook_point": h.get("hook_point", ""),
+                        "name": h.get("name", ""),
+                        "script": h.get("script", ""),
+                    }
+                    for h in execution_hooks
+                ]
+            )
+        for var in env_vars:
+            string_data[var["key"]] = var["value"]
+
+        secret = k8s_client.V1Secret(
+            metadata=k8s_client.V1ObjectMeta(
+                name=secret_name,
+                namespace=namespace,
+                labels={
+                    "app.kubernetes.io/name": "terrapod-runner",
+                    "terrapod.io/run-id": run_id,
+                },
+                owner_references=[
+                    k8s_client.V1OwnerReference(
+                        api_version="batch/v1",
+                        kind="Job",
+                        name=job_name,
+                        uid=job_uid,
+                        block_owner_deletion=True,
+                    )
+                ],
+            ),
+            type="Opaque",
+            string_data=string_data,
+        )
+
+        core_api = _get_core_api()
+        core_api.create_namespaced_secret(namespace=namespace, body=secret)
+        logger.info("Created vars secret", secret=secret_name, job=job_name)
         return secret_name
+
+    def _read_ca_bundle_pem(self) -> str:
+        """Read the listener's own mounted custom CA source file (#592).
+
+        Returns the raw PEM, cached after first read (the mounted file is
+        stable for the pod's lifetime). Empty string when no CA bundle is
+        configured or the file is missing/unreadable — the caller then skips
+        per-run CA delivery rather than failing the run. We ship the raw
+        SOURCE (not the listener's merged bundle) so the runner trusts the
+        RUNNER image's roots + the custom CA, not the listener image's roots.
+        """
+        if not self.runner_config.ca_bundle_enabled:
+            return ""
+        cached = getattr(self, "_ca_bundle_pem_cache", None)
+        if cached is not None:
+            return cached
+        path = self.runner_config.ca_bundle_source_path
+        pem = ""
+        if path and os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    pem = f.read().strip()
+            except OSError as e:
+                logger.warning("Could not read CA bundle source", path=path, error=str(e))
+        else:
+            logger.warning("CA bundle enabled but source file missing", path=path)
+        self._ca_bundle_pem_cache = pem
+        return pem
+
+    async def _create_ca_secret(
+        self, secret_name: str, run_id: str, ca_pem: str, job_name: str, job_uid: str
+    ) -> None:
+        """Create a K8s Secret holding the custom outbound CA (#592), with an
+        ownerReference to the Job (cascade-GC'd with it, like the auth Secret).
+
+        The CA is public material, but a Secret avoids needing `configmaps:
+        create` RBAC the listener doesn't have. The runner Job mounts it and
+        merges it with the image's system roots in an init container.
+        """
+        from kubernetes import client as k8s_client
+
+        from terrapod.runner.job_manager import _get_core_api
+
+        namespace = self.runner_config.runner_namespace
+
+        secret = k8s_client.V1Secret(
+            metadata=k8s_client.V1ObjectMeta(
+                name=secret_name,
+                namespace=namespace,
+                labels={
+                    "app.kubernetes.io/name": "terrapod-runner",
+                    "terrapod.io/run-id": run_id,
+                },
+                owner_references=[
+                    k8s_client.V1OwnerReference(
+                        api_version="batch/v1",
+                        kind="Job",
+                        name=job_name,
+                        uid=job_uid,
+                        block_owner_deletion=True,
+                    )
+                ],
+            ),
+            type="Opaque",
+            string_data={"ca-extra.pem": ca_pem},
+        )
+
+        core_api = _get_core_api()
+        core_api.create_namespaced_secret(namespace=namespace, body=secret)
+        logger.info("Created CA secret", secret=secret_name, job=job_name)
 
 
 def _handle_signals() -> None:

@@ -120,6 +120,7 @@ def _mock_run(**kwargs):
     run.plan_only = kwargs.get("plan_only", False)
     run.listener_id = kwargs.get("listener_id", None)
     run.locked = kwargs.get("locked", False)
+    run.source = kwargs.get("source", "tfe-api")
     return run
 
 
@@ -188,6 +189,149 @@ class TestTransitionRun:
         result = await transition_run(db, run, "applied")
         assert result.apply_finished_at is not None
 
+    @patch("terrapod.services.run_service.fire_run_triggers", new_callable=AsyncMock)
+    async def test_applied_resets_drift_status_when_enabled(self, mock_fire):
+        """A successful non-speculative apply means state == reality.
+        Reset drift_status to "no_drift" and advance
+        drift_last_checked_at so a previously errored / drifted
+        workspace clears its Health Issues banner the moment the
+        operator applies.
+
+        This is the second half of the production-incident fix:
+        even with the planned-doesn't-block-drift fix landed, a
+        stale "errored" drift_status would persist until the next
+        drift check fired and overwrote it — which on the affected
+        deployment was 24h away. Resetting on apply makes the UX
+        responsive.
+        """
+        db = AsyncMock(spec=AsyncSession)
+        ws = MagicMock()
+        ws.drift_detection_enabled = True
+        ws.drift_status = "errored"
+        ws.drift_last_checked_at = None
+        db.get = AsyncMock(return_value=ws)
+
+        run = _mock_run(
+            status="applying",
+            source="tfe-api",
+            plan_only=False,
+            apply_started_at=datetime.now(UTC),
+        )
+        await transition_run(db, run, "applied")
+
+        assert ws.drift_status == "no_drift"
+        assert ws.drift_last_checked_at is not None
+
+    @patch("terrapod.services.run_service.fire_run_triggers", new_callable=AsyncMock)
+    async def test_applied_does_not_touch_drift_for_drift_detection_run(self, mock_fire):
+        """Drift detection runs have their own status writer
+        (`handle_drift_run_completed`). Don't double-write here.
+        """
+        db = AsyncMock(spec=AsyncSession)
+        ws = MagicMock()
+        ws.drift_detection_enabled = True
+        ws.drift_status = "drifted"
+        db.get = AsyncMock(return_value=ws)
+
+        run = _mock_run(
+            status="applying",
+            source="drift-detection",
+            plan_only=False,
+            apply_started_at=datetime.now(UTC),
+        )
+        await transition_run(db, run, "applied")
+
+        assert ws.drift_status == "drifted"  # untouched
+
+    @patch("terrapod.services.run_service.fire_run_triggers", new_callable=AsyncMock)
+    async def test_applied_does_not_touch_drift_for_plan_only(self, mock_fire):
+        """plan_only runs don't change infrastructure, so they
+        don't imply state == reality. Don't reset drift_status.
+        """
+        db = AsyncMock(spec=AsyncSession)
+        ws = MagicMock()
+        ws.drift_detection_enabled = True
+        ws.drift_status = "errored"
+        db.get = AsyncMock(return_value=ws)
+
+        run = _mock_run(
+            status="applying",
+            source="tfe-api",
+            plan_only=True,
+            apply_started_at=datetime.now(UTC),
+        )
+        await transition_run(db, run, "applied")
+
+        assert ws.drift_status == "errored"  # untouched
+
+    @patch("terrapod.services.run_service.fire_run_triggers", new_callable=AsyncMock)
+    async def test_applied_skips_drift_reset_when_feature_disabled(self, mock_fire):
+        """If the workspace doesn't use drift detection, don't
+        write to the column at all — cheap branch.
+        """
+        db = AsyncMock(spec=AsyncSession)
+        ws = MagicMock()
+        ws.drift_detection_enabled = False
+        ws.drift_status = ""
+        ws.drift_last_checked_at = None
+        db.get = AsyncMock(return_value=ws)
+
+        run = _mock_run(
+            status="applying",
+            source="tfe-api",
+            plan_only=False,
+            apply_started_at=datetime.now(UTC),
+        )
+        await transition_run(db, run, "applied")
+
+        assert ws.drift_status == ""
+        assert ws.drift_last_checked_at is None
+
+    @patch("terrapod.services.run_service.fire_run_triggers", new_callable=AsyncMock)
+    async def test_applied_clears_state_diverged(self, mock_fire):
+        """A successful non-speculative apply brings state into agreement with
+        reality, so a stale state_diverged flag must clear. This is the ONLY
+        thing that clears it for a workspace whose applies are serial-neutral
+        no-ops (perpetual phantom diff): the runner skips the redundant state
+        upload, so the upload-path clear never fires.
+        """
+        db = AsyncMock(spec=AsyncSession)
+        ws = MagicMock()
+        ws.drift_detection_enabled = False
+        ws.state_diverged = True
+        db.get = AsyncMock(return_value=ws)
+
+        run = _mock_run(
+            status="applying",
+            source="tfe-api",
+            plan_only=False,
+            apply_started_at=datetime.now(UTC),
+        )
+        await transition_run(db, run, "applied")
+
+        assert ws.state_diverged is False
+
+    @patch("terrapod.services.run_service.fire_run_triggers", new_callable=AsyncMock)
+    async def test_applied_does_not_clear_state_diverged_for_plan_only(self, mock_fire):
+        """plan_only runs don't mutate infrastructure, so they don't resolve a
+        divergence. Leave the flag set.
+        """
+        db = AsyncMock(spec=AsyncSession)
+        ws = MagicMock()
+        ws.drift_detection_enabled = False
+        ws.state_diverged = True
+        db.get = AsyncMock(return_value=ws)
+
+        run = _mock_run(
+            status="applying",
+            source="tfe-api",
+            plan_only=True,
+            apply_started_at=datetime.now(UTC),
+        )
+        await transition_run(db, run, "applied")
+
+        assert ws.state_diverged is True  # untouched
+
     async def test_error_message_stored(self):
         db = AsyncMock(spec=AsyncSession)
         run = _mock_run(status="planning")
@@ -219,6 +363,8 @@ def _mock_workspace(**kwargs):
     ws.name = kwargs.get("name", "test-ws")
     ws.auto_apply = kwargs.get("auto_apply", False)
     ws.terraform_version = kwargs.get("terraform_version", "1.11")
+    ws.terragrunt_enabled = kwargs.get("terragrunt_enabled", False)
+    ws.terragrunt_version = kwargs.get("terragrunt_version", "1.0")
     ws.resource_cpu = kwargs.get("resource_cpu", "1")
     ws.resource_memory = kwargs.get("resource_memory", "2Gi")
     ws.agent_pool_id = kwargs.get("agent_pool_id", None)
@@ -274,6 +420,39 @@ class TestCreateRun:
         await create_run(db, ws)
         assert MockRun.call_args[1]["resource_cpu"] == "2"
         assert MockRun.call_args[1]["resource_memory"] == "4Gi"
+
+    @patch("terrapod.services.run_service.Run")
+    async def test_terragrunt_snapshot_from_workspace(self, MockRun):
+        # Terragrunt enable+version are frozen onto the run at creation so a
+        # later workspace edit can't change an in-flight run's execution tool.
+        db = AsyncMock(spec=AsyncSession)
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = None
+        db.execute.return_value = mock_result
+
+        ws = _mock_workspace(terragrunt_enabled=True, terragrunt_version="1.0")
+        instance = MockRun.return_value
+        instance.id = uuid.uuid4()
+        instance.status = "pending"
+
+        await create_run(db, ws)
+        assert MockRun.call_args[1]["terragrunt_enabled"] is True
+        assert MockRun.call_args[1]["terragrunt_version"] == "1.0"
+
+    @patch("terrapod.services.run_service.Run")
+    async def test_terragrunt_disabled_by_default(self, MockRun):
+        db = AsyncMock(spec=AsyncSession)
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = None
+        db.execute.return_value = mock_result
+
+        ws = _mock_workspace()  # terragrunt_enabled defaults False
+        instance = MockRun.return_value
+        instance.id = uuid.uuid4()
+        instance.status = "pending"
+
+        await create_run(db, ws)
+        assert MockRun.call_args[1]["terragrunt_enabled"] is False
 
     @patch("terrapod.services.run_service.Run")
     async def test_pool_from_workspace(self, MockRun):
@@ -332,6 +511,10 @@ class TestCreateRun:
 class TestConfirmRun:
     async def test_confirms_planned_run(self):
         db = AsyncMock(spec=AsyncSession)
+        # confirm_run checks the workspace lock — return an unlocked one.
+        ws = MagicMock()
+        ws.locked = False
+        db.get.return_value = ws
         run = _mock_run(status="planned")
         result = await confirm_run(db, run)
         assert result.status == "confirmed"
@@ -340,6 +523,16 @@ class TestConfirmRun:
         db = AsyncMock(spec=AsyncSession)
         run = _mock_run(status="queued")
         with pytest.raises(ValueError, match="planned"):
+            await confirm_run(db, run)
+
+    async def test_rejects_when_workspace_locked(self):
+        db = AsyncMock(spec=AsyncSession)
+        ws = MagicMock()
+        ws.locked = True
+        ws.lock_id = "lock-ops@example.com"
+        db.get.return_value = ws
+        run = _mock_run(status="planned")
+        with pytest.raises(ValueError, match="locked"):
             await confirm_run(db, run)
 
 

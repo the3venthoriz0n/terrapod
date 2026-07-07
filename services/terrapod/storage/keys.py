@@ -52,6 +52,21 @@ def lock_file_key(workspace_id: str, run_id: str) -> str:
     return f"plans/{workspace_id}/{run_id}.terraform.lock.hcl"
 
 
+def plan_artifacts_key(workspace_id: str, run_id: str) -> str:
+    """Key for the plan-phase workspace diff tarball.
+
+    The runner snapshots the workspace file tree after init and again
+    after plan, and uploads the set difference (paths that exist after
+    plan but didn't after init) as a plain `tar`. The apply phase
+    downloads + extracts this over its initialised workspace, restoring
+    any plan-time generated artifacts (e.g. `data.archive_file` zips)
+    that would otherwise be missing because each phase runs in a
+    fresh K8s Job. tfplan + lock file are uploaded via their own
+    endpoints and are excluded from this tarball to avoid duplication.
+    """
+    return f"plans/{workspace_id}/{run_id}.plan-artifacts.tar"
+
+
 def config_version_key(workspace_id: str, config_version_id: str) -> str:
     """Key for a configuration version archive."""
     return f"config/{workspace_id}/{config_version_id}.tar.gz"
@@ -109,6 +124,20 @@ def provider_cache_key(
 def binary_cache_key(tool: str, version: str, os_: str, arch: str) -> str:
     """Key for a cached terraform/tofu CLI binary."""
     return f"cache/binaries/{tool}/{version}/{os_}_{arch}"
+
+
+def binary_cache_sums_key(tool: str, version: str) -> str:
+    """Key for the cached publisher SHA256SUMS manifest (per tool+version).
+
+    Persisted at cache time (#607) so runners can verify the executable
+    against the publisher's signed manifest without reaching upstream.
+    """
+    return f"cache/binaries/{tool}/{version}/SHA256SUMS"
+
+
+def binary_cache_sums_sig_key(tool: str, version: str) -> str:
+    """Key for the cached detached GPG signature over the SHA256SUMS manifest."""
+    return f"cache/binaries/{tool}/{version}/SHA256SUMS.sig"
 
 
 # --- Platform Provider Cache ---

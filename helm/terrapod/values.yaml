@@ -43,6 +43,28 @@ api:
   # command: ["uvicorn", "terrapod.api.app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
   command: []
 
+  # Dedicated HMAC secret for stateless tokens (runner tokens + run-task
+  # callback tokens). When unset, the signing key falls back to
+  # sha256(database_url) — functionally fine, but it couples token-forgery
+  # resistance to the database credentials. Point this at a K8s Secret to
+  # decouple them. Leaving it unset does NOT invalidate in-flight tokens on
+  # upgrade. Inject via secretKeyRef (the key is a secret, never a ConfigMap).
+  tokenSigningKey:
+    existingSecret: ""               # name of a K8s Secret holding the key
+    existingSecretKey: "token_signing_key"  # key within that Secret
+
+  # CA bundle for database TLS server-cert verification, used when
+  # config.database.ssl_mode is "verify-ca"/"verify-full" (cloud-IAM DB auth).
+  # A CA bundle is public, non-secret material, so provide it as a ConfigMap —
+  # either inline (the chart creates the ConfigMap for you) or by referencing an
+  # existing one. The chart mounts it read-only and wires
+  # config.database.ssl_root_cert to the mounted path automatically. Leave unset
+  # for ssl_mode require / a system-trusted CA.
+  databaseCA:
+    inline: ""                       # paste the CA bundle PEM here; the chart creates a ConfigMap for it
+    existingConfigMap: ""            # OR reference an existing ConfigMap holding the CA bundle
+    key: ca.pem                      # key within the ConfigMap (also the mounted filename)
+
   # Service configuration
   service:
     type: ClusterIP
@@ -110,6 +132,29 @@ api:
       pool_timeout: 30         # Seconds to wait for a pool connection
       connect_timeout: 10      # TCP connect timeout in seconds
       command_timeout: 30      # Query timeout in seconds
+      # DB auth (#573): "password" (default — static creds in the DB URL) or a
+      # cloud-IAM mode that mints a short-lived token per connection under the
+      # API's workload identity (no static DB password, TLS required):
+      #   aws_iam   — AWS RDS IAM (IRSA)
+      #   gcp_iam   — GCP Cloud SQL IAM (Workload Identity Federation)
+      #   azure_ad  — Azure Database for PostgreSQL Entra auth (Azure Workload Identity)
+      auth_mode: password
+      aws_iam_region: ""       # AWS region for RDS IAM signing ("" = AWS_REGION env); aws_iam only
+      ssl_mode: ""             # IAM-auth TLS: "" / require (encrypt) | verify-ca | verify-full
+      ssl_root_cert: ""        # CA bundle path for verify-ca/verify-full (mount via api.extraVolumes); "" = system CAs
+
+    # Redis/Valkey auth (#579). "password" (default — static auth string in the
+    # Redis URL) or a cloud-IAM mode that mints a short-lived token per
+    # connection under the API's workload identity (no static Redis secret, TLS
+    # rediss:// required):
+    #   aws_iam   — AWS ElastiCache IAM (IRSA; needs elasticache:Connect + aws_cache_name)
+    #   gcp_iam   — GCP Memorystore IAM (Workload Identity Federation)
+    #   azure_ad  — Azure Cache for Redis Entra auth (Azure Workload Identity)
+    redis:
+      auth_mode: password
+      username: ""             # Redis ACL user for IAM (ElastiCache User / IAM user / Entra object id)
+      aws_iam_region: ""       # AWS region for ElastiCache IAM signing; aws_iam only
+      aws_cache_name: ""       # ElastiCache replication-group / serverless cache id (NOT the endpoint host); aws_iam only
 
     # Default execution backend and version for new workspaces
     default_execution_backend: tofu  # tofu | terraform
@@ -161,7 +206,15 @@ api:
       callback_base_url: ""
 
       session_ttl_hours: 12
-      api_token_max_ttl_hours: 8760  # 1 year; 0 = no limit
+      api_token_max_ttl_hours: 8760  # 1 year; upper bound on any token. 0 = no limit
+      # Lifespan of the token minted by `terraform login` — short-lived per-session
+      # CLI credentials, distinct from the max cap above. 0 falls back to the cap.
+      login_token_ttl_hours: 12
+      # Service tokens (#495): separate (always-expiring) cap; warning lead time;
+      # and the bound-token idle-login window (ON by default; 0 disables).
+      service_token_max_ttl_hours: 8760
+      token_expiry_warning_days: 14
+      bound_token_idle_days: 7
       require_external_sso_for_roles: []
 
       # ── SSO / Identity Providers ──────────────────────────────────────
@@ -205,6 +258,15 @@ api:
     # Private Registry & Caching
     registry:
       enabled: true
+      # Sealed (cache-only) mode for air-gapped deployments. When true, NO
+      # upstream fetch ever happens across the binary cache, provider network
+      # mirror, terragrunt binary, and version resolution: a cache miss returns
+      # an actionable 404 instead of attempting upstream, partial-version
+      # resolution (e.g. "1.12") resolves ONLY against cached entries, and the
+      # artifact-retention sweeper skips the binary/provider caches. Pre-populate
+      # the cache first (bulk-warm admin endpoint/UI, typically with cache_only
+      # off pointing at an internal mirror), then seal. See docs/registry.md.
+      cache_only: false
       provider_cache:
         enabled: true
         upstream_registries:
@@ -216,10 +278,38 @@ api:
             arch: amd64
           - os: linux
             arch: arm64
+        # Integrity verification for provider archives fetched from upstream.
+        # One of: off, checksum, signature. 'signature' (default, fail-closed)
+        # checks the archive SHA-256 against the registry-advertised shasum AND
+        # verifies the registry's SHA256SUMS GPG signature against the
+        # registry-advertised signing key (mirrors `terraform init`).
+        # 'checksum' = shasum-only. 'off' = no verification (NOT recommended).
+        verify: signature
+        # In 'signature' mode, when an upstream advertises NO signature material
+        # (private registries / non-signing mirrors / some community providers),
+        # default false = fail closed. Set true to degrade to a shasum-only check
+        # (with a warning) for those providers instead of rejecting them.
+        allow_unsigned: false
       binary_cache:
         enabled: true
         terraform_mirror_url: "https://releases.hashicorp.com/terraform"
         tofu_mirror_url: "https://github.com/opentofu/opentofu/releases/download"
+        # Upstream download base for terragrunt binaries (bare per-platform
+        # binary, not a zip). Only used by workspaces with terragrunt enabled.
+        terragrunt_mirror_url: "https://github.com/gruntwork-io/terragrunt/releases/download"
+        # Version-index sources — separate from the *_mirror_url download bases
+        # above. These are the endpoints the cache reads to LIST versions and to
+        # resolve a partial version (e.g. "1.12" -> "1.12.3"). Upstream they live
+        # on different hosts from the download base, so an internal-mirror /
+        # air-gapped deployment must override BOTH the download base AND the
+        # version index for each tool. A mirror MUST serve the same response
+        # shape as the upstream it replaces:
+        #   - terraform: HashiCorp index JSON  {"versions": {"1.12.3": {...}}}
+        #   - tofu:      OpenTofu index JSON    {"versions": [{"id": "1.12.3"}]}
+        #   - terragrunt: GitHub releases array [{"tag_name": "v0.58.0", ...}]
+        terraform_version_index_url: "https://releases.hashicorp.com/terraform/index.json"
+        tofu_version_index_url: "https://get.opentofu.org/tofu/api.json"
+        terragrunt_version_index_url: "https://api.github.com/repos/gruntwork-io/terragrunt/releases"
         # Lowest pre-release tier to accept for terraform/tofu CLI version
         # resolution + caching. One of: none, rc, beta, alpha, dev.
         # 'none' (default) permits only GA releases. 'rc' allows release
@@ -227,6 +317,24 @@ api:
         # in dev/staging to try upcoming releases like terraform 1.15-rc or
         # tofu 1.12-beta before they GA.
         allow_prerelease: none
+        # Integrity verification for terraform/tofu/terragrunt binaries fetched
+        # from upstream. One of: off, checksum, signature. 'signature' (default,
+        # fail-closed) verifies the upstream SHA256SUMS GPG signature against the
+        # pinned publisher key (HashiCorp / OpenTofu / Gruntwork) AND checks the
+        # binary's SHA-256 against that signed manifest. The binary is executed
+        # on every run, so verification is on by default. 'checksum' = manifest
+        # compare only. 'off' = no verification (NOT recommended).
+        verify: signature
+        # Operator override for the pinned publisher keys, keyed by tool →
+        # ASCII-armored public key. Empty (default) uses the keys bundled in the
+        # image (HashiCorp / OpenTofu / Gruntwork). Supply a key to bridge an
+        # upstream key rotation without a Terrapod release, or to trust an
+        # internal re-signing mirror. Propagated to runner Jobs. Example:
+        #   signing_keys:
+        #     terraform: |
+        #       -----BEGIN PGP PUBLIC KEY BLOCK-----
+        #       ...
+        signing_keys: {}
       module_interface:
         enabled: true
 
@@ -236,6 +344,14 @@ api:
     # In production, inject from K8s Secret via TERRAPOD_REGISTRY__SIGNING_KEY env var
     # registry:
     #   signing_key: ""
+
+    # Service Catalog — no-code self-service provisioning over the module
+    # registry. On by default; the catalog RBAC axis is opt-in (default
+    # `none`), so no user can browse or provision until granted catalog
+    # permission. Set to false to hide the surface entirely (endpoints 404).
+    # See docs/service-catalog.md.
+    catalog:
+      enabled: true
 
     # VCS Integration
     # VCS connections (GitHub App installations, GitLab tokens) are created
@@ -247,6 +363,13 @@ api:
       github:
         # Optional: K8s Secret containing the webhook HMAC secret.
         # Only needed if GitHub webhooks are enabled for faster feedback.
+        existingSecret: ""
+        existingSecretKey: "webhook_secret"
+      gitlab:
+        # Optional: K8s Secret containing the global GitLab webhook secret
+        # (matched against the X-Gitlab-Token header). Only needed if GitLab
+        # webhooks are enabled for faster feedback and you aren't setting a
+        # per-connection webhook secret on the VCS connection.
         existingSecret: ""
         existingSecretKey: "webhook_secret"
 
@@ -297,11 +420,25 @@ api:
     ai_summary:
       enabled: false
       # LiteLLM model string. Examples:
+      #   bedrock/us.anthropic.claude-sonnet-4-6  (default — recommended for chat)
       #   bedrock/anthropic.claude-opus-4-8
       #   openai/gpt-5
       #   anthropic/claude-opus-4-8
       #   gemini/gemini-2.5-pro
-      model: ""
+      #
+      # The default targets Anthropic Sonnet 4.6 on Bedrock — chosen
+      # because it supports Bedrock prompt caching (chat follow-ups
+      # are ~10% the input-token cost of fresh requests), is in the
+      # recommended-for-chat tier (multi-turn coherence proven), and
+      # is ~5× cheaper than Opus while better at JSON-schema
+      # compliance for the structured tool calls. `enabled: false`
+      # remains the chart default so the feature is still
+      # double-opt-in; setting a sensible model just means operators
+      # don't ALSO have to look one up.
+      #
+      # See `docs/ai-plan-summary.md#choosing-a-model-for-chat` for
+      # the full recommended tier when picking a different provider.
+      model: "bedrock/us.anthropic.claude-sonnet-4-6"
       # Optional base URL override (vLLM, LiteLLM proxy, custom Azure).
       # Leave empty for vendor providers — LiteLLM knows the defaults.
       api_base: ""
@@ -314,6 +451,16 @@ api:
       request_timeout_seconds: 60
       # Output-token cap per UTC day across all summaries. 0 = unlimited.
       daily_token_budget: 0
+      # Follow-up chat (#463). Per-run cap on USER turns — once an
+      # operator has posted this many follow-ups on a single run,
+      # the UI disables the chat input. Set to 0 to disable the
+      # chat feature entirely (initial summary still fires).
+      followup_max_messages_per_run: 20
+      # Output-token cap per follow-up reply. Smaller than
+      # max_output_tokens because follow-ups are conversational,
+      # not full re-summaries. Bump only if operators routinely
+      # hit `finish_reason=length` on detailed answers.
+      followup_max_output_tokens: 2048
       # Size caps on the inputs attached to the model request.
       plan_json_max_bytes: 500000
       code_context_max_bytes: 200000
@@ -351,6 +498,24 @@ api:
       enabled: true
       poll_interval_seconds: 300
       min_workspace_interval_seconds: 3600
+
+    # Interactive Slack integration (#556). OFF by default. Transport is Socket
+    # Mode — an OUTBOUND WebSocket to Slack, so no public URL / ingress change is
+    # needed (matches the restricted-network execution model). The bot/app/signing
+    # tokens are SECRETS: put them in a K8s Secret and reference it via
+    # `existingSecret` — they are injected via secretKeyRef, never rendered into
+    # the ConfigMap. See docs/slack-integration.md for the full setup.
+    slack:
+      enabled: false
+      socket_mode: true              # false → Request-URL mode (needs webhook ingress)
+      command: "/terrapod"           # slash command this deployment answers (must match the app manifest)
+      label: ""                      # short per-deployment label shown in messages (e.g. "prod"), rendered as Slack
+                                     # mrkdwn; disambiguates multiple Terrapods sharing one Slack workspace — see #691
+      existingSecret: ""             # K8s Secret holding the three tokens
+      existingSecretKeys:            # keys within that Secret
+        botToken: bot-token
+        appToken: app-token
+        signingSecret: signing-secret
 
     # Notifications
     notifications:
@@ -395,6 +560,62 @@ api:
         enabled: false
         interval: 30s
         labels: {}
+      # Shipped PrometheusRule (alert rules) — off by default; enable when you
+      # run the Prometheus Operator. The bundled rules cover API availability /
+      # error-rate / latency, stuck runs, listener launch failures, reconciler
+      # stalls, DB/Redis/storage errors, cache miss rate, and retention errors.
+      # Each alert carries a runbook_url annotation pointing at docs/runbooks.md.
+      prometheusRule:
+        enabled: false
+        # Extra labels so your Prometheus's ruleSelector picks the rule up
+        # (e.g. {release: kube-prometheus-stack}).
+        labels: {}
+        # Base URL the runbook_url annotations point at. Override to pin a tag
+        # or mirror the runbooks internally.
+        runbookBaseUrl: "https://github.com/mattrobinsonsre/terrapod/blob/main/docs/runbooks.md"
+        # Append your own rule groups (raw PrometheusRule spec.groups entries).
+        extraGroups: []
+      # Bundled Grafana dashboard(s), shipped as a ConfigMap labeled for the
+      # Grafana sidecar (kiwigrid/k8s-sidecar — used by kube-prometheus-stack
+      # and the bitnami Grafana chart) so they auto-import. Off by default.
+      # Operators without the sidecar can import helm/terrapod/dashboards/*.json
+      # by hand.
+      grafanaDashboards:
+        enabled: false
+        # Label the sidecar watches for. Match your Grafana sidecar config.
+        labels:
+          grafana_dashboard: "1"
+        annotations: {}
+
+    # Optional application-layer encryption at rest (#553). OFF by default.
+    #
+    # WHEN TO USE: for deployments WITHOUT a usable CSP at-rest encryption switch
+    # — bare-metal, on-prem, niche cloud, or air-gapped — where this is your path
+    # to encryption at rest. If your CSP already encrypts at rest (RDS/S3/Azure/
+    # GCS), prefer that; this is then belt-and-braces, not a requirement.
+    #
+    # Phase 1 encrypts DB-stored secrets (starting with the CA private key).
+    # KEK durability is the backend's job — and for `static` it is YOURS: losing
+    # the master key makes encrypted data unrecoverable. See
+    # docs/encryption-at-rest.md before enabling.
+    encryption:
+      enabled: false
+      # static (operator-held key, works anywhere) | vault_transit (CSP-agnostic,
+      # on-prem/air-gapped) | awskms (cloud belt-and-braces)
+      provider: static
+      # Vault Transit (provider: vault_transit)
+      vault_address: ""
+      vault_mount: transit
+      vault_key_name: terrapod
+      vault_namespace: ""
+      # AWS KMS (provider: awskms)
+      aws_kms_key_id: ""
+      aws_kms_region: ""
+      # Secret holding the static master key and/or Vault token, injected via
+      # secretKeyRef (NEVER a ConfigMap). Required for static + vault_transit.
+      existingSecret: ""
+      staticKeyKey: static_key
+      vaultTokenKey: vault_token
 
     # Artifact Retention — periodic cleanup of old artifacts from object storage.
     # When enabled, a background task runs at the configured interval and removes
@@ -513,9 +734,64 @@ api:
     #   iam.gke.io/gcp-service-account: terrapod@project.iam.gserviceaccount.com
     annotations: {}
 
-# ── Web UI (Next.js) ──────────────────────────────────────────────────────────
-web:
+# ── Logical PostgreSQL backup + DR drill (#545) ───────────────────────────────
+# OFF by default. A standard deployment already has both halves a backup needs
+# (a Postgres URL + an object-storage backend), so enabling this needs no new
+# infra or credentials: a CronJob runs `pg_dump` and streams the dump to the
+# configured object store under `prefix`, inheriting the bucket's at-rest
+# encryption and the API ServiceAccount's cloud workload identity.
+#
+# This is a LOGICAL dump — RPO is the dump interval, not point-in-time — and is
+# the baseline floor, not a replacement for RDS snapshots / WAL-G / pgBackRest
+# for serious-RPO deployments. To keep the only backup out of the app data's
+# blast radius, enable object-store cross-region replication on the destination
+# bucket (see docs/disaster-recovery.md) rather than dual-writing app-side.
+backup:
   enabled: false
+  schedule: "0 2 * * *"          # daily at 02:00 (cluster TZ)
+  prefix: "backups/"             # object-store key prefix for dumps
+  retention:
+    keep: 0                      # keep N most-recent backups (0 = keep all)
+    days: 0                      # delete backups older than N days (0 = disabled)
+  backoffLimit: 2
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  resources: {}
+  # DR drill — restore the latest backup into a THROWAWAY sidecar Postgres
+  # (never the live DB) and assert core invariants. A tested restore beats a
+  # documented one. Run on demand with:
+  #   kubectl create job --from=cronjob/<release>-terrapod-restore-verify drill-now
+  restoreVerify:
+    enabled: false
+    schedule: "0 4 * * 0"        # weekly, Sundays at 04:00
+    postgresImage: "postgres:17-alpine"
+    backoffLimit: 1
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    resources: {}
+    postgresResources: {}
+
+# ── Cloud-identity preflight doctor (#571) ────────────────────────────────────
+# OFF by default. When enabled, runs as a Helm post-install/upgrade hook so a
+# misconfigured OIDC trust policy / SA binding fails the install LOUDLY instead
+# of the first run failing cryptically. Two Jobs: the API ServiceAccount
+# (storage read + cloud identity + DB connect) and the runner ServiceAccount
+# (cloud identity only). A failing hook fails `helm install/upgrade` — that's the
+# point. Also runnable on demand via `make preflight-identity`.
+preflight:
+  enabled: false
+  checkRunner: true              # also probe the runner SA's cloud identity
+  hook: "post-install,post-upgrade"
+  hookWeight: "5"
+  backoffLimit: 0
+  resources: {}
+
+# ── Web UI (Next.js) ──────────────────────────────────────────────────────────
+# The web frontend is the BFF (Backend-For-Frontend): all browser, CLI, and
+# listener traffic enters through it and is proxied to the API. The Ingress
+# routes here, so it is enabled by default alongside the API and listener.
+web:
+  enabled: true
 
   replicas: 2
 
@@ -692,6 +968,53 @@ runners:
   tokenTTLSeconds: 3600         # Runner token TTL (default 1 hour)
   maxTokenTTLSeconds: 7200      # Runner token max TTL (default 2 hours)
   staleTimeoutSeconds: 3600     # Seconds before a run with no Job status is marked errored
+  # Seconds before a claimed run with no Job launched is errored (listener
+  # claimed it but never created the Job — e.g. runner-token 401, K8s outage).
+  launchTimeoutSeconds: 300
+  # Default terraform/tofu version + backend for runner Jobs when a workspace
+  # doesn't pin one. Runs snapshot the resolved version at creation time.
+  defaultTerraformVersion: "1.12"
+  defaultExecutionBackend: "tofu"  # tofu | terraform
+  # Maximum wall-clock seconds a drift-detection run may spend in `planning`
+  # before the reconciler errors it out. Independent of staleTimeoutSeconds:
+  # that one fires on listeners going dark; this one fires on terraform
+  # legitimately running too long for a background drift check (e.g. a
+  # github-provider state refresh that takes hours on a workspace with
+  # hundreds of rate-limited reads). Drift runs are plan-only and
+  # background-priority — a 30-minute cap is a generous SLO for "tell me
+  # if there's drift". Set to 0 to disable the cap.
+  driftMaxDurationSeconds: 1800
+
+  # Auto-retry for FAILED platform-initiated lifecycle destroys (a catalog
+  # instance destroy or an autodiscovery directory destroy). terraform destroy
+  # is commonly transiently flaky (dependency-release ordering, eventual
+  # consistency, draining LBs / releasing ENIs / emptying buckets); a re-run
+  # usually succeeds and re-running is safe (destroy is incremental). The
+  # workspace is archived only on a SUCCESSFUL destroy, so retries never lose
+  # data — they either succeed and archive or exhaust the cap and stay errored
+  # for an operator. A user's own CLI `terraform destroy` is never retried.
+  # Set lifecycleDestroyRetries to 0 to disable.
+  lifecycleDestroyRetries: 2            # retries after the first failure (3 attempts total)
+  lifecycleDestroyRetryBackoffSeconds: 45  # wait after an error before retrying
+
+  # Execution hooks (#619): kill-switch for operator-defined custom-shell steps
+  # run inside runner Jobs at fixed points (pre_init/pre_plan/post_plan/
+  # pre_apply/post_apply). Hooks are an admin-managed library associated with
+  # workspaces via the API. When false, the listener drops all resolved hooks
+  # before building the Job, so no custom shell runs in the runner — for
+  # security-conscious / sealed deployments that forbid arbitrary hook scripts.
+  hooksEnabled: true
+
+  # Maximum size in bytes of the plan-phase workspace-diff tarball that
+  # the runner uploads at end of plan and downloads at start of apply.
+  # That tarball restores files plan generated on disk (data.archive_file
+  # outputs, null_resource local-exec scratch, etc.) that would otherwise
+  # be missing in the apply pod's fresh workspace. Uploads exceeding
+  # this size are rejected with HTTP 413; the runner logs the rejection
+  # and apply will then fail on the resource that depended on the
+  # missing file (no worse than the pre-feature behaviour).
+  # Default 256 MiB (256 * 1024 * 1024 = 268435456).
+  planArtifactsMaxBytes: 268435456
 
   # ServiceAccount for runner Jobs (cloud workload identity)
   serviceAccount:
@@ -761,6 +1084,16 @@ listener:
   #
   # See docs/deployment-network-isolation.md for the full pattern.
   publicApiUrl: ""
+
+  # Listener tuning — non-sensitive, delivered via the runner ConfigMap
+  # (runners.yaml → RunnerConfig), not Deployment env (#617). Defaults are
+  # sane; override per cluster as needed.
+  heartbeatInterval: 60   # Seconds between listener heartbeats (Redis TTL is 300).
+  maxConcurrent: 3        # Max concurrent run launches per listener pod.
+  pollInterval: 30        # Fallback poll interval when SSE is idle (s).
+  sseReadTimeout: 30      # SSE silence beyond this reconnects (keepalive is 1s).
+  sseMaxAge: 600          # Proactive SSE reconnect interval (s).
+  sseRetryInterval: 5     # Backoff between SSE reconnect attempts (s).
 
   # Join token for pool registration.
   # Either set joinToken directly or reference an existing K8s Secret (recommended).
@@ -984,8 +1317,20 @@ migrations:
     tag: ""  # Defaults to appVersion
     pullPolicy: IfNotPresent
 
+  # Job retry budget. The migrations Job is a pre-install/pre-upgrade hook; when
+  # the database is co-deployed in the same release (eval/dev embedded Postgres,
+  # postgresql.deploy=true) it may still be starting when the hook first runs, so
+  # the Job retries with exponential backoff until the DB is reachable. Harmless
+  # for an already-up managed database in production.
+  backoffLimit: 10
+
 # ── Bootstrap (initial admin user + optional pool) ─────────────────────────
+# The bootstrap Job is a post-install hook that idempotently seeds the admin
+# user (+ an optional agent pool). NOTE: ArgoCD runs post-install hooks on
+# every Sync, so on an established deployment (admin already exists) it just
+# re-runs as a no-op — set `enabled: false` to stop it once seeded.
 # bootstrap:
+#   enabled: true      # set false to skip the bootstrap Job (admin already seeded)
 #   adminEmail: admin@example.com
 #   adminPassword: ""  # Required when enabled
 #   existingSecret: ""  # Alternative: reference an existing K8s Secret
@@ -993,6 +1338,18 @@ migrations:
 #   passwordKey: password
 #   poolName: ""       # Optional: auto-create an agent pool with this name
 #   poolToken: ""      # Optional: auto-create a join token for the pool
+#   sampleWorkspace: false      # Eval only: seed a sample workspace + a completed
+#                               # plan-only run so the UI is populated on first login.
+#                               # Do NOT enable in production (it inserts demo data).
+#   sampleWorkspaceName: ""     # Optional name for the seeded workspace (default "example-vpc")
+#   hook: ""           # Helm hook phase (default "post-install"). Set to
+#                      # "pre-install,pre-upgrade" with hookWeight "-3" to create
+#                      # the admin/pool BEFORE the listener rolls out — required if
+#                      # you enable the listener with a bootstrap-created pool AND
+#                      # install with `helm --wait` (otherwise --wait deadlocks on
+#                      # the listener's pool-join readiness). The eval profile does
+#                      # this; production defaults keep the historical post-install.
+#   hookWeight: ""     # Helm hook-weight (default "10")
 
 # ── Database (PostgreSQL) ─────────────────────────────────────────────────────
 # Provide credentials via existingSecret (recommended) or url (dev only).
@@ -1001,12 +1358,46 @@ postgresql:
   # existingSecret: "terrapod-db-credentials"
   # existingSecretKey: "url"  # key within the Secret (default: url)
 
+  # ── Embedded PostgreSQL — EVAL / DEV ONLY ──────────────────────────────
+  # When true, the chart deploys a single-replica in-cluster PostgreSQL and
+  # wires the API/migrations/bootstrap to it automatically (no url/existingSecret
+  # needed). This exists so the stack can run with ZERO external dependencies
+  # for local evaluation (`make eval`) and the Tilt dev loop. It is NOT
+  # production-grade — one replica, no HA, no backups, no tuning. For production,
+  # keep this false and provide a managed database via url / existingSecret.
+  deploy: false
+  embedded:
+    image: postgres:16-alpine
+    # A fixed password for the embedded DB (eval only). Leave empty to have the
+    # chart generate one (stable across upgrades via a lookup on the Secret).
+    password: ""
+    persistence:
+      size: 1Gi
+      storageClass: ""   # "" = cluster default StorageClass (kind/k3d ship one)
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+
 # ── Redis ─────────────────────────────────────────────────────────────────
 # Provide credentials via existingSecret (recommended) or url (dev only).
 redis:
   url: ""
   # existingSecret: "terrapod-redis-credentials"
   # existingSecretKey: "url"  # key within the Secret (default: url)
+
+  # ── Embedded Redis — EVAL / DEV ONLY ───────────────────────────────────
+  # When true, the chart deploys a single-replica in-cluster Redis and points
+  # the API at it automatically. Same caveat as embedded PostgreSQL above:
+  # eval/dev only (no auth, no persistence, no HA). Production should keep this
+  # false and provide a managed Redis/Valkey via url / existingSecret.
+  deploy: false
+  embedded:
+    image: redis:7-alpine
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
 
 # ── Storage ─────────────────────────────────────────────────────────────────
 # Filesystem PVC — only created when storage.backend=filesystem
@@ -1034,3 +1425,45 @@ networkPolicies:
 namespace:
   create: false
   labels: {}
+
+# ── Egress: forward proxy + custom CA trust (restricted-network deployments) ──
+# proxy.* and caBundle.* are a matched pair for high-security / restricted-egress
+# networks where outbound traffic must egress via a forward proxy and/or TLS
+# terminates against internal/corporate CAs — including a TLS-intercepting "MITM"
+# proxy presenting its OWN CA. They apply to EVERY component that makes outbound
+# calls: the API, web/BFF, listener, the migrations + bootstrap Jobs, and the
+# runner Jobs (so terraform/tofu provider+module fetches egress through the proxy
+# and trust the CA too). See docs/deployment-proxy.md.
+
+# Forward proxy. When enabled, BOTH upper- and lower-case env vars
+# (HTTP_PROXY/http_proxy, HTTPS_PROXY/https_proxy, NO_PROXY/no_proxy) are injected
+# into every component — different runtimes (Python httpx/requests, Go,
+# terraform/tofu, curl, cloud SDKs) read different cases. The chart APPENDS
+# cluster-internal destinations to noProxy automatically (localhost, 127.0.0.1,
+# .svc, .svc.cluster.local, .cluster.local, the in-cluster service names) so
+# internal traffic is never proxied. Add cloud metadata (169.254.169.254) and any
+# object-store/STS endpoints that must bypass the proxy to noProxy yourself.
+proxy:
+  enabled: false
+  httpProxy: ""                   # e.g. http://proxy.internal:3128
+  httpsProxy: ""                  # e.g. http://proxy.internal:3128 (often the same as httpProxy)
+  noProxy: []                     # extra no_proxy entries; cluster-internal defaults are appended
+
+# Custom CA trust bundle for OUTBOUND TLS (corporate roots, internal registries /
+# VCS / artifact stores, and a TLS-intercepting proxy's MITM CA). For the Python/
+# Go/git components an init container MERGES the supplied CA(s) with the image's
+# system roots into one bundle on a shared emptyDir, so the app trusts BOTH public
+# and corporate/proxy CAs (a replacement bundle would drop the public roots and
+# break public endpoints); the merged bundle is wired via SSL_CERT_FILE /
+# REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE (Python, curl, Go, terraform/tofu) and
+# GIT_SSL_CAINFO (git). The web/BFF (Node) trusts it via NODE_EXTRA_CA_CERTS, which
+# APPENDS to Node's built-in roots (no merge needed). A CA bundle is public,
+# non-secret material — prefer a ConfigMap. This is SEPARATE from api.databaseCA,
+# which verifies the database SERVER cert specifically; caBundle is general
+# outbound trust. See docs/deployment-proxy.md for how the two interact.
+caBundle:
+  enabled: false
+  inline: ""                      # paste the extra CA PEM(s) here; the chart creates a ConfigMap
+  existingConfigMap: ""           # OR reference an existing ConfigMap holding the CA bundle
+  existingSecret: ""              # OR an existing Secret holding the CA bundle
+  key: ca-extra.pem               # key within the ConfigMap/Secret (the supplied CA filename)

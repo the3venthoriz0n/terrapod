@@ -1,10 +1,15 @@
-"""AI plan summariser + plan-failure analyser (#401).
+"""AI plan summariser + run-failure analyser (#401, #419).
 
 When enabled via ``ai_summary.enabled``, the API triggers an
-asynchronous call after every plan-phase terminal transition:
+asynchronous call after every terminal run transition:
   - ``planned`` → ``kind=plan_summary``: describe changes + rate risk.
-  - ``errored`` while still in the plan phase → ``kind=failure_analysis``:
-    explain why the plan failed and suggest fixes.
+  - ``errored`` at any point → ``kind=failure_analysis``: explain why
+    the run failed and suggest fixes. Plan-phase errors read the
+    plan log; apply-phase errors read the apply log and the prompt
+    grows apply-specific guidance (identify the failed resource,
+    identify resources that completed before the failure, call out
+    partial-state, rank fixes by recovery type). Workspaces flagged
+    ``state_diverged`` also surface that in a dedicated prompt block.
 
 The model call goes through the LiteLLM Python library
 (``litellm.acompletion``). Terrapod always speaks the OpenAI Chat
@@ -41,6 +46,7 @@ import asyncio
 import datetime as dt
 import io
 import json
+import os
 import pathlib
 import subprocess
 import tarfile
@@ -48,23 +54,45 @@ import tempfile
 import uuid
 
 import litellm
+import sqlalchemy as sa
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from terrapod.config import settings
-from terrapod.db.models import PlanSummary, Run, Workspace, now_utc
+from terrapod.db.models import PlanSummary, PlanSummaryMessage, Run, Workspace, now_utc
 from terrapod.db.session import get_db_session
 from terrapod.logging_config import get_logger
 from terrapod.services.summariser_prompt import render_prompt, tool_for_kind
 from terrapod.storage import get_storage
 from terrapod.storage.keys import (
+    apply_log_key,
     config_version_key,
     plan_json_output_key,
     plan_log_key,
 )
 
 logger = get_logger(__name__)
+
+# ── LiteLLM noise + resilience ────────────────────────────────────────────────
+#
+# LiteLLM is chatty by default (an INFO "LiteLLM completion() model=…" line on
+# every call) and emits provider-debug banners on errors — pure noise in our
+# logs since we wrap every call with our own structured logging. Quiet it.
+import logging as _logging  # noqa: E402
+
+litellm.suppress_debug_info = True
+_logging.getLogger("LiteLLM").setLevel(_logging.WARNING)
+
+# Bounded retry for the model call. Bedrock (and any provider) occasionally
+# fails a connection instantly under concurrency — LiteLLM surfaces these as
+# `litellm.Timeout` with ~0s elapsed even though the model isn't slow. Almost
+# all calls succeed, so a couple of backed-off retries make the intermittent
+# blips self-heal instead of failing the (best-effort) summary and spamming the
+# log. LiteLLM retries its own transient classes (Timeout / APIConnectionError /
+# RateLimitError / InternalServerError / ServiceUnavailable); a 4xx is final and
+# not retried. Matches the "outbound calls use bounded retry" invariant.
+_LLM_NUM_RETRIES = 2  # → up to 3 attempts
 
 
 # --- Input retrieval ---------------------------------------------------------
@@ -84,18 +112,148 @@ def _truncate_tail(data: bytes, max_bytes: int) -> str:
     )
 
 
-def _truncate_head(data: bytes, max_bytes: int) -> str:
-    """Return ``data`` decoded as UTF-8, truncated from the tail.
+# Top-level plan keys that carry no information the risk rating needs; dropped
+# first when a plan is over budget (configuration is large and is background
+# only — the grounding rule forbids rating from it anyway).
+_PLAN_BACKGROUND_KEYS = ("configuration", "planned_values", "prior_state", "relevant_attributes")
+_PLAN_CHANGE_ARRAYS = ("resource_changes", "resource_drift", "drift_observed_no_apply_action")
 
-    Plan JSON's structural value is at the head — provider config and
-    resource_changes come first.
+
+def _change_skeleton(rc: dict) -> dict:
+    """address + type + name + change.actions only — the bare risk signal that
+    preserves a change's existence and action when its full body won't fit."""
+    ch = rc.get("change") if isinstance(rc.get("change"), dict) else {}
+    return {
+        "address": rc.get("address"),
+        "type": rc.get("type"),
+        "name": rc.get("name"),
+        "change": {"actions": ch.get("actions")},
+    }
+
+
+def _fit_plan_json(data: bytes, max_bytes: int) -> str:
+    """Fit cleaned plan JSON within ``max_bytes`` by LOGICAL priority, never
+    hiding a destroy.
+
+    The old code head-truncated the bytes, silently dropping the tail of
+    ``resource_changes`` — so a destroy near the end of a large plan was
+    invisible and the model summarised a plan it only half-read. Instead we keep
+    the most consequential changes in FULL and sample the routine ones, in this
+    order:
+
+        1. every destroy (delete / replace) — full detail (which resource, what
+           data) is exactly what matters most;
+        2. every create — full;
+        3. every update — full;
+        4. a bounded sample of anything else (reads / observed drift).
+
+    Each tier is added in full while budget remains; once full entries no longer
+    fit, the remaining entries are kept as address+actions skeletons so their
+    existence is never lost; only when even skeletons don't fit are the
+    lowest-priority changes summarised as a count in ``_omitted_changes``.
+    Destroys are processed first, so they are the last thing ever reduced — a
+    destroy is effectively never hidden.
     """
     if max_bytes <= 0 or len(data) <= max_bytes:
         return data.decode("utf-8", errors="replace")
-    return (
-        data[:max_bytes].decode("utf-8", errors="replace")
-        + f"\n[... {len(data) - max_bytes} bytes truncated from tail ...]"
-    )
+    try:
+        plan = json.loads(data)
+    except (json.JSONDecodeError, ValueError):
+        return data[:max_bytes].decode("utf-8", errors="replace") + "\n[... truncated ...]"
+    if not isinstance(plan, dict):
+        return data[:max_bytes].decode("utf-8", errors="replace") + "\n[... truncated ...]"
+
+    def _size(obj: object) -> int:
+        return len(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+
+    # 1) drop background blocks the risk rating never needs.
+    for k in _PLAN_BACKGROUND_KEYS:
+        plan.pop(k, None)
+    # 2) drop the verbose computed-attribute map (not a sensitive marker).
+    for ck in _PLAN_CHANGE_ARRAYS:
+        for rc in plan.get(ck) or []:
+            ch = rc.get("change") if isinstance(rc, dict) else None
+            if isinstance(ch, dict):
+                ch.pop("after_unknown", None)
+    if _size(plan) <= max_bytes:
+        return json.dumps(plan, separators=(",", ":"))
+
+    # 3) priority reduction of resource_changes (the large array; drift arrays
+    # are small and kept intact).
+    rcs = [r for r in (plan.get("resource_changes") or []) if isinstance(r, dict)]
+
+    def _acts(rc: dict) -> list:
+        return (rc.get("change") or {}).get("actions") or []
+
+    destroys = [r for r in rcs if "delete" in _acts(r)]
+    creates = [r for r in rcs if _acts(r) == ["create"]]
+    updates = [r for r in rcs if "update" in _acts(r) and "delete" not in _acts(r)]
+    seen = {id(r) for r in destroys + creates + updates}
+    other = [r for r in rcs if id(r) not in seen]
+    real = destroys + creates + updates  # every real change, in priority order
+
+    reserve = 400  # headroom for the _note / _omitted_changes appended below
+    omitted: dict[str, int] = {}
+
+    # Pass A: list EVERY real change as a skeleton first, so its existence and
+    # action are guaranteed present (a destroy is never hidden).
+    skeletons = [_change_skeleton(r) for r in real]
+    plan["resource_changes"] = skeletons
+    base = _size(plan)
+
+    if base + reserve <= max_bytes:
+        used = base
+        # Pass B: upgrade skeletons to FULL detail in priority order (destroys,
+        # then creates, then updates) while budget remains. The most
+        # consequential changes get full attributes; routine ones may stay
+        # skeletons.
+        for i, rc in enumerate(real):
+            delta = _size(rc) - _size(skeletons[i])
+            if delta > 0 and used + delta <= max_bytes - reserve:
+                plan["resource_changes"][i] = rc
+                used += delta
+        # Pass C: a bounded sample of the lowest-priority changes (reads /
+        # observed drift); count the rest.
+        sample_budget = 25
+        for rc in other:
+            sk = _change_skeleton(rc)
+            sz = _size(sk) + 1
+            if sample_budget > 0 and used + sz + reserve <= max_bytes:
+                plan["resource_changes"].append(sk)
+                used += sz
+                sample_budget -= 1
+            else:
+                key = ",".join(_acts(rc)) or "other"
+                omitted[key] = omitted.get(key, 0) + 1
+    else:
+        # Pathological: even bare skeletons of the real changes overflow. Keep
+        # them in priority order (destroys first) until the budget is spent and
+        # count the rest — so any dropped destroy is at least counted, never
+        # silently lost.
+        plan["resource_changes"] = []
+        used = _size(plan)
+        for rc in real:
+            sk = _change_skeleton(rc)
+            sz = _size(sk) + 1
+            if used + sz + reserve <= max_bytes:
+                plan["resource_changes"].append(sk)
+                used += sz
+            else:
+                key = ",".join(_acts(rc)) or "other"
+                omitted[key] = omitted.get(key, 0) + 1
+        for rc in other:
+            key = ",".join(_acts(rc)) or "other"
+            omitted[key] = omitted.get(key, 0) + 1
+
+    if omitted:
+        plan["_omitted_changes"] = omitted
+        plan["_note"] = (
+            "plan too large to show in full; changes are shown in priority "
+            "order (all destroys, then creates, then updates, then a sample of "
+            "the rest), each in full where it fits else as address+actions. "
+            "Counts of any not shown are in _omitted_changes."
+        )
+    return json.dumps(plan, separators=(",", ":"))
 
 
 def _extract_tf_sources(tarball: bytes, max_bytes: int) -> str:
@@ -308,7 +466,14 @@ def _build_code_diff(prev_tarball: bytes | None, cur_tarball: bytes, max_bytes: 
     if max_bytes <= 0 or prev_tarball is None:
         return ""
 
-    with tempfile.TemporaryDirectory(prefix="tp-aisum-diff-") as tmp:
+    # Land the extraction on the CSP-attached PVC when configured (matches
+    # cv_diff_service / vcs_archive_cache / provider_cache_service). Only .tf
+    # /.tfvars text is extracted here, so the small-file exemption applies and
+    # /tmp is acceptable too — but the PVC keeps an unexpectedly large .tf off
+    # the RAM-backed tmpfs.
+    configured = settings.vcs.tmpdir
+    diff_dir = configured if configured and os.path.isdir(configured) else None
+    with tempfile.TemporaryDirectory(prefix="tp-aisum-diff-", dir=diff_dir) as tmp:
         tmp_root = pathlib.Path(tmp)
         prev_dir = tmp_root / "previous"
         cur_dir = tmp_root / "current"
@@ -417,16 +582,28 @@ async def _gather_inputs(db: AsyncSession, run: Run, kind: str) -> tuple[str, st
         # Clean BEFORE truncation so the head-truncate budget is spent
         # on actual changes, not no-op snapshot noise.
         cleaned = await asyncio.to_thread(_clean_plan_json_bytes, raw)
-        primary = _truncate_head(cleaned, cfg.plan_json_max_bytes)
+        primary = await asyncio.to_thread(_fit_plan_json, cleaned, cfg.plan_json_max_bytes)
     else:
-        key = plan_log_key(str(run.workspace_id), str(run.id))
-        primary_label = "PLAN_LOG"
+        # failure_analysis. Choose log key by phase: apply-phase errors
+        # carry their detail in the apply log (#419). Plan-phase errors
+        # use the plan log as before. apply_started_at is the
+        # discriminator: set as soon as the apply phase begins, never
+        # unset.
+        if run.apply_started_at is not None:
+            key = apply_log_key(str(run.workspace_id), str(run.id))
+            primary_label = "APPLY_LOG"
+        else:
+            key = plan_log_key(str(run.workspace_id), str(run.id))
+            primary_label = "PLAN_LOG"
         primary_lang = "text"
         try:
             raw = await storage.get(key)
         except Exception as e:
             logger.warning(
-                "plan log not available for summariser", run_id=str(run.id), error=str(e)
+                "log not available for failure_analysis",
+                run_id=str(run.id),
+                label=primary_label,
+                error=str(e),
             )
             return "", primary_label, primary_lang, "", ""
         primary = _truncate_tail(raw, cfg.plan_json_max_bytes)
@@ -527,8 +704,106 @@ def _resolve_workspace_mode(ws: Workspace) -> bool:
 # --- Model call --------------------------------------------------------------
 
 
+def _supports_anthropic_cache_control(model: str) -> bool:
+    """Whether the model honours ``cache_control: {"type": "ephemeral"}``
+    blocks for prompt caching.
+
+    Three families take the marker:
+      - ``anthropic/<id>`` — Anthropic direct.
+      - ``bedrock/[us\\.|eu\\.]anthropic.<id>`` and any
+        ``bedrock/.*claude.*`` — Anthropic models on Bedrock.
+      - ``bedrock/[us\\.|eu\\.]amazon.nova-*`` — Amazon Nova on
+        Bedrock (Nova Pro / Lite both support the same marker).
+
+    Other providers either cache automatically given a long enough
+    repeated prefix (OpenAI direct, DeepSeek direct) or don't cache
+    at all (Gemini, Azure OpenAI on older deployments, Bedrock →
+    Llama / Mistral / Cohere, Groq, self-hosted vLLM). In both cases
+    no marker is needed; the request still works.
+
+    Detection is by model-string prefix only — same routing surface
+    LiteLLM uses to pick the provider. No live capability probing.
+    """
+    if not model:
+        return False
+    m = model.lower()
+    if m.startswith("anthropic/"):
+        return True
+    if m.startswith("bedrock/"):
+        tail = m[len("bedrock/") :]
+        # Bedrock cross-region inference prefixes its model IDs with
+        # ``us.`` / ``eu.`` / ``apac.``. Strip them so the family
+        # check below matches on the same shape as direct-region IDs.
+        for prefix in ("us.", "eu.", "apac.", "ap-southeast.", "ap-northeast."):
+            if tail.startswith(prefix):
+                tail = tail[len(prefix) :]
+                break
+        if tail.startswith("anthropic.") or "claude" in tail:
+            return True
+        if tail.startswith("amazon.nova-") or tail.startswith("nova-"):
+            return True
+    return False
+
+
+def _apply_anthropic_cache_markers(messages: list[dict]) -> list[dict]:
+    """Mark the system + initial user message for ephemeral caching.
+
+    The Anthropic / Bedrock-Anthropic / Bedrock-Nova prompt-caching
+    protocol takes plain string ``content`` and rewrites it into a
+    one-element list of content blocks with ``cache_control`` on the
+    last (and only) block. The cacheable prefix is everything up to
+    and including the marked block.
+
+    Two markers are emitted: one on the system prompt (mostly static
+    skill + style instructions) and one on the initial user message
+    (carries the plan JSON + code diff — the bulk of the prompt).
+    Everything after that — follow-up user / assistant turns — is
+    uncached and re-sent each turn, which is fine: those payloads
+    are small.
+
+    The cached prefix must be byte-identical across turns or the
+    provider hashes a different key and the cache misses. Callers
+    must not sneak per-turn timestamps / nonces into the cached
+    blocks.
+    """
+    if not messages:
+        return messages
+    out: list[dict] = []
+    seen_user = False
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        # Mark the system prompt + the FIRST user message only;
+        # subsequent user / assistant turns stay plain string and
+        # land after the cacheable prefix.
+        if role == "system" or (role == "user" and not seen_user):
+            if isinstance(content, str):
+                rewritten = dict(msg)
+                rewritten["content"] = [
+                    {
+                        "type": "text",
+                        "text": content,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+                out.append(rewritten)
+            else:
+                out.append(msg)
+            if role == "user":
+                seen_user = True
+        else:
+            out.append(msg)
+    return out
+
+
 def _build_litellm_kwargs(
-    *, kind: str, system_message: str, user_message: str, max_output_tokens: int
+    *,
+    kind: str,
+    system_message: str,
+    user_message: str,
+    max_output_tokens: int,
+    history: list[dict] | None = None,
+    use_tools: bool = True,
 ) -> dict:
     """Assemble the keyword arguments for ``litellm.acompletion``.
 
@@ -542,25 +817,52 @@ def _build_litellm_kwargs(
     passed through unconditionally — LiteLLM ignores the ones that
     don't apply to the resolved provider, so this keeps the dispatch
     table flat (no per-provider branching in Terrapod).
+
+    ``history``: optional chronologically-ordered list of
+    ``{"role": ..., "content": ...}`` dicts appended after the
+    cacheable prefix. Used by the follow-up chat path (#463) to feed
+    prior turns back to the model. The cacheable prefix (system +
+    initial user) stays first so prompt caching kicks in for every
+    turn against the same plan.
+
+    ``use_tools``: when False, omits the ``tools`` definition and
+    ``tool_choice`` from the request. Used by the chat follow-up
+    path where we want prose replies, not structured output. The
+    initial-user message still contains the prompt's "call the
+    tool" instruction — that's referring to the FIRST turn (already
+    answered as the synthesised assistant turn-0); the model handles
+    multi-turn correctly even with that instruction in the prefix.
     """
     cfg = settings.ai_summary
     auth = cfg.auth
-    tool = tool_for_kind(kind)
-    tool_name = tool["function"]["name"]
+
+    messages: list[dict] = [
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": user_message},
+    ]
+    if history:
+        messages.extend(history)
+    if _supports_anthropic_cache_control(cfg.model):
+        messages = _apply_anthropic_cache_markers(messages)
 
     kwargs: dict = {
         "model": cfg.model,
         "max_tokens": max_output_tokens,
-        "messages": [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": user_message},
-        ],
-        "tools": [tool],
+        "messages": messages,
+        "timeout": cfg.request_timeout_seconds,
+        # Self-heal transient instant-failures (see _LLM_NUM_RETRIES). LiteLLM
+        # backs off between attempts and only retries its transient classes.
+        "num_retries": _LLM_NUM_RETRIES,
+        "retry_strategy": "exponential_backoff_retry",
+    }
+
+    if use_tools:
+        tool = tool_for_kind(kind)
+        tool_name = tool["function"]["name"]
+        kwargs["tools"] = [tool]
         # Force the named tool — without this, models can choose to
         # respond in plain prose and we lose the schema guarantee.
-        "tool_choice": {"type": "function", "function": {"name": tool_name}},
-        "timeout": cfg.request_timeout_seconds,
-    }
+        kwargs["tool_choice"] = {"type": "function", "function": {"name": tool_name}}
 
     if cfg.api_base:
         kwargs["api_base"] = cfg.api_base
@@ -745,22 +1047,49 @@ def _parse_model_json(text: str) -> dict:
 # --- Trigger handler ---------------------------------------------------------
 
 
-async def _emit_ready_event(workspace_id: uuid.UUID, run_id: uuid.UUID) -> None:
+async def _emit_summary_event(
+    event: str,
+    workspace_id: uuid.UUID,
+    run_id: uuid.UUID,
+    **extra,
+) -> None:
+    """Best-effort SSE notify for the per-workspace run-events channel.
+
+    Used by every plan-summary status change so the run-detail page
+    updates without a reload (#463 phase 4):
+
+      - ``plan_summary_pending`` — handler dispatched; show spinner.
+      - ``plan_summary_ready`` — initial summary landed; render it.
+      - ``plan_summary_errored`` — initial summary failed; show error.
+      - ``plan_summary_skipped`` — initial summary skipped (budget /
+        workspace disabled / runner died); render skipped state.
+      - ``plan_summary_message_posted`` — a chat turn landed; refetch
+        the transcript so other open browsers see it.
+
+    ``extra`` keys ride the event payload — used by
+    ``plan_summary_message_posted`` to carry the new message ID for
+    callers that want to scroll-to-message.
+    """
     try:
         from terrapod.redis.client import RUN_EVENTS_PREFIX, publish_event
 
+        payload = {
+            "event": event,
+            "run_id": str(run_id),
+            "workspace_id": str(workspace_id),
+        }
+        payload.update(extra)
         await publish_event(
             f"{RUN_EVENTS_PREFIX}{workspace_id}",
-            json.dumps(
-                {
-                    "event": "plan_summary_ready",
-                    "run_id": str(run_id),
-                    "workspace_id": str(workspace_id),
-                }
-            ),
+            json.dumps(payload),
         )
     except Exception as e:  # SSE is best-effort
-        logger.debug("Failed to publish plan_summary_ready", error=str(e))
+        logger.debug("Failed to publish summary event", event_name=event, error=str(e))
+
+
+# Backwards-compat shim — existing call sites use _emit_ready_event.
+async def _emit_ready_event(workspace_id: uuid.UUID, run_id: uuid.UUID) -> None:
+    await _emit_summary_event("plan_summary_ready", workspace_id, run_id)
 
 
 async def _upsert_summary(
@@ -823,13 +1152,51 @@ async def _upsert_summary(
     await db.execute(stmt)
 
 
+def _slack_trigger_for(run, kind: str) -> str | None:
+    """Which deferred Slack event this run's *settled* AI summary should fire
+    (#556). Only the fresh-AI, always-posted events — needs_attention and
+    errored. Drift / auto-apply / plan-only return None (drift posts from its
+    own handler with a no-changes gate; the rest aren't approval events)."""
+    if kind == "failure_analysis":
+        return "run:errored"
+    if getattr(run, "is_drift_detection", False):
+        return None
+    if run.status == "planned" and not run.auto_apply and not run.plan_only:
+        return "run:needs_attention"
+    return None
+
+
 async def handle_ai_plan_summary(payload: dict) -> None:
-    """Triggered handler: summarise (or analyse the failure of) one plan.
+    """Triggered handler: summarise a plan, then fire any deferred Slack post.
 
     Payload: ``{"run_id": "<uuid>", "kind": "plan_summary" | "failure_analysis"}``.
     Enqueued from ``run_service.transition_run`` on plan-phase terminal
     transitions when the feature is globally enabled.
+
+    The deferred Slack post (#556) is fired in a ``finally`` so a slow or failed
+    model never blocks the approval message: as soon as the summary settles
+    (ready OR errored), the deferred needs_attention/errored message posts with
+    the review included.
     """
+    holder: dict = {}
+    try:
+        await _summarise_one(payload, holder)
+    finally:
+        run_stub = holder.get("run")
+        trigger = holder.get("trigger")
+        if run_stub is not None and trigger:
+            try:
+                from terrapod.services.slack_notify_service import enqueue_slack_notify
+
+                await enqueue_slack_notify(run_stub, trigger, _from_summariser=True)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("slack notify after summary failed", error=str(e))
+
+
+async def _summarise_one(payload: dict, _slack: dict) -> None:
+    """The summarisation body. Populates ``_slack`` with the deferred Slack
+    target (a run stub + trigger) as soon as the run is loaded, so the wrapper's
+    ``finally`` can post even if summarisation raises."""
     cfg = settings.ai_summary
     if not cfg.enabled:
         return
@@ -856,6 +1223,31 @@ async def handle_ai_plan_summary(payload: dict) -> None:
         if ws is None:
             return
 
+        # Capture the deferred Slack target now, while the run is loaded and
+        # fresh, so the wrapper's `finally` can post regardless of how
+        # summarisation ends (#556).
+        from types import SimpleNamespace
+
+        _slack["run"] = SimpleNamespace(id=str(run.id), workspace_id=str(run.workspace_id))
+        _slack["trigger"] = _slack_trigger_for(run, kind)
+
+        # Upsert a `pending` row + emit `plan_summary_pending` so the UI
+        # shows a placeholder from the moment the handler starts (#463
+        # phase 4). Without this the run-detail page silently 404s on
+        # /plan-summary until the handler finishes, leaving users
+        # wondering if anything is happening. Every exit path below
+        # transitions this row to its terminal state and emits the
+        # matching event.
+        await _upsert_summary(
+            db,
+            run_id=run_id,
+            kind=kind,
+            status="pending",
+            model=cfg.model,
+        )
+        await db.commit()
+        await _emit_summary_event("plan_summary_pending", ws.id, run_id)
+
         # Skip summarisation when the runner died abnormally (#430). The plan
         # log + JSON upload happens AFTER the runner posts plan-result, so an
         # OOM / SIGKILL between those steps leaves us with an empty log + the
@@ -873,6 +1265,7 @@ async def handle_ai_plan_summary(payload: dict) -> None:
                 error_message=f"runner exited abnormally ({run.runner_exit_status})",
             )
             await db.commit()
+            await _emit_summary_event("plan_summary_skipped", ws.id, run_id)
             return
 
         if not _resolve_workspace_mode(ws):
@@ -884,6 +1277,7 @@ async def handle_ai_plan_summary(payload: dict) -> None:
                 error_message="workspace disabled",
             )
             await db.commit()
+            await _emit_summary_event("plan_summary_skipped", ws.id, run_id)
             return
 
         remaining = await _budget_remaining()
@@ -897,7 +1291,7 @@ async def handle_ai_plan_summary(payload: dict) -> None:
                 error_message="daily token budget exhausted",
             )
             await db.commit()
-            await _emit_ready_event(ws.id, run_id)
+            await _emit_summary_event("plan_summary_skipped", ws.id, run_id)
             return
 
         primary, label, lang, code_context, code_diff = await _gather_inputs(db, run, kind)
@@ -910,6 +1304,7 @@ async def handle_ai_plan_summary(payload: dict) -> None:
                 error_message=f"no {label} available",
             )
             await db.commit()
+            await _emit_summary_event("plan_summary_errored", ws.id, run_id)
             return
 
         system_message, user_message = render_prompt(
@@ -923,6 +1318,8 @@ async def handle_ai_plan_summary(payload: dict) -> None:
             code_diff=code_diff,
             prompt_prefix=cfg.context.prompt_prefix,
             prompt_suffix=cfg.context.prompt_suffix,
+            state_diverged=bool(ws.state_diverged),
+            drift_detection=bool(run.is_drift_detection),
         )
 
         try:
@@ -948,6 +1345,7 @@ async def handle_ai_plan_summary(payload: dict) -> None:
                 error_message=str(e)[:500],
             )
             await db.commit()
+            await _emit_summary_event("plan_summary_errored", ws.id, run_id)
             return
 
         description = str(parsed.get("description", ""))[:50_000]
@@ -1022,3 +1420,339 @@ async def handle_ai_plan_summary(payload: dict) -> None:
         in_tok=in_tok,
         out_tok=out_tok,
     )
+
+
+# ── Follow-up chat (#463) ───────────────────────────────────────────────────
+
+
+class FollowupError(Exception):
+    """Raised by ``post_followup`` for any path the caller must surface
+    to the operator (router maps these to HTTP 4xx / 5xx). Pure-domain
+    so the service doesn't import FastAPI types."""
+
+
+class FollowupDisabled(FollowupError):
+    """Chat globally off (``ai_summary.enabled=False`` or
+    ``followup_max_messages_per_run=0``) or workspace disabled."""
+
+
+class FollowupCapReached(FollowupError):
+    """Run already has ``followup_max_messages_per_run`` user turns."""
+
+
+class FollowupBudgetExhausted(FollowupError):
+    """Daily AI token budget hit before this turn could run."""
+
+
+async def _build_followup_history(
+    db: AsyncSession,
+    plan_summary: PlanSummary,
+    new_user_text: str,
+) -> list[dict]:
+    """Return the chat history to append AFTER the cacheable
+    (system + initial-user) prefix.
+
+    Layout:
+      [0]            assistant — initial summary description (text)
+      [1..2N]        prior user / assistant follow-up turns from
+                     ``plan_summary_messages`` in chronological order
+      [last]         the just-posted user message (caller hasn't
+                     committed it yet)
+
+    The initial summary description is rendered as a plain assistant
+    text turn rather than synthesising an OpenAI tool_call object —
+    keeps history simple, model handles the prose-vs-tool flip fine
+    once ``tool_choice`` is omitted from the request. Risk factors are
+    deliberately NOT replayed in history; follow-ups rarely need them
+    and inflating tokens would defeat the budget gate.
+    """
+
+    history: list[dict] = []
+    if plan_summary.description:
+        history.append({"role": "assistant", "content": plan_summary.description})
+
+    # Mode-switch framing turn. The cacheable prefix's last line tells
+    # the model "Now call the submit_plan_summary tool exactly once
+    # with your structured answer." Without an explicit hand-off, the
+    # model reads any subsequent user turn as off-task and refuses
+    # ("I don't answer questions like that — my role here is limited
+    # to ... submitting a single structured summary via the tool. I've
+    # already done that for this plan."). This synthesised
+    # user/assistant exchange establishes follow-up mode — prose
+    # replies, no further tool calls — and sits AFTER the cache marker
+    # so prompt caching still hits.
+    history.append(
+        {
+            "role": "user",
+            "content": (
+                "Thanks. The structured summary above has been recorded "
+                "via the tool. From here on I'd like to ask follow-up "
+                "questions about the plan in plain prose — no more tool "
+                "calls. Please answer concisely, grounded in the plan "
+                "JSON, code, and diff already provided. If a question "
+                "asks for information that isn't in the materials I "
+                "shared, say so rather than guessing."
+            ),
+        }
+    )
+    history.append(
+        {
+            "role": "assistant",
+            "content": (
+                "Understood. I'll answer follow-up questions in prose "
+                "based on the plan and the code I've already reviewed. "
+                "What would you like to know?"
+            ),
+        }
+    )
+
+    prior = (
+        (
+            await db.execute(
+                sa.select(PlanSummaryMessage)
+                .where(PlanSummaryMessage.plan_summary_id == plan_summary.id)
+                .order_by(PlanSummaryMessage.created_at, PlanSummaryMessage.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for msg in prior:
+        # Skip assistant rows that errored — they have empty content
+        # and would just confuse the model. User rows always pass
+        # through so the model sees the question they're answering.
+        if msg.role == "assistant" and not msg.content.strip():
+            continue
+        history.append({"role": msg.role, "content": msg.content})
+
+    history.append({"role": "user", "content": new_user_text})
+    return history
+
+
+async def _call_chat_model(
+    *,
+    system_message: str,
+    user_message: str,
+    history: list[dict],
+    max_output_tokens: int,
+) -> tuple[str, int, int]:
+    """Drive a prose completion via the LiteLLM library.
+
+    No tools, no tool_choice — follow-ups are text-in / text-out.
+    Reuses ``_build_litellm_kwargs`` so the cacheable prefix gets the
+    same ``cache_control: ephemeral`` markers the initial summary
+    used; the provider's prompt cache amortises plan-context cost
+    across every follow-up.
+
+    ``kind`` is irrelevant when ``use_tools=False`` (the tool
+    definition isn't included in the request); we pass
+    ``"plan_summary"`` for shape only.
+
+    Returns ``(reply_text, input_tokens, output_tokens)``. Raises on
+    HTTP failure / truncation / empty response.
+    """
+    cfg = settings.ai_summary
+    if not cfg.model:
+        raise RuntimeError("ai_summary.model must be set")
+
+    resp = await litellm.acompletion(
+        **_build_litellm_kwargs(
+            kind="plan_summary",
+            system_message=system_message,
+            user_message=user_message,
+            max_output_tokens=max_output_tokens,
+            history=history,
+            use_tools=False,
+        )
+    )
+
+    if not resp.choices:
+        raise RuntimeError("model response had no choices")
+    choice = resp.choices[0]
+    finish_reason = getattr(choice, "finish_reason", None)
+    if finish_reason == "length":
+        raise RuntimeError(
+            f"chat reply truncated at max_output_tokens={max_output_tokens} "
+            "(finish_reason=length); raise ai_summary.followup_max_output_tokens"
+        )
+
+    text = (getattr(choice.message, "content", "") or "").strip()
+    if not text:
+        raise RuntimeError("chat reply was empty")
+
+    usage = getattr(resp, "usage", None)
+    in_tok = int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0
+    out_tok = int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0
+    return text, in_tok, out_tok
+
+
+async def post_followup(
+    *,
+    db: AsyncSession,
+    plan_summary: PlanSummary,
+    run: Run,
+    workspace: Workspace,
+    user_message_text: str,
+) -> PlanSummaryMessage:
+    """Process a single user follow-up turn (#463).
+
+    The router has already authorised the request and loaded the
+    PlanSummary / Run / Workspace rows. This function:
+
+      1. Validates feature flags + per-run cap + daily budget.
+      2. Persists the user turn (so it's visible even if the model
+         call fails — gives the operator a record of what they
+         asked).
+      3. Calls the model with the SAME cacheable prefix the initial
+         summary used (so caching providers serve the prefix hit).
+      4. Persists the assistant turn + telemetry, debits the daily
+         budget, commits.
+
+    Returns the persisted assistant ``PlanSummaryMessage`` row.
+
+    Raises:
+      FollowupDisabled — chat off (global / workspace), 403/503 surface
+      FollowupCapReached — per-run user-turn cap hit, 409 surface
+      FollowupBudgetExhausted — daily token budget hit, 429 surface
+      RuntimeError / ValueError — model HTTP / parse failures; the
+        router maps these to 502 and the user row has already been
+        committed so the failure is visible in the transcript with
+        an errored assistant row recorded too.
+    """
+
+    cfg = settings.ai_summary
+    if not cfg.enabled or cfg.followup_max_messages_per_run <= 0:
+        raise FollowupDisabled("AI follow-up chat is disabled")
+    if not _resolve_workspace_mode(workspace):
+        raise FollowupDisabled("AI summary is disabled for this workspace")
+
+    text = (user_message_text or "").strip()
+    if not text:
+        raise FollowupError("message body is empty")
+    # 32 KiB hard cap on a single user turn — defends the DB column
+    # and the model's context from a paste-bomb. Generous enough that
+    # operators pasting a log excerpt are fine.
+    if len(text) > 32 * 1024:
+        raise FollowupError("message body exceeds 32 KiB")
+
+    # Per-run user-turn cap. Counts USER rows only — assistant rows
+    # don't count, otherwise the cap halves silently.
+    user_count = (
+        await db.execute(
+            sa.select(sa.func.count())
+            .select_from(PlanSummaryMessage)
+            .where(
+                PlanSummaryMessage.plan_summary_id == plan_summary.id,
+                PlanSummaryMessage.role == "user",
+            )
+        )
+    ).scalar() or 0
+    if user_count >= cfg.followup_max_messages_per_run:
+        raise FollowupCapReached(
+            f"reached the {cfg.followup_max_messages_per_run}-message cap for this run"
+        )
+
+    # Daily token budget. Same accounting as the initial summary —
+    # output_tokens against the workspace's daily allowance.
+    remaining = await _budget_remaining()
+    if remaining is not None and remaining <= 0:
+        raise FollowupBudgetExhausted("daily AI token budget exhausted")
+
+    # Persist the user row first so an operator sees their question
+    # even if the model call fails downstream.
+    user_row = PlanSummaryMessage(
+        plan_summary_id=plan_summary.id,
+        role="user",
+        content=text,
+    )
+    db.add(user_row)
+    await db.flush()
+
+    # Build the cacheable prefix — SAME inputs the initial summary
+    # used, so the provider's prompt cache serves the prefix hit.
+    primary, label, lang, code_context, code_diff = await _gather_inputs(db, run, plan_summary.kind)
+    if not primary:
+        # The CV/log was GC'd or never existed. Record an errored
+        # assistant row so the transcript is uniform, commit, surface.
+        err = f"no {label} available to ground the follow-up"
+        assistant_row = PlanSummaryMessage(
+            plan_summary_id=plan_summary.id,
+            role="assistant",
+            content="",
+            model=cfg.model,
+            error_message=err,
+        )
+        db.add(assistant_row)
+        await db.commit()
+        raise FollowupError(err)
+
+    system_message, initial_user_message = render_prompt(
+        kind=plan_summary.kind,
+        fleet_context=cfg.context.fleet_context,
+        workspace_context=workspace.ai_summary_context,
+        primary_input=primary,
+        primary_input_label=label,
+        primary_input_lang=lang,
+        code_context_truncated=code_context,
+        code_diff=code_diff,
+        prompt_prefix=cfg.context.prompt_prefix,
+        prompt_suffix=cfg.context.prompt_suffix,
+        state_diverged=bool(workspace.state_diverged),
+    )
+    history = await _build_followup_history(db, plan_summary, text)
+
+    try:
+        reply_text, in_tok, out_tok = await _call_chat_model(
+            system_message=system_message,
+            user_message=initial_user_message,
+            history=history,
+            max_output_tokens=cfg.followup_max_output_tokens,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "AI follow-up call failed",
+            plan_summary_id=str(plan_summary.id),
+            run_id=str(run.id),
+            error=str(e),
+        )
+        assistant_row = PlanSummaryMessage(
+            plan_summary_id=plan_summary.id,
+            role="assistant",
+            content="",
+            model=cfg.model,
+            error_message=str(e)[:500],
+        )
+        db.add(assistant_row)
+        await db.commit()
+        raise
+
+    assistant_row = PlanSummaryMessage(
+        plan_summary_id=plan_summary.id,
+        role="assistant",
+        content=reply_text,
+        model=cfg.model,
+        input_tokens=in_tok,
+        output_tokens=out_tok,
+    )
+    db.add(assistant_row)
+    await _budget_charge(out_tok)
+    await db.commit()
+
+    # SSE so other open browsers viewing this run pick up the new
+    # turn without a reload. `message_id` lets the client scroll-to.
+    await _emit_summary_event(
+        "plan_summary_message_posted",
+        workspace.id,
+        run.id,
+        message_id=str(assistant_row.id),
+    )
+
+    logger.info(
+        "AI follow-up reply",
+        plan_summary_id=str(plan_summary.id),
+        run_id=str(run.id),
+        in_tok=in_tok,
+        out_tok=out_tok,
+        user_turn=user_count + 1,
+    )
+    return assistant_row

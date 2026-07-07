@@ -90,6 +90,7 @@ docker_build(
     live_update=[
         sync('./services/terrapod/config.py', '/app/terrapod/config.py'),
         sync('./services/terrapod/logging_config.py', '/app/terrapod/logging_config.py'),
+        sync('./services/terrapod/http_retry.py', '/app/terrapod/http_retry.py'),
         sync('./services/terrapod/runner', '/app/terrapod/runner'),
     ],
 )
@@ -101,7 +102,7 @@ docker_build(
     dockerfile='docker/Dockerfile.migrations',
 )
 
-# Runner Job image (Alpine + curl/tar/jq, signal-forwarding entrypoint)
+# Runner Job image (python:3.13-slim, pure-Python orchestrator).
 # Built as a local_resource (not docker_build) because the runner image is
 # referenced in the runners.yaml ConfigMap, not in a pod spec — Tilt's image
 # injection doesn't apply.  values-local.yaml sets terrapod-runner:local with
@@ -109,7 +110,19 @@ docker_build(
 local_resource(
     'build-runner-image',
     cmd='docker build -f docker/Dockerfile.runner -t terrapod-runner:local .',
-    deps=['docker/Dockerfile.runner', 'docker/runner-entrypoint.sh'],
+    deps=[
+        'docker/Dockerfile.runner',
+        'services/pyproject-runner.toml',
+        'services/terrapod/http_retry.py',
+        'services/terrapod/runner/__init__.py',
+        'services/terrapod/runner/runner_config.py',
+        'services/terrapod/runner/download.py',
+        'services/terrapod/runner/exec_subprocess.py',
+        'services/terrapod/runner/lock_extender.py',
+        'services/terrapod/runner/plan_artifacts.py',
+        'services/terrapod/runner/job_entrypoint.py',
+        'services/terrapod/runner/phases',
+    ],
     labels=['build'],
 )
 
@@ -140,111 +153,15 @@ docker_build(
 #
 # Redis is *deliberately* left ephemeral below — sessions, listener
 # heartbeats, and scheduler locks should reset on Tilt restart.
-k8s_yaml(blob("""
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: terrapod-postgresql-data
-  namespace: terrapod
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 2Gi
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: terrapod-postgresql
-  namespace: terrapod
-spec:
-  replicas: 1
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      app: terrapod-postgresql
-  template:
-    metadata:
-      labels:
-        app: terrapod-postgresql
-    spec:
-      containers:
-        - name: postgres
-          image: postgres:16-alpine
-          ports:
-            - containerPort: 5432
-          env:
-            - name: POSTGRES_USER
-              value: terrapod
-            - name: POSTGRES_PASSWORD
-              value: terrapod
-            - name: POSTGRES_DB
-              value: terrapod
-            # PVC's mount point is `/var/lib/postgresql/data`, which
-            # postgres's official entrypoint also wants to populate with
-            # config; point the actual DB cluster into a subdirectory so
-            # the lost+found dir at the PVC root doesn't confuse initdb.
-            - name: PGDATA
-              value: /var/lib/postgresql/data/pgdata
-          volumeMounts:
-            - name: data
-              mountPath: /var/lib/postgresql/data
-      volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: terrapod-postgresql-data
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: terrapod-postgresql
-  namespace: terrapod
-spec:
-  selector:
-    app: terrapod-postgresql
-  ports:
-    - port: 5432
-      targetPort: 5432
-"""))
-
-# Redis for local development
-k8s_yaml(blob("""
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: terrapod-redis
-  namespace: terrapod
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: terrapod-redis
-  template:
-    metadata:
-      labels:
-        app: terrapod-redis
-    spec:
-      containers:
-        - name: redis
-          image: redis:7-alpine
-          ports:
-            - containerPort: 6379
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: terrapod-redis
-  namespace: terrapod
-spec:
-  selector:
-    app: terrapod-redis
-  ports:
-    - port: 6379
-      targetPort: 6379
-"""))
-
+# PostgreSQL + Redis are deployed by the Helm chart itself now
+# (postgresql.deploy / redis.deploy = true in values-local.yaml), so the Tilt
+# dev loop and the `make eval` kind/k3d quickstart share ONE batteries-included
+# datastore path instead of maintaining a separate copy here. Postgres keeps a
+# PVC (persists across restarts via embedded.persistence); Redis is ephemeral.
+#
+# These resources come through helm() below. Tilt does NOT execute helm hook
+# ordering, so the migrations→Postgres and api→migrations sequencing is enforced
+# by the resource_deps wired further down (unchanged — same resource names).
 k8s_resource('terrapod-postgresql', labels=['infra'])
 k8s_resource('terrapod-redis', labels=['infra'])
 
@@ -316,32 +233,16 @@ k8s_resource(
     links=[link('https://terrapod.local', 'Terrapod')],
 )
 
-# Dev pool setup — creates pool + join token via the API pod's bootstrap script.
-# Idempotent: skips if pool already exists.
-local_resource(
-    'setup-dev-pool',
-    cmd='''
-echo "Waiting for API pod to be ready..."
-kubectl -n terrapod wait --for=condition=Ready pod -l app.kubernetes.io/name=terrapod,app.kubernetes.io/component=api --timeout=120s
-
-echo "Creating dev pool + join token..."
-kubectl -n terrapod exec deploy/terrapod-api -- env \
-    DATABASE_URL="postgresql+asyncpg://terrapod:terrapod@terrapod-postgresql:5432/terrapod" \
-    TERRAPOD_BOOTSTRAP_ADMIN_EMAIL=admin \
-    TERRAPOD_BOOTSTRAP_ADMIN_PASSWORD=admin \
-    TERRAPOD_BOOTSTRAP_POOL_NAME=dev \
-    TERRAPOD_BOOTSTRAP_POOL_TOKEN=dev-join-token-do-not-use-in-prod \
-    python -m terrapod.cli.bootstrap
-''',
-    labels=['setup'],
-    resource_deps=['terrapod-api'],
-)
-
-# Runner Listener (uses same image as API, needs dev pool)
+# Runner Listener (uses same image as API). The agent pool + join token are
+# created by the chart's bootstrap Job (terrapod-bootstrap-1), driven by
+# `bootstrap.poolName` / `bootstrap.poolToken` in values-local.yaml — the SAME
+# mechanism the kind/k3d eval profile uses (values-eval.yaml). The listener joins
+# that pool with the matching `listener.joinToken`, so it depends on the bootstrap
+# Job (pool must exist) and the API (the join target). No separate pool-setup step.
 k8s_resource(
     'terrapod-listener',
     labels=['backend'],
-    resource_deps=['setup-dev-pool'],
+    resource_deps=['terrapod-bootstrap-1', 'terrapod-api'],
 )
 
 # ─────────────────────────────────────────────────────────────────────────────

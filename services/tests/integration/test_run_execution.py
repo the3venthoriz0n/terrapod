@@ -375,6 +375,112 @@ class TestClaimRun:
         _, listener_id = setup
         assert await _claim_run(client, listener_id) is None
 
+    async def test_claim_run_delivers_vars_payload(self, app, client, setup):
+        """next_run returns terraform-vars carrying `hcl` (never `sensitive`) + env-vars.
+
+        The runner consumes `hcl` to render terrapod.auto.tfvars (raw expression
+        vs quoted string). Sensitivity is NOT part of the runner contract — all
+        terraform vars, sensitive or not, are delivered uniformly via the per-run
+        vars Secret — so `sensitive` must not leak into this payload, and the
+        sensitive value IS delivered (the runner needs it; the Secret, not
+        masking, is what protects it).
+        """
+        pool_id, listener_id = setup
+        ws_id = await _create_remote_workspace(client, pool_id, "vars-payload-ws")
+
+        async def _add_var(key, value, category, *, sensitive=False, hcl=False):
+            resp = await client.post(
+                f"/api/v2/workspaces/{ws_id}/vars",
+                json={
+                    "data": {
+                        "type": "vars",
+                        "attributes": {
+                            "key": key,
+                            "value": value,
+                            "category": category,
+                            "sensitive": sensitive,
+                            "hcl": hcl,
+                        },
+                    }
+                },
+                headers=AUTH,
+            )
+            assert resp.status_code == 201, resp.text
+
+        await _add_var("ports", "[80, 443]", "terraform", hcl=True)
+        await _add_var("secret", "s3cr3t", "terraform", sensitive=True)
+        await _add_var("MY_ENV", "envval", "env")
+
+        await _create_run(client, ws_id)
+        result = await _claim_run(client, listener_id)
+        assert result is not None
+        data, _ = result
+
+        tvars = {v["key"]: v for v in data["attributes"]["terraform-vars"]}
+        assert set(tvars) == {"ports", "secret"}
+        for v in tvars.values():
+            assert "hcl" in v
+            assert "sensitive" not in v  # dead field removed
+        assert tvars["ports"]["hcl"] is True
+        assert tvars["secret"]["hcl"] is False
+        assert tvars["secret"]["value"] == "s3cr3t"  # sensitive value delivered
+
+        env = {v["key"]: v for v in data["attributes"]["env-vars"]}
+        assert env["MY_ENV"]["value"] == "envval"
+
+    async def test_execution_hooks_killswitch_enforced_server_side(
+        self, app, client, setup, monkeypatch
+    ):
+        """The API serves NO execution hooks when the kill-switch is off (#678),
+        so a listener that ignores the flag still never receives a hook script.
+        Enabled (default) delivers the associated hook; disabled delivers []."""
+        from types import SimpleNamespace
+
+        pool_id, listener_id = setup
+
+        async def _mk_hook_ws(suffix):
+            ws_id = await _create_remote_workspace(client, pool_id, f"hook-ks-{suffix}")
+            r = await client.post(
+                "/api/terrapod/v1/execution-hooks",
+                json={
+                    "data": {
+                        "type": "execution-hooks",
+                        "attributes": {
+                            "name": f"ks-{suffix}",
+                            "hook-point": "pre_init",
+                            "script": "echo hi",
+                        },
+                    }
+                },
+                headers=AUTH,
+            )
+            assert r.status_code == 201, r.text
+            hook_id = r.json()["data"]["id"]
+            r = await client.post(
+                f"/api/terrapod/v1/execution-hooks/{hook_id}/relationships/workspaces",
+                json={"data": [{"id": ws_id, "type": "workspaces"}]},
+                headers=AUTH,
+            )
+            assert r.status_code == 204, r.text
+            return ws_id
+
+        # Enabled (default): the associated hook is delivered to the runner.
+        ws_on = await _mk_hook_ws("on")
+        await _create_run(client, ws_on)
+        data_on, _ = await _claim_run(client, listener_id)
+        assert len(data_on["attributes"]["execution-hooks"]) == 1
+
+        # Kill-switch off: the API serves no hooks even though one is associated.
+        from terrapod import config as _cfg
+
+        monkeypatch.setattr(
+            _cfg, "load_runner_config", lambda *a, **k: SimpleNamespace(hooks_enabled=False)
+        )
+        ws_off = await _mk_hook_ws("off")
+        await _create_run(client, ws_off)
+        data_off, _ = await _claim_run(client, listener_id)
+        assert data_off["attributes"]["execution-hooks"] == []
+
 
 class TestPlanOnlyLifecycle:
     async def test_plan_only_full_lifecycle(self, app, client, setup):
@@ -598,3 +704,439 @@ class TestStateUpload:
         sv = versions[0]
         assert sv["attributes"]["serial"] == 1
         assert sv["attributes"]["lineage"] == "e2e-test-lineage"
+
+
+class TestSupersedeStaleRuns:
+    """Auto-discard of superseded apply-capable (plan+apply) runs.
+
+    A newer apply-capable run on a workspace makes older un-applied
+    apply-capable runs stale: `planned` runs awaiting confirmation are
+    discarded and `pending`/`queued` runs are canceled, so the newest run is
+    the one that proceeds. In-flight execution (`confirmed`/`applying`) is
+    never superseded, and plan-only runs neither supersede nor are superseded.
+    These run against real Postgres/Redis through the real run state machine —
+    confirming the behaviour, not just that a helper is called.
+    """
+
+    async def test_newer_run_discards_stale_planned(self, app, client, setup):
+        """A planned run awaiting confirmation is discarded when a newer
+        apply-capable run is queued behind it."""
+        pool_id, listener_id = setup
+        ws_id = await _create_remote_workspace(client, pool_id, "supersede-planned")
+
+        # Run A → planned, awaiting manual confirm.
+        run_a = await _create_run(client, ws_id)
+        run_a_id = run_a["id"]
+        await _run_plan_lifecycle(client, listener_id, run_a_id)
+        assert (await _get_run(client, run_a_id))["attributes"]["status"] == "planned"
+
+        # Run B queued behind it supersedes A.
+        run_b = await _create_run(client, ws_id, message="newer")
+        run_b_id = run_b["id"]
+
+        a_after = await _get_run(client, run_a_id)
+        assert a_after["attributes"]["status"] == "discarded"
+        assert "superseded" in a_after["attributes"]["message"].lower()
+        assert (await _get_run(client, run_b_id))["attributes"]["status"] not in (
+            "discarded",
+            "canceled",
+        )
+
+    async def test_plan_only_run_does_not_supersede(self, app, client, setup):
+        """A newer plan-only run must NOT discard an older planned apply run
+        (plan-only runs are safe to run concurrently)."""
+        pool_id, listener_id = setup
+        ws_id = await _create_remote_workspace(client, pool_id, "supersede-planonly")
+
+        run_a = await _create_run(client, ws_id)
+        run_a_id = run_a["id"]
+        await _run_plan_lifecycle(client, listener_id, run_a_id)
+        assert (await _get_run(client, run_a_id))["attributes"]["status"] == "planned"
+
+        # A plan-only run is not an apply-capable superseder.
+        await _create_run(client, ws_id, **{"plan-only": True}, message="speculative")
+        assert (await _get_run(client, run_a_id))["attributes"]["status"] == "planned"
+
+    async def test_newer_run_cancels_stale_queued(self, app, client, setup):
+        """Older queued (never-planned) runs are canceled by a newer run."""
+        pool_id, listener_id = setup
+        ws_id = await _create_remote_workspace(client, pool_id, "supersede-queued")
+
+        run_a = await _create_run(client, ws_id)
+        run_a_id = run_a["id"]
+        assert (await _get_run(client, run_a_id))["attributes"]["status"] == "queued"
+
+        run_b = await _create_run(client, ws_id, message="newer")
+        run_b_id = run_b["id"]
+
+        assert (await _get_run(client, run_a_id))["attributes"]["status"] == "canceled"
+        assert (await _get_run(client, run_b_id))["attributes"]["status"] == "queued"
+
+    async def test_in_flight_confirmed_run_not_superseded(self, app, client, setup):
+        """A confirmed (apply-committed) run is NOT discarded by a newer run."""
+        pool_id, listener_id = setup
+        ws_id = await _create_remote_workspace(client, pool_id, "supersede-confirmed")
+
+        run_a = await _create_run(client, ws_id)
+        run_a_id = run_a["id"]
+        await _run_plan_lifecycle(client, listener_id, run_a_id)
+        resp = await client.post(f"/api/v2/runs/{run_a_id}/actions/apply", headers=AUTH)
+        assert resp.status_code == 200
+        assert (await _get_run(client, run_a_id))["attributes"]["status"] == "confirmed"
+
+        await _create_run(client, ws_id, message="newer")
+
+        # Committed apply intent must survive — never auto-discarded.
+        assert (await _get_run(client, run_a_id))["attributes"]["status"] == "confirmed"
+
+    async def test_planning_race_run_born_superseded(self, app, client, setup):
+        """A run that finishes planning only to find a newer run already
+        waiting is discarded on reaching `planned` (closes the race the
+        queued-time supersede can't see)."""
+        pool_id, listener_id = setup
+        ws_id = await _create_remote_workspace(client, pool_id, "supersede-race")
+
+        run_a = await _create_run(client, ws_id)
+        run_a_id = run_a["id"]
+
+        # Claim A → it is now `planning` (NOT yet superseded — in-flight).
+        result = await _claim_run(client, listener_id)
+        assert result is not None and result[0]["id"] == run_a_id
+        assert (await _get_run(client, run_a_id))["attributes"]["status"] == "planning"
+
+        # Newer run B queues while A is still planning — A is not yet touched.
+        run_b = await _create_run(client, ws_id, message="newer")
+        run_b_id = run_b["id"]
+        assert (await _get_run(client, run_a_id))["attributes"]["status"] == "planning"
+
+        # Finish A's plan. On reaching `planned` it finds B waiting → discarded.
+        runner_token = await _get_runner_token(client, listener_id, run_a_id)
+        await _report_job_launched(client, listener_id, run_a_id)
+        assert (
+            await _upload_artifact(client, run_a_id, "plan-log", FAKE_PLAN_LOG, runner_token) == 204
+        )
+        assert (
+            await _upload_artifact(client, run_a_id, "plan-file", FAKE_PLAN_FILE, runner_token)
+            == 204
+        )
+        await _report_job_status(client, listener_id, run_a_id, "plan", "succeeded")
+        from terrapod.services.run_reconciler import reconcile_runs
+
+        await reconcile_runs()
+
+        assert (await _get_run(client, run_a_id))["attributes"]["status"] == "discarded"
+        assert (await _get_run(client, run_b_id))["attributes"]["status"] not in (
+            "discarded",
+            "canceled",
+        )
+
+    async def test_supersede_is_per_workspace(self, app, client, setup):
+        """A newer run on one workspace must not touch runs on another."""
+        pool_id, listener_id = setup
+        ws1 = await _create_remote_workspace(client, pool_id, "supersede-ws1")
+        ws2 = await _create_remote_workspace(client, pool_id, "supersede-ws2")
+
+        run1 = await _create_run(client, ws1)
+        run1_id = run1["id"]
+        await _run_plan_lifecycle(client, listener_id, run1_id)
+        assert (await _get_run(client, run1_id))["attributes"]["status"] == "planned"
+
+        # A run on ws2 must not supersede ws1's planned run.
+        await _create_run(client, ws2, message="other-workspace")
+        assert (await _get_run(client, run1_id))["attributes"]["status"] == "planned"
+
+
+async def _lock_workspace(client, ws_id: str) -> None:
+    resp = await client.post(f"/api/v2/workspaces/{ws_id}/actions/lock", headers=AUTH)
+    assert resp.status_code == 200, resp.text
+
+
+async def _unlock_workspace(client, ws_id: str) -> None:
+    resp = await client.post(f"/api/v2/workspaces/{ws_id}/actions/unlock", headers=AUTH)
+    assert resp.status_code == 200, resp.text
+
+
+class TestRunSerializationAndLocking:
+    """Per-workspace serialization of apply-capable runs + manual-lock gating.
+
+    Only one plan+apply run executes per workspace at a time; a newer one waits
+    until the in-flight one is terminal. Plan-only runs run concurrently and
+    ignore the lock. A manual workspace lock blocks apply-capable runs from
+    starting and blocks confirm, but not plan-only runs. Driven through the
+    real dispatcher + Postgres row-locking — this is the concurrency guarantee
+    that mocked tests cannot prove.
+    """
+
+    async def test_apply_capable_runs_serialize_per_workspace(self, app, client, setup):
+        """A second apply-capable run cannot start while the first is applying;
+        it starts only once the first reaches a terminal state."""
+        pool_id, listener_id = setup
+        ws_id = await _create_remote_workspace(client, pool_id, "serialize-ws", auto_apply=True)
+
+        # Run A → confirmed (auto-apply), then claim its apply → `applying`.
+        run_a = await _create_run(client, ws_id)
+        run_a_id = run_a["id"]
+        runner_token = await _run_plan_lifecycle(client, listener_id, run_a_id)
+        assert (await _get_run(client, run_a_id))["attributes"]["status"] == "confirmed"
+        result = await _claim_run(client, listener_id)
+        assert result is not None and result[1] == "apply" and result[0]["id"] == run_a_id
+        assert (await _get_run(client, run_a_id))["attributes"]["status"] == "applying"
+
+        # Newer apply-capable run B queues — A is in-flight, so not superseded.
+        run_b = await _create_run(client, ws_id, message="newer")
+        run_b_id = run_b["id"]
+        assert (await _get_run(client, run_a_id))["attributes"]["status"] == "applying"
+
+        # Serialization: nothing claimable while A applies (B's plan is gated).
+        assert await _claim_run(client, listener_id) is None
+
+        # Finish A's apply.
+        await _report_job_launched(client, listener_id, run_a_id)
+        assert (
+            await _upload_artifact(client, run_a_id, "apply-log", FAKE_APPLY_LOG, runner_token)
+            == 204
+        )
+        assert await _upload_artifact(client, run_a_id, "state", FAKE_STATE, runner_token) == 204
+        await _report_job_status(client, listener_id, run_a_id, "apply", "succeeded")
+        from terrapod.services.run_reconciler import reconcile_runs
+
+        await reconcile_runs()
+        assert (await _get_run(client, run_a_id))["attributes"]["status"] == "applied"
+
+        # Now B can start.
+        result = await _claim_run(client, listener_id)
+        assert result is not None and result[0]["id"] == run_b_id and result[1] == "plan"
+
+    async def test_plan_only_run_starts_alongside_in_flight_apply(self, app, client, setup):
+        """A plan-only run is claimable even while an apply-capable run is
+        in flight on the same workspace (plan-only is concurrency-safe)."""
+        pool_id, listener_id = setup
+        ws_id = await _create_remote_workspace(
+            client, pool_id, "serialize-planonly", auto_apply=True
+        )
+
+        run_a = await _create_run(client, ws_id)
+        run_a_id = run_a["id"]
+        await _run_plan_lifecycle(client, listener_id, run_a_id)
+        result = await _claim_run(client, listener_id)  # claim apply → applying
+        assert result is not None and result[1] == "apply"
+        assert (await _get_run(client, run_a_id))["attributes"]["status"] == "applying"
+
+        # Plan-only run C is NOT gated by A's in-flight apply.
+        run_c = await _create_run(client, ws_id, **{"plan-only": True}, message="speculative")
+        run_c_id = run_c["id"]
+        result = await _claim_run(client, listener_id)
+        assert result is not None and result[0]["id"] == run_c_id and result[1] == "plan"
+
+    async def test_manual_lock_blocks_apply_capable_claim(self, app, client, setup):
+        """A manually locked workspace will not start an apply-capable run;
+        unlocking lets it proceed."""
+        pool_id, listener_id = setup
+        ws_id = await _create_remote_workspace(client, pool_id, "lock-blocks-ws")
+
+        await _lock_workspace(client, ws_id)
+        run_a = await _create_run(client, ws_id)
+        run_a_id = run_a["id"]
+        assert (await _get_run(client, run_a_id))["attributes"]["status"] == "queued"
+
+        # Locked → not claimable.
+        assert await _claim_run(client, listener_id) is None
+
+        # Unlock → now claimable.
+        await _unlock_workspace(client, ws_id)
+        result = await _claim_run(client, listener_id)
+        assert result is not None and result[0]["id"] == run_a_id
+
+    async def test_manual_lock_allows_plan_only_claim(self, app, client, setup):
+        """A plan-only run runs even on a locked workspace."""
+        pool_id, listener_id = setup
+        ws_id = await _create_remote_workspace(client, pool_id, "lock-planonly-ws")
+
+        await _lock_workspace(client, ws_id)
+        run = await _create_run(client, ws_id, **{"plan-only": True})
+        run_id = run["id"]
+        result = await _claim_run(client, listener_id)
+        assert result is not None and result[0]["id"] == run_id and result[1] == "plan"
+
+    async def test_manual_lock_blocks_confirm(self, app, client, setup):
+        """Confirming (applying) a planned run on a locked workspace is 409."""
+        pool_id, listener_id = setup
+        ws_id = await _create_remote_workspace(client, pool_id, "lock-confirm-ws")
+
+        run = await _create_run(client, ws_id)
+        run_id = run["id"]
+        await _run_plan_lifecycle(client, listener_id, run_id)
+        assert (await _get_run(client, run_id))["attributes"]["status"] == "planned"
+
+        await _lock_workspace(client, ws_id)
+        resp = await client.post(f"/api/v2/runs/{run_id}/actions/apply", headers=AUTH)
+        assert resp.status_code == 409, resp.text
+
+        # Unlock → confirm now works.
+        await _unlock_workspace(client, ws_id)
+        resp = await client.post(f"/api/v2/runs/{run_id}/actions/apply", headers=AUTH)
+        assert resp.status_code == 200, resp.text
+        assert (await _get_run(client, run_id))["attributes"]["status"] == "confirmed"
+
+
+class TestPlanStaleness:
+    """State-drift (#647, always on) and time-based expiry (#646, per-workspace)
+    auto-discard of stale apply-capable planned runs — against real Postgres
+    through the real state machine, the state-version discard hook, and the
+    expiry sweep. Composes with supersede (a separate reason)."""
+
+    async def test_new_state_version_discards_stale_plan(self, app, client, setup):
+        """A planned run whose plan predates a newly-landed state version is
+        auto-discarded with a state-changed reason (#647)."""
+        import uuid as _uuid
+
+        from terrapod.db.models import StateVersion
+        from terrapod.db.session import get_db_session
+        from terrapod.services import run_service
+
+        pool_id, listener_id = setup
+        ws_id = await _create_remote_workspace(client, pool_id, "stale-state-ws")
+        ws_uuid = _uuid.UUID(ws_id.removeprefix("ws-"))
+
+        # Seed a baseline state version (serial 1) so the plan has something to
+        # be measured stale against. (No auto_apply → B stays `planned`.)
+        async with get_db_session() as db:
+            db.add(StateVersion(workspace_id=ws_uuid, serial=1, lineage="x"))
+            await db.commit()
+
+        # Run B plans against serial 1, then awaits confirmation.
+        run_b = await _create_run(client, ws_id)
+        await _run_plan_lifecycle(client, listener_id, run_b["id"])
+        assert (await _get_run(client, run_b["id"]))["attributes"]["status"] == "planned"
+
+        # A new state version (serial 2) lands → the hook discards B.
+        async with get_db_session() as db:
+            db.add(StateVersion(workspace_id=ws_uuid, serial=2, lineage="x"))
+            await db.flush()
+            await run_service.discard_stale_plans_for_state_change(db, ws_uuid, 2)
+            await db.commit()
+
+        b_after = (await _get_run(client, run_b["id"]))["attributes"]
+        assert b_after["status"] == "discarded"
+        assert "state changed" in (b_after["discard-reason"] or "")
+
+    async def test_plan_with_no_baseline_is_not_stale(self, app, client, setup):
+        """A first apply (no prior state version) has no baseline → the state
+        guard never fires and the plan confirms normally (#647)."""
+        pool_id, listener_id = setup
+        ws_id = await _create_remote_workspace(client, pool_id, "no-baseline-ws")
+
+        run = await _create_run(client, ws_id)
+        await _run_plan_lifecycle(client, listener_id, run["id"])
+        resp = await client.post(f"/api/v2/runs/{run['id']}/actions/apply", headers=AUTH)
+        assert resp.status_code == 200, resp.text
+        assert (await _get_run(client, run["id"]))["attributes"]["status"] == "confirmed"
+
+    async def test_plan_expiry_sweep_discards_aged_plan(self, app, client, setup):
+        """The periodic sweep discards a planned run older than the workspace's
+        plan-expiry TTL (#646)."""
+        import uuid as _uuid
+        from datetime import timedelta
+
+        from terrapod.db.models import Run, Workspace, now_utc
+        from terrapod.db.session import get_db_session
+        from terrapod.services import run_service
+
+        pool_id, listener_id = setup
+        ws_id = await _create_remote_workspace(client, pool_id, "expiry-ws")
+
+        run = await _create_run(client, ws_id)
+        await _run_plan_lifecycle(client, listener_id, run["id"])
+        assert (await _get_run(client, run["id"]))["attributes"]["status"] == "planned"
+
+        # Enable a TTL and age the plan past it, then run the sweep.
+        async with get_db_session() as db:
+            ws = await db.get(Workspace, _uuid.UUID(ws_id.removeprefix("ws-")))
+            ws.plan_expiry_seconds = 3600
+            r = await db.get(Run, _uuid.UUID(run["id"].removeprefix("run-")))
+            r.plan_finished_at = now_utc() - timedelta(seconds=7200)
+            await db.commit()
+
+        await run_service.expire_stale_plans_cycle()
+
+        after = (await _get_run(client, run["id"]))["attributes"]
+        assert after["status"] == "discarded"
+        assert "plan expired" in (after["discard-reason"] or "")
+
+    async def test_confirm_time_guard_409s_and_discards(self, app, client, setup):
+        """Confirm-time backstop (#647): if state moved but the event hook did not
+        discard this run (e.g. it was still `planning` when the version landed),
+        confirming returns 409 AND the run is left `discarded` — the discard is
+        committed before the 409 raises, not rolled back with the errored request."""
+        import uuid as _uuid
+
+        from terrapod.db.models import StateVersion
+        from terrapod.db.session import get_db_session
+
+        pool_id, listener_id = setup
+        ws_id = await _create_remote_workspace(client, pool_id, "confirm-stale-ws")
+        ws_uuid = _uuid.UUID(ws_id.removeprefix("ws-"))
+
+        # Baseline serial 1, then plan against it.
+        async with get_db_session() as db:
+            db.add(StateVersion(workspace_id=ws_uuid, serial=1, lineage="x"))
+            await db.commit()
+        run = await _create_run(client, ws_id)
+        await _run_plan_lifecycle(client, listener_id, run["id"])
+
+        # Advance the state serial WITHOUT the discard hook, so the run is still
+        # `planned` when we try to confirm it (simulates the hook-missed race).
+        async with get_db_session() as db:
+            db.add(StateVersion(workspace_id=ws_uuid, serial=2, lineage="x"))
+            await db.commit()
+
+        resp = await client.post(f"/api/v2/runs/{run['id']}/actions/apply", headers=AUTH)
+        assert resp.status_code == 409
+        assert "state changed" in resp.text
+        after = (await _get_run(client, run["id"]))["attributes"]
+        assert after["status"] == "discarded"
+        assert "state changed" in (after["discard-reason"] or "")
+
+    async def test_listener_status_report_respects_state_drift_guard(self, app, client, setup):
+        """The listener status-report PATCH (update_run_status) must route an
+        auto-apply plan completion through the guarded complete_plan path — it
+        must NOT bare-transition a stale plan straight to confirmed/applying
+        against state that moved since the plan was computed (#665)."""
+        import uuid as _uuid
+
+        from terrapod.db.models import StateVersion
+        from terrapod.db.session import get_db_session
+
+        pool_id, listener_id = setup
+        ws_id = await _create_remote_workspace(
+            client, pool_id, "listener-stale-ws", auto_apply=True
+        )
+        ws_uuid = _uuid.UUID(ws_id.removeprefix("ws-"))
+
+        # Baseline serial 1 — the plan is measured stale against it.
+        async with get_db_session() as db:
+            db.add(StateVersion(workspace_id=ws_uuid, serial=1, lineage="x"))
+            await db.commit()
+
+        # Claim the run so it enters `planning` and snapshots plan_state_serial=1.
+        run = await _create_run(client, ws_id)
+        claimed = await _claim_run(client, listener_id)
+        assert claimed is not None
+        assert (await _get_run(client, run["id"]))["attributes"]["status"] == "planning"
+
+        # State advances to serial 2 before the listener reports the plan done.
+        async with get_db_session() as db:
+            db.add(StateVersion(workspace_id=ws_uuid, serial=2, lineage="x"))
+            await db.commit()
+
+        # Listener reports the plan finished via the PATCH status endpoint.
+        resp = await client.patch(
+            f"/api/terrapod/v1/listeners/{listener_id}/runs/{run['id']}",
+            json={"status": "planned", "has_changes": True},
+        )
+        assert resp.status_code == 200, resp.text
+
+        after = (await _get_run(client, run["id"]))["attributes"]
+        # Guarded: discarded as stale — NOT auto-applied (confirmed/applying).
+        assert after["status"] == "discarded", after["status"]
+        assert "state changed" in (after["discard-reason"] or "")

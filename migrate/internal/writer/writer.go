@@ -7,14 +7,18 @@
 //
 // Two modes:
 //
-//   * DryRun (default) — walks the Plan, builds a Report describing
+//   - DryRun (default) — walks the Plan, builds a Report describing
 //     the would-be writes, never touches Terrapod. Sensitive variable
 //     values are NEVER read from the source in this mode.
 //
-//   * Apply — actually writes. Order is dependency-first: VCS
-//     connections → workspaces → variables. After each write the state
-//     file is saved so a crash mid-migration is resumable from the
-//     same state file.
+//   - Apply — actually writes. Order is dependency-first: VCS
+//     connections → workspaces (+ their variables + state) → variable
+//     sets → run triggers → notification configurations → agent pools →
+//     gpg keys. Everything after workspaces comes later so its references
+//     resolve to the Terrapod IDs the workspace loop recorded (agent pools
+//     also re-point their member workspaces; gpg keys are independent).
+//     After each write the state file is saved so a crash mid-migration is
+//     resumable from the same state file.
 package writer
 
 import (
@@ -83,14 +87,19 @@ type Options struct {
 // stays self-contained (no live SDK references) so callers can
 // serialise it to disk for the handover document.
 type Report struct {
-	DryRun      bool                  `json:"dry_run"`
-	StartedAt   time.Time             `json:"started_at"`
-	FinishedAt  time.Time             `json:"finished_at"`
-	Source      string                `json:"source"`
-	Connections []ConnectionOutcome   `json:"connections,omitempty"`
-	Workspaces  []WorkspaceOutcome    `json:"workspaces,omitempty"`
-	Skipped     []ir.SkippedItem      `json:"skipped,omitempty"`
-	Errors      []string              `json:"errors,omitempty"`
+	DryRun        bool                  `json:"dry_run"`
+	StartedAt     time.Time             `json:"started_at"`
+	FinishedAt    time.Time             `json:"finished_at"`
+	Source        string                `json:"source"`
+	Connections   []ConnectionOutcome   `json:"connections,omitempty"`
+	Workspaces    []WorkspaceOutcome    `json:"workspaces,omitempty"`
+	VariableSets  []VarsetOutcome       `json:"variable_sets,omitempty"`
+	RunTriggers   []RunTriggerOutcome   `json:"run_triggers,omitempty"`
+	Notifications []NotificationOutcome `json:"notifications,omitempty"`
+	AgentPools    []AgentPoolOutcome    `json:"agent_pools,omitempty"`
+	GPGKeys       []GPGKeyOutcome       `json:"gpg_keys,omitempty"`
+	Skipped       []ir.SkippedItem      `json:"skipped,omitempty"`
+	Errors        []string              `json:"errors,omitempty"`
 }
 
 // ConnectionOutcome is the per-VCS-connection result. State is
@@ -134,6 +143,75 @@ type VarOutcome struct {
 	Key   string `json:"key"`
 	State string `json:"state"`
 	Error string `json:"error,omitempty"`
+}
+
+// VarsetOutcome is the per-variable-set result. VarOutcomes records each
+// variable; Assignments is how many workspace assignments landed (source
+// refs resolved to migrated Terrapod workspaces); Unresolved lists source
+// workspace refs outside the migration scope (assign by hand).
+type VarsetOutcome struct {
+	SourceID    string       `json:"source_id"`
+	Name        string       `json:"name"`
+	State       string       `json:"state"` // "planned" | "created" | "reused" | "errored"
+	TerrapodID  string       `json:"terrapod_id,omitempty"`
+	Global      bool         `json:"global,omitempty"`
+	Error       string       `json:"error,omitempty"`
+	VarOutcomes []VarOutcome `json:"var_outcomes,omitempty"`
+	Assignments int          `json:"assignments,omitempty"`
+	Unresolved  []string     `json:"unresolved_workspace_refs,omitempty"`
+}
+
+// RunTriggerOutcome is the per-run-trigger result. State: "planned" |
+// "created" | "reused" | "skipped" | "errored". "skipped" means an
+// endpoint wasn't migrated (out of scope); Detail explains.
+type RunTriggerOutcome struct {
+	SourceName      string `json:"source_name"`
+	DestinationName string `json:"destination_name"`
+	State           string `json:"state"`
+	TerrapodID      string `json:"terrapod_id,omitempty"`
+	Detail          string `json:"detail,omitempty"`
+}
+
+// NotificationOutcome is the per-notification-config result. State:
+// "planned" | "created" | "reused" | "skipped" | "errored". "skipped"
+// means the destination workspace wasn't migrated (out of scope);
+// Detail explains. NeedsToken flags a generic webhook whose HMAC token
+// the operator must re-enter (the source never returns it).
+type NotificationOutcome struct {
+	WorkspaceName string `json:"workspace_name"`
+	Name          string `json:"name"`
+	State         string `json:"state"`
+	TerrapodID    string `json:"terrapod_id,omitempty"`
+	NeedsToken    bool   `json:"needs_token,omitempty"`
+	Detail        string `json:"detail,omitempty"`
+}
+
+// AgentPoolOutcome is the per-agent-pool result. State: "planned" |
+// "created" | "reused" | "errored". Assignments is how many member
+// workspaces were re-pointed at the new pool; Unresolved lists source
+// workspace refs outside the migration scope (assign by hand). Every
+// created/reused pool needs a fresh join token + redeployed listeners
+// — TFE tokens are never portable — surfaced separately in the report.
+type AgentPoolOutcome struct {
+	SourceID    string   `json:"source_id"`
+	Name        string   `json:"name"`
+	State       string   `json:"state"`
+	TerrapodID  string   `json:"terrapod_id,omitempty"`
+	Error       string   `json:"error,omitempty"`
+	Assignments int      `json:"assignments,omitempty"`
+	Unresolved  []string `json:"unresolved_workspace_refs,omitempty"`
+}
+
+// GPGKeyOutcome is the per-GPG-key result. State: "planned" | "created"
+// | "reused" | "errored". Only the public key migrates; provider
+// versions still re-publish via terrapod-publish (which owns the
+// signature).
+type GPGKeyOutcome struct {
+	SourceID   string `json:"source_id"`
+	KeyID      string `json:"key_id,omitempty"`
+	State      string `json:"state"`
+	TerrapodID string `json:"terrapod_id,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 // Writer is the entry point. Construct one per migration run and call
@@ -223,6 +301,64 @@ func (w *Writer) Run(ctx context.Context, plan ir.Plan, opts Options) (*Report, 
 		report.Workspaces = append(report.Workspaces, outcome)
 		if err := w.saveState(); err != nil {
 			return report, fmt.Errorf("save state after workspace %q: %w", ws.SourceID, err)
+		}
+	}
+
+	// Variable sets AFTER workspaces: their per-workspace assignments
+	// resolve source workspace IDs to the Terrapod IDs the workspace
+	// loop just recorded in the state file.
+	for i := range plan.VariableSets {
+		vs := &plan.VariableSets[i]
+		outcome := w.applyVariableSet(ctx, vs, opts)
+		report.VariableSets = append(report.VariableSets, outcome)
+		if err := w.saveState(); err != nil {
+			return report, fmt.Errorf("save state after variable set %q: %w", vs.SourceID, err)
+		}
+	}
+
+	// Run triggers last: both endpoints must be migrated workspaces for
+	// the source→destination link to resolve to Terrapod IDs.
+	for i := range plan.RunTriggers {
+		rt := &plan.RunTriggers[i]
+		outcome := w.applyRunTrigger(ctx, rt, opts)
+		report.RunTriggers = append(report.RunTriggers, outcome)
+		if err := w.saveState(); err != nil {
+			return report, fmt.Errorf("save state after run trigger %s→%s: %w", rt.SourceName, rt.DestinationName, err)
+		}
+	}
+
+	// Notifications last too: the destination workspace must be a
+	// migrated workspace for the config to attach.
+	for i := range plan.Notifications {
+		nc := &plan.Notifications[i]
+		outcome := w.applyNotification(ctx, nc, opts)
+		report.Notifications = append(report.Notifications, outcome)
+		if err := w.saveState(); err != nil {
+			return report, fmt.Errorf("save state after notification %q on %s: %w", nc.Name, nc.WorkspaceName, err)
+		}
+	}
+
+	// Agent pools last: created after workspaces so their member
+	// assignments resolve to migrated Terrapod workspaces, which the
+	// writer then re-points at the new pool.
+	for i := range plan.AgentPools {
+		ap := &plan.AgentPools[i]
+		outcome := w.applyAgentPool(ctx, ap, opts)
+		report.AgentPools = append(report.AgentPools, outcome)
+		if err := w.saveState(); err != nil {
+			return report, fmt.Errorf("save state after agent pool %q: %w", ap.Name, err)
+		}
+	}
+
+	// GPG keys are independent of workspaces (provider signing public
+	// keys), so order doesn't matter for correctness — created last,
+	// rolled back first, to keep the reverse-order invariant uniform.
+	for i := range plan.GPGKeys {
+		gk := &plan.GPGKeys[i]
+		outcome := w.applyGPGKey(ctx, gk, opts)
+		report.GPGKeys = append(report.GPGKeys, outcome)
+		if err := w.saveState(); err != nil {
+			return report, fmt.Errorf("save state after gpg key %q: %w", gk.KeyID, err)
 		}
 	}
 
@@ -325,6 +461,14 @@ func (w *Writer) applyWorkspace(ctx context.Context, ws *ir.Workspace, connByRef
 		for _, v := range ws.Variables {
 			out.VarOutcomes = append(out.VarOutcomes, VarOutcome{Key: v.Key, State: "planned"})
 		}
+		// Report the state version that WOULD migrate so the dry-run plan
+		// is complete (the issue's "report exactly what would be created
+		// … state versions"). This only READS the source state for its
+		// metadata (lineage/serial/size) — it never uploads. Reading is
+		// the same safe operation apply does; no Terrapod write happens.
+		if opts.StateForWorkspace != nil {
+			out.StateOutcome = w.planState(ctx, ws.SourceID, opts.StateForWorkspace)
+		}
 		return out
 	}
 
@@ -384,6 +528,10 @@ func (w *Writer) applyWorkspace(ctx context.Context, ws *ir.Workspace, connByRef
 	w.recordWorkspace(ws, "created", "")
 	if rec := w.state.WorkspaceBySourceID(ws.SourceID); rec != nil {
 		rec.TerrapodID = created.ID
+		// Provenance for rollback: WE created this workspace, so rollback
+		// is allowed to delete it. Reused/pre-existing workspaces never
+		// reach this path, so this flag is the safe delete gate.
+		rec.CreatedByMigration = true
 	}
 
 	for i := range ws.Variables {
@@ -396,6 +544,36 @@ func (w *Writer) applyWorkspace(ctx context.Context, ws *ir.Workspace, connByRef
 		out.StateOutcome = w.applyState(ctx, created.ID, ws.SourceID, opts.StateForWorkspace)
 	}
 
+	return out
+}
+
+// planState reads the source state for its metadata only and reports
+// what a real apply WOULD upload — it never writes to Terrapod. Used by
+// the dry-run path so the plan shows the state version (serial/lineage/
+// size) alongside the workspace + variables. A missing/empty source
+// state is reported as "no_source_state"; a read error is reported (so
+// the operator learns about an unreadable backend at plan time) but is
+// non-fatal to the dry-run.
+func (w *Writer) planState(ctx context.Context, sourceID string, reader StateReader) *StateOutcome {
+	out := &StateOutcome{State: "planned"}
+	raw, lineage, serial, err := reader(ctx, sourceID)
+	if err != nil {
+		var none *ErrNoStateForWorkspace
+		if errors.As(err, &none) {
+			out.State = "no_source_state"
+			return out
+		}
+		out.State = "errored"
+		out.Error = fmt.Sprintf("read source state: %v", err)
+		return out
+	}
+	if len(raw) == 0 {
+		out.State = "no_source_state"
+		return out
+	}
+	out.Serial = serial
+	out.Lineage = lineage
+	out.SizeKB = stateSizeKB(len(raw))
 	return out
 }
 
@@ -663,8 +841,551 @@ func (w *Writer) reconcileVariable(ctx context.Context, workspaceID string, req 
 	return nil
 }
 
-
 // ── State plumbing ───────────────────────────────────────────────────
+
+// ── Variable set handling ─────────────────────────────────────────────
+
+// applyVariableSet creates a variable set on Terrapod, adds its
+// variables, and assigns it to the migrated workspaces it referenced.
+// Runs after the workspace loop so WorkspaceRefs (source IDs) resolve to
+// the Terrapod workspace IDs recorded during that loop. Idempotent: a
+// prior run's varset (recorded with a TerrapodID) is reused, not
+// re-created.
+func (w *Writer) applyVariableSet(ctx context.Context, vs *ir.VariableSet, opts Options) VarsetOutcome {
+	out := VarsetOutcome{SourceID: vs.SourceID, Name: vs.Name, State: "planned", Global: vs.Global}
+
+	if prior := w.state.VarsetBySourceID(vs.SourceID); prior != nil && prior.TerrapodID != "" {
+		out.State = "reused"
+		out.TerrapodID = prior.TerrapodID
+		if !opts.DryRun {
+			w.applyVarsetContents(ctx, prior.TerrapodID, vs, &out, opts)
+		}
+		return out
+	}
+
+	if opts.DryRun {
+		// Don't recurse into variables (would invoke the sensitive-value
+		// callback) — just plan them, mirroring the workspace path.
+		for _, v := range vs.Variables {
+			out.VarOutcomes = append(out.VarOutcomes, VarOutcome{Key: v.Key, State: "planned"})
+		}
+		out.Assignments, out.Unresolved = w.planVarsetAssignments(vs)
+		w.recordVarset(vs, "planned", "", 0)
+		return out
+	}
+
+	created, err := w.client.CreateVariableSet(ctx, terrapod.CreateVariableSetRequest{
+		Name:        vs.Name,
+		Description: vs.Description,
+		Global:      vs.Global,
+		Priority:    vs.Priority,
+	})
+	if err != nil {
+		var conflict *terrapod.ConflictError
+		if errors.As(err, &conflict) {
+			out.State = "errored"
+			out.Error = fmt.Sprintf("Terrapod variable set named %q already exists; resolve the collision (rename or delete the existing set) then re-run apply", vs.Name)
+			w.recordVarset(vs, "errored", out.Error, 0)
+			return out
+		}
+		out.State = "errored"
+		out.Error = err.Error()
+		w.recordVarset(vs, "errored", out.Error, 0)
+		return out
+	}
+
+	out.State = "created"
+	out.TerrapodID = created.ID
+	w.recordVarset(vs, "created", "", len(vs.Variables))
+	if rec := w.state.VarsetBySourceID(vs.SourceID); rec != nil {
+		rec.TerrapodID = created.ID
+		// Provenance gate for a future rollback: WE created this set.
+		rec.CreatedByMigration = true
+	}
+	w.applyVarsetContents(ctx, created.ID, vs, &out, opts)
+	return out
+}
+
+// applyVarsetContents adds the variables and workspace assignments to an
+// existing (just-created or reused) varset.
+func (w *Writer) applyVarsetContents(ctx context.Context, varsetID string, vs *ir.VariableSet, out *VarsetOutcome, opts Options) {
+	for i := range vs.Variables {
+		v := &vs.Variables[i]
+		out.VarOutcomes = append(out.VarOutcomes, w.applyVarsetVariable(ctx, varsetID, vs.SourceID, v, opts))
+	}
+
+	// Global sets apply to everything and take no explicit assignment.
+	if vs.Global {
+		return
+	}
+	for _, ref := range vs.WorkspaceRefs {
+		rec := w.state.WorkspaceBySourceID(ref)
+		if rec == nil || rec.TerrapodID == "" {
+			// The referenced workspace wasn't migrated (out of scope, or
+			// it errored). Surface it so the operator assigns by hand.
+			out.Unresolved = append(out.Unresolved, ref)
+			continue
+		}
+		// The assign endpoint is idempotent (204 on already-assigned,
+		// never 409), so a resume re-assign just succeeds — no special
+		// conflict handling needed.
+		if err := w.client.AssignWorkspaceToVarset(ctx, varsetID, rec.TerrapodID); err != nil {
+			out.Unresolved = append(out.Unresolved, ref)
+			continue
+		}
+		out.Assignments++
+	}
+	if rec := w.state.VarsetBySourceID(vs.SourceID); rec != nil {
+		rec.AssignedWorkspaces = out.Assignments
+	}
+}
+
+// applyVarsetVariable adds one variable to a varset. Mirrors
+// applyVariable's sensitive-value handling: sensitive values are never
+// read from the source — the variable is created with an empty value +
+// sensitive=true for the operator to fill in post-cutover.
+func (w *Writer) applyVarsetVariable(ctx context.Context, varsetID, varsetSourceID string, v *ir.Variable, opts Options) VarOutcome {
+	out := VarOutcome{Key: v.Key, State: "created"}
+
+	value := v.Value
+	if v.Sensitive {
+		value = ""
+		out.State = "needs_value"
+		if opts.SensitiveValueForVariable != nil {
+			if s, err := opts.SensitiveValueForVariable(varsetSourceID, v.Key); err == nil {
+				value = s
+				out.State = "created"
+			}
+		}
+	}
+
+	_, err := w.client.CreateVarsetVariable(ctx, varsetID, terrapod.CreateVarsetVariableRequest{
+		Key:         v.Key,
+		Value:       value,
+		Category:    v.Category,
+		HCL:         v.HCL,
+		Sensitive:   v.Sensitive,
+		Description: v.Description,
+	})
+	if err != nil {
+		// 409 → a prior run already added this key. Leave sensitive
+		// values alone (operator may have hand-entered them); treat
+		// non-sensitive as reconciled (present, value not re-pushed in
+		// this slice).
+		var conflict *terrapod.ConflictError
+		if errors.As(err, &conflict) {
+			if v.Sensitive {
+				out.State = "needs_value"
+				return out
+			}
+			out.State = "reconciled"
+			return out
+		}
+		out.State = "errored"
+		out.Error = err.Error()
+		return out
+	}
+	return out
+}
+
+// planVarsetAssignments reports, for a dry-run, how many of a varset's
+// workspace refs resolve to a recorded (planned or created) workspace
+// and which don't. Global sets return (0, nil).
+func (w *Writer) planVarsetAssignments(vs *ir.VariableSet) (int, []string) {
+	if vs.Global {
+		return 0, nil
+	}
+	var resolved int
+	var unresolved []string
+	for _, ref := range vs.WorkspaceRefs {
+		// A workspace that errored during apply has a state record but was
+		// not successfully created — don't count it as a would-be
+		// assignment; report it as unresolved instead (optimistic-count fix).
+		if ws := w.state.WorkspaceBySourceID(ref); ws != nil && ws.State != "errored" {
+			resolved++
+		} else {
+			unresolved = append(unresolved, ref)
+		}
+	}
+	return resolved, unresolved
+}
+
+func (w *Writer) recordVarset(vs *ir.VariableSet, state, errMsg string, varCount int) {
+	if rec := w.state.VarsetBySourceID(vs.SourceID); rec != nil {
+		rec.State = state
+		rec.Error = errMsg
+		if varCount > 0 {
+			rec.ExpectedVarCount = varCount
+		}
+		return
+	}
+	w.state.VariableSets = append(w.state.VariableSets, framework.VariableSetRecord{
+		SourceID:         vs.SourceID,
+		Name:             vs.Name,
+		State:            state,
+		Error:            errMsg,
+		ExpectedVarCount: varCount,
+	})
+}
+
+// ── Run trigger handling ──────────────────────────────────────────────
+
+// applyRunTrigger registers a cross-workspace run trigger (source apply →
+// queue a run on the destination). Both endpoints must be migrated
+// workspaces; a trigger referencing a workspace outside the migration
+// scope is skipped and reported. Idempotent via the (source, destination)
+// pair recorded in the state file.
+func (w *Writer) applyRunTrigger(ctx context.Context, rt *ir.RunTrigger, opts Options) RunTriggerOutcome {
+	out := RunTriggerOutcome{SourceName: rt.SourceName, DestinationName: rt.DestinationName, State: "planned"}
+
+	if prior := w.state.RunTriggerByPair(rt.SourceWorkspaceRef, rt.DestinationWorkspaceRef); prior != nil && prior.TerrapodID != "" {
+		out.State = "reused"
+		out.TerrapodID = prior.TerrapodID
+		return out
+	}
+
+	// Both endpoints must be in the migration (recorded workspaces). In
+	// dry-run the workspaces are recorded as "planned" with empty
+	// TerrapodID, so presence is the check; in apply we also need the id.
+	src := w.state.WorkspaceBySourceID(rt.SourceWorkspaceRef)
+	dst := w.state.WorkspaceBySourceID(rt.DestinationWorkspaceRef)
+	inScope := src != nil && dst != nil
+	if !opts.DryRun {
+		inScope = inScope && src.TerrapodID != "" && dst.TerrapodID != ""
+	}
+	if !inScope {
+		out.State = "skipped"
+		out.Detail = "one or both endpoints are outside the migration scope; create this run trigger by hand once both workspaces exist on Terrapod"
+		w.recordRunTrigger(rt, "skipped", "", "")
+		return out
+	}
+
+	if opts.DryRun {
+		w.recordRunTrigger(rt, "planned", "", "")
+		return out
+	}
+
+	created, err := w.client.CreateRunTrigger(ctx, terrapod.CreateRunTriggerRequest{
+		DestinationWorkspaceID: dst.TerrapodID,
+		SourceWorkspaceID:      src.TerrapodID,
+	})
+	if err != nil {
+		// 409 → the link already exists (a prior run, or a pre-existing
+		// identical trigger). Treat as reused. We don't learn its id, so
+		// it won't be a rollback target — acceptable: rollback only
+		// deletes triggers it can positively identify as its own.
+		var conflict *terrapod.ConflictError
+		if errors.As(err, &conflict) {
+			out.State = "reused"
+			w.recordRunTrigger(rt, "reused", "", "")
+			return out
+		}
+		out.State = "errored"
+		out.Detail = err.Error()
+		w.recordRunTrigger(rt, "errored", "", err.Error())
+		return out
+	}
+	out.State = "created"
+	out.TerrapodID = created.ID
+	w.recordRunTrigger(rt, "created", created.ID, "")
+	return out
+}
+
+func (w *Writer) recordRunTrigger(rt *ir.RunTrigger, state, terrapodID, errMsg string) {
+	if rec := w.state.RunTriggerByPair(rt.SourceWorkspaceRef, rt.DestinationWorkspaceRef); rec != nil {
+		rec.State = state
+		rec.Error = errMsg
+		if terrapodID != "" {
+			rec.TerrapodID = terrapodID
+			rec.CreatedByMigration = true
+		}
+		return
+	}
+	rec := framework.RunTriggerRecord{
+		SourceWorkspaceRef:      rt.SourceWorkspaceRef,
+		DestinationWorkspaceRef: rt.DestinationWorkspaceRef,
+		State:                   state,
+		Error:                   errMsg,
+	}
+	if terrapodID != "" {
+		rec.TerrapodID = terrapodID
+		rec.CreatedByMigration = true
+	}
+	w.state.RunTriggers = append(w.state.RunTriggers, rec)
+}
+
+// applyNotification creates a per-workspace notification configuration on
+// the migrated destination workspace. Idempotent (reuses a prior record),
+// 409-tolerant (a same-named config already present is treated as reused),
+// and skips cleanly when the destination workspace is outside the
+// migration scope. Generic-webhook HMAC tokens are never available from
+// the source, so those configs are created with an empty token and the
+// operator is told to re-enter it (NeedsToken → the report flags it).
+func (w *Writer) applyNotification(ctx context.Context, nc *ir.NotificationConfiguration, opts Options) NotificationOutcome {
+	out := NotificationOutcome{
+		WorkspaceName: nc.WorkspaceName,
+		Name:          nc.Name,
+		State:         "planned",
+		NeedsToken:    nc.NeedsToken,
+	}
+
+	if prior := w.state.NotificationByWorkspaceAndName(nc.WorkspaceRef, nc.Name); prior != nil && prior.TerrapodID != "" {
+		out.State = "reused"
+		out.TerrapodID = prior.TerrapodID
+		return out
+	}
+
+	// The destination workspace must be a migrated workspace. In dry-run
+	// presence is enough; in apply we also need its Terrapod ID.
+	dst := w.state.WorkspaceBySourceID(nc.WorkspaceRef)
+	inScope := dst != nil
+	if !opts.DryRun {
+		inScope = inScope && dst.TerrapodID != ""
+	}
+	if !inScope {
+		out.State = "skipped"
+		out.Detail = "destination workspace is outside the migration scope; create this notification configuration by hand once the workspace exists on Terrapod"
+		w.recordNotification(nc, "skipped", "", "")
+		return out
+	}
+
+	if opts.DryRun {
+		w.recordNotification(nc, "planned", "", "")
+		return out
+	}
+
+	created, err := w.client.CreateNotificationConfiguration(ctx, dst.TerrapodID, terrapod.CreateNotificationConfigurationRequest{
+		Name:            nc.Name,
+		DestinationType: nc.DestinationType,
+		URL:             nc.URL,
+		Enabled:         nc.Enabled,
+		Triggers:        nc.Triggers,
+		EmailAddresses:  nc.EmailAddresses,
+		// Token intentionally empty: the source never returns it. For
+		// generic webhooks NeedsToken flags operator re-entry.
+	})
+	if err != nil {
+		// 409 → a same-named config already exists on the workspace
+		// (a prior run, or a pre-existing identical config). Treat as
+		// reused. We don't learn its id, so it won't be a rollback
+		// target — rollback only deletes configs it can positively
+		// identify as its own.
+		var conflict *terrapod.ConflictError
+		if errors.As(err, &conflict) {
+			out.State = "reused"
+			w.recordNotification(nc, "reused", "", "")
+			return out
+		}
+		out.State = "errored"
+		out.Detail = err.Error()
+		w.recordNotification(nc, "errored", "", err.Error())
+		return out
+	}
+	out.State = "created"
+	out.TerrapodID = created.ID
+	w.recordNotification(nc, "created", created.ID, "")
+	return out
+}
+
+func (w *Writer) recordNotification(nc *ir.NotificationConfiguration, state, terrapodID, errMsg string) {
+	if rec := w.state.NotificationByWorkspaceAndName(nc.WorkspaceRef, nc.Name); rec != nil {
+		rec.State = state
+		rec.Error = errMsg
+		if terrapodID != "" {
+			rec.TerrapodID = terrapodID
+			rec.CreatedByMigration = true
+		}
+		return
+	}
+	rec := framework.NotificationRecord{
+		WorkspaceRef: nc.WorkspaceRef,
+		Name:         nc.Name,
+		State:        state,
+		Error:        errMsg,
+	}
+	if terrapodID != "" {
+		rec.TerrapodID = terrapodID
+		rec.CreatedByMigration = true
+	}
+	w.state.Notifications = append(w.state.Notifications, rec)
+}
+
+// applyAgentPool creates a Terrapod agent pool and re-points every
+// migrated member workspace at it. Idempotent (reuses a prior record),
+// 409-tolerant. Only the pool's identity + workspace assignments
+// migrate — TFE agent tokens are write-only and never returned, so no
+// token is created; the report tells the operator to regenerate a join
+// token and redeploy listeners. Member workspaces outside the migration
+// scope are reported as unresolved.
+func (w *Writer) applyAgentPool(ctx context.Context, ap *ir.AgentPool, opts Options) AgentPoolOutcome {
+	out := AgentPoolOutcome{SourceID: ap.SourceID, Name: ap.Name, State: "planned"}
+
+	// Resolve the pool's Terrapod id — a prior run's, or a fresh create.
+	poolID := ""
+	if prior := w.state.AgentPoolBySourceID(ap.SourceID); prior != nil && prior.TerrapodID != "" {
+		poolID = prior.TerrapodID
+		out.State = "reused"
+		out.TerrapodID = poolID
+	}
+
+	if opts.DryRun {
+		out.Assignments, out.Unresolved = w.planPoolAssignments(ap)
+		if out.State != "reused" {
+			w.recordAgentPool(ap, "planned", "", "")
+		}
+		return out
+	}
+
+	if poolID == "" {
+		created, err := w.client.CreateAgentPool(ctx, terrapod.CreateAgentPoolRequest{
+			Name: ap.Name,
+		})
+		if err != nil {
+			// 409 → a pool with this name already exists (a prior run, or
+			// operator-created). We can't learn its id, so it won't be a
+			// rollback target — acceptable: rollback only deletes pools it
+			// can positively identify as its own. Skip re-pointing (we
+			// don't know the id) and report.
+			var conflict *terrapod.ConflictError
+			if errors.As(err, &conflict) {
+				out.State = "reused"
+				w.recordAgentPool(ap, "reused", "", "")
+				return out
+			}
+			out.State = "errored"
+			out.Error = err.Error()
+			w.recordAgentPool(ap, "errored", "", err.Error())
+			return out
+		}
+		poolID = created.ID
+		out.State = "created"
+		out.TerrapodID = poolID
+		w.recordAgentPool(ap, "created", poolID, "")
+	}
+
+	// Re-point each migrated member workspace at the new pool.
+	for _, ref := range ap.WorkspaceRefs {
+		ws := w.state.WorkspaceBySourceID(ref)
+		if ws == nil || ws.TerrapodID == "" {
+			out.Unresolved = append(out.Unresolved, ref)
+			continue
+		}
+		if _, err := w.client.UpdateWorkspace(ctx, ws.TerrapodID, terrapod.UpdateWorkspaceRequest{
+			AgentPoolID: poolID,
+		}); err != nil {
+			out.Unresolved = append(out.Unresolved, ref)
+			continue
+		}
+		out.Assignments++
+	}
+	return out
+}
+
+// planPoolAssignments counts how many of a pool's member workspaces map
+// to migrated workspaces and collects the source refs that don't (used
+// in dry-run and to seed the outcome). Mirrors planVarsetAssignments.
+func (w *Writer) planPoolAssignments(ap *ir.AgentPool) (assigned int, unresolved []string) {
+	for _, ref := range ap.WorkspaceRefs {
+		// Skip workspaces that errored during apply — a record exists but
+		// the workspace wasn't successfully created (optimistic-count fix).
+		if ws := w.state.WorkspaceBySourceID(ref); ws != nil && ws.State != "errored" {
+			assigned++
+		} else {
+			unresolved = append(unresolved, ref)
+		}
+	}
+	return assigned, unresolved
+}
+
+func (w *Writer) recordAgentPool(ap *ir.AgentPool, state, terrapodID, errMsg string) {
+	if rec := w.state.AgentPoolBySourceID(ap.SourceID); rec != nil {
+		rec.State = state
+		rec.Error = errMsg
+		if terrapodID != "" {
+			rec.TerrapodID = terrapodID
+			rec.CreatedByMigration = true
+		}
+		return
+	}
+	rec := framework.AgentPoolRecord{
+		SourceID: ap.SourceID,
+		Name:     ap.Name,
+		State:    state,
+		Error:    errMsg,
+	}
+	if terrapodID != "" {
+		rec.TerrapodID = terrapodID
+		rec.CreatedByMigration = true
+	}
+	w.state.AgentPools = append(w.state.AgentPools, rec)
+}
+
+// applyGPGKey registers a provider signing PUBLIC key on Terrapod.
+// Idempotent (reuses a prior record), 409-tolerant (a key already
+// registered is treated as reused). Only the public key migrates — the
+// private key never leaves the operator, so provider versions still
+// re-publish via terrapod-publish.
+func (w *Writer) applyGPGKey(ctx context.Context, gk *ir.GPGKey, opts Options) GPGKeyOutcome {
+	out := GPGKeyOutcome{SourceID: gk.SourceID, KeyID: gk.KeyID, State: "planned"}
+
+	if prior := w.state.GPGKeyBySourceID(gk.SourceID); prior != nil && prior.TerrapodID != "" {
+		out.State = "reused"
+		out.TerrapodID = prior.TerrapodID
+		return out
+	}
+
+	if opts.DryRun {
+		w.recordGPGKey(gk, "planned", "", "")
+		return out
+	}
+
+	created, err := w.client.CreateGPGKey(ctx, terrapod.CreateGPGKeyRequest{
+		ASCIIArmor: gk.ASCIIArmor,
+	})
+	if err != nil {
+		// 409 → the key is already registered (a prior run, or the
+		// operator imported it). Treat as reused. We don't learn its id,
+		// so it won't be a rollback target — rollback only deletes keys
+		// it can positively identify as its own.
+		var conflict *terrapod.ConflictError
+		if errors.As(err, &conflict) {
+			out.State = "reused"
+			w.recordGPGKey(gk, "reused", "", "")
+			return out
+		}
+		out.State = "errored"
+		out.Error = err.Error()
+		w.recordGPGKey(gk, "errored", "", err.Error())
+		return out
+	}
+	out.State = "created"
+	out.TerrapodID = created.ID
+	w.recordGPGKey(gk, "created", created.ID, "")
+	return out
+}
+
+func (w *Writer) recordGPGKey(gk *ir.GPGKey, state, terrapodID, errMsg string) {
+	if rec := w.state.GPGKeyBySourceID(gk.SourceID); rec != nil {
+		rec.State = state
+		rec.Error = errMsg
+		if terrapodID != "" {
+			rec.TerrapodID = terrapodID
+			rec.CreatedByMigration = true
+		}
+		return
+	}
+	rec := framework.GPGKeyRecord{
+		SourceID: gk.SourceID,
+		KeyID:    gk.KeyID,
+		State:    state,
+		Error:    errMsg,
+	}
+	if terrapodID != "" {
+		rec.TerrapodID = terrapodID
+		rec.CreatedByMigration = true
+	}
+	w.state.GPGKeys = append(w.state.GPGKeys, rec)
+}
 
 func (w *Writer) recordConnection(c *ir.VCSConnection, state, errMsg string) {
 	if rec := findConnectionRecord(w.state, c.SourceID); rec != nil {
@@ -684,15 +1405,17 @@ func (w *Writer) recordWorkspace(ws *ir.Workspace, state, errMsg string) {
 	if rec := w.state.WorkspaceBySourceID(ws.SourceID); rec != nil {
 		rec.State = state
 		rec.Error = errMsg
+		rec.ExpectedVarCount = len(ws.Variables)
 		return
 	}
 	rec := framework.WorkspaceRecord{
-		SourceID:   ws.SourceID,
-		SourceName: ws.Name,
-		State:      state,
-		Error:      errMsg,
-		Labels:     ws.Labels,
-		CreatedAt:  time.Now().UTC(),
+		SourceID:         ws.SourceID,
+		SourceName:       ws.Name,
+		State:            state,
+		Error:            errMsg,
+		Labels:           ws.Labels,
+		ExpectedVarCount: len(ws.Variables),
+		CreatedAt:        time.Now().UTC(),
 	}
 	w.state.Workspaces = append(w.state.Workspaces, rec)
 }
@@ -739,6 +1462,35 @@ func collectErrors(r *Report) []string {
 			errs = append(errs, fmt.Sprintf("workspace %q state: %s", ws.Name, ws.StateOutcome.Error))
 		}
 	}
+	for _, vs := range r.VariableSets {
+		if vs.Error != "" {
+			errs = append(errs, fmt.Sprintf("variable-set %q: %s", vs.Name, vs.Error))
+		}
+		for _, v := range vs.VarOutcomes {
+			if v.Error != "" {
+				errs = append(errs, fmt.Sprintf("variable-set %q variable %q: %s", vs.Name, v.Key, v.Error))
+			}
+		}
+	}
+	for _, rt := range r.RunTriggers {
+		if rt.State == "errored" && rt.Detail != "" {
+			errs = append(errs, fmt.Sprintf("run-trigger %s→%s: %s", rt.SourceName, rt.DestinationName, rt.Detail))
+		}
+	}
+	for _, nc := range r.Notifications {
+		if nc.State == "errored" && nc.Detail != "" {
+			errs = append(errs, fmt.Sprintf("notification %q on %q: %s", nc.Name, nc.WorkspaceName, nc.Detail))
+		}
+	}
+	for _, ap := range r.AgentPools {
+		if ap.State == "errored" && ap.Error != "" {
+			errs = append(errs, fmt.Sprintf("agent-pool %q: %s", ap.Name, ap.Error))
+		}
+	}
+	for _, gk := range r.GPGKeys {
+		if gk.State == "errored" && gk.Error != "" {
+			errs = append(errs, fmt.Sprintf("gpg-key %q: %s", gk.KeyID, gk.Error))
+		}
+	}
 	return errs
 }
-

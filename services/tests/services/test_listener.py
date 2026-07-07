@@ -24,7 +24,18 @@ def fresh_shutdown_event():
 def _make_listener(shutdown_event: asyncio.Event, **overrides) -> RunnerListener:
     """Create a listener with mocked identity and config."""
     with patch("terrapod.runner.listener.load_runner_config") as mock_cfg:
-        mock_cfg.return_value = MagicMock(definitions=[])
+        # __init__ now reads listener knobs off RunnerConfig (#617) — give the
+        # mock real int defaults so comparisons (active >= max_concurrent) work.
+        mock_cfg.return_value = MagicMock(
+            definitions=[],
+            heartbeat_interval=60,
+            max_concurrent=3,
+            health_port=8081,
+            sse_retry_interval=5,
+            poll_interval=30,
+            sse_read_timeout=30,
+            sse_max_age=600,
+        )
         listener = RunnerListener()
 
     listener.identity = MagicMock()
@@ -329,3 +340,101 @@ class TestAuthSecretNaming:
         prefix_plan = names[0].rsplit("-plan-", 1)[0]
         prefix_apply = names[1].rsplit("-apply-", 1)[0]
         assert prefix_plan == prefix_apply
+
+
+# ── Per-run vars Secret ──────────────────────────────────────────────
+
+
+class TestCreateVarsSecret:
+    """The vars Secret holds all variable values (terraform tfvars blob + env
+    vars), with an ownerReference to the Job (cascade-GC), so values are never
+    plaintext in the Job spec."""
+
+    async def test_builds_secret_with_tfvars_blob_and_env_keys(self, fresh_shutdown_event):
+        listener = _make_listener(fresh_shutdown_event)
+        core_api = MagicMock()
+        with patch("terrapod.runner.job_manager._get_core_api", return_value=core_api):
+            await listener._create_vars_secret(
+                "tprun-r1-plan-vars",
+                "r1",
+                terraform_vars=[
+                    {"key": "cidr", "value": "10.0.0.0/16", "hcl": False},
+                    {"key": "ports", "value": "[80, 443]", "hcl": True},
+                ],
+                env_vars=[{"key": "AWS_SECRET_ACCESS_KEY", "value": "shh"}],
+                job_name="tprun-r1-plan",
+                job_uid="uid-1",
+            )
+        core_api.create_namespaced_secret.assert_called_once()
+        body = core_api.create_namespaced_secret.call_args.kwargs["body"]
+        sd = body.string_data
+        # Env var value is a Secret key.
+        assert sd["AWS_SECRET_ACCESS_KEY"] == "shh"
+        # Terraform vars are a JSON blob preserving hcl.
+        import json as _json
+
+        blob = _json.loads(sd["terraform.tfvars.json"])
+        assert {"key": "ports", "value": "[80, 443]", "hcl": True} in blob
+        # ownerReference back to the Job (cascade GC).
+        owner = body.metadata.owner_references[0]
+        assert owner.kind == "Job" and owner.uid == "uid-1"
+
+    async def test_no_tfvars_key_when_only_env_vars(self, fresh_shutdown_event):
+        listener = _make_listener(fresh_shutdown_event)
+        core_api = MagicMock()
+        with patch("terrapod.runner.job_manager._get_core_api", return_value=core_api):
+            await listener._create_vars_secret(
+                "tprun-r1-plan-vars",
+                "r1",
+                terraform_vars=[],
+                env_vars=[{"key": "FOO", "value": "bar"}],
+                job_name="tprun-r1-plan",
+                job_uid="uid-1",
+            )
+        sd = core_api.create_namespaced_secret.call_args.kwargs["body"].string_data
+        assert "terraform.tfvars.json" not in sd
+        assert sd["FOO"] == "bar"
+
+
+# ── Launch namespace propagation (regression) ────────────────────────
+
+
+class TestLaunchNamespace:
+    """Regression: the launch path must create the Job AND look up its UID (for
+    the auth-Secret ownerReference) in the *configured* runner namespace.
+
+    get_job_uid() previously omitted the namespace and fell back to a stale
+    default decoupled from the configured runner namespace, so the auth-Secret
+    step did a `get jobs` in the wrong namespace than the Job was created in —
+    a 403 on every launch when the two differed (e.g. single-namespace eval)."""
+
+    async def test_launch_uses_configured_runner_namespace(self, fresh_shutdown_event):
+        listener = _make_listener(fresh_shutdown_event)
+        listener.runner_config.runner_namespace = "custom-runner-ns"
+
+        listener._get_runner_token = AsyncMock(return_value="runtok:abc")
+        listener._create_auth_secret = AsyncMock()
+        listener._read_ca_bundle_pem = MagicMock(return_value="")
+        listener._report_launch_failed = AsyncMock()
+        listener._auth_headers = MagicMock(return_value={})
+
+        spec = {"metadata": {"name": "tprun-r1-plan", "namespace": "custom-runner-ns"}}
+        with (
+            patch("terrapod.runner.job_template.build_job_spec", return_value=spec),
+            patch(
+                "terrapod.runner.job_manager.create_job",
+                new=AsyncMock(return_value="tprun-r1-plan"),
+            ) as mock_create,
+            patch(
+                "terrapod.runner.job_manager.get_job_uid",
+                new=AsyncMock(return_value="uid-1"),
+            ) as mock_uid,
+            patch("terrapod.runner.listener.arequest_with_retry", new=AsyncMock()),
+        ):
+            await listener._launch_run("r1", {"phase": "plan"})
+
+        listener._report_launch_failed.assert_not_called()
+        mock_create.assert_awaited_once()
+        assert mock_create.await_args.kwargs["namespace"] == "custom-runner-ns"
+        mock_uid.assert_awaited_once()
+        assert mock_uid.await_args.kwargs["namespace"] == "custom-runner-ns"

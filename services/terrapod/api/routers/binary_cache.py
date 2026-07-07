@@ -20,23 +20,27 @@ Endpoints:
     DELETE /api/terrapod/v1/admin/provider-cache/{hostname}/{namespace}/{type}/{version}      — purge provider
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from terrapod.api.dependencies import AuthenticatedUser, get_current_user, require_admin
-from terrapod.config import settings
+from terrapod.api.serialization import rfc3339
+from terrapod.config import WarmBinaryEntry, WarmProviderEntry, settings
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
 from terrapod.services.binary_cache_service import (
     get_or_cache_binary,
+    get_or_cache_sums,
     list_available_versions,
     list_cached_binaries,
     purge_binary,
     resolve_version,
     warm_binary,
 )
+from terrapod.services.cache_errors import CacheOnlyError
+from terrapod.services.cache_warm_service import warm_from_manifest
 from terrapod.services.provider_cache_service import (
     list_cached_providers,
     purge_cached_provider,
@@ -110,6 +114,9 @@ async def download_binary(
     try:
         resolved = await resolve_version(tool, version)
         url = await get_or_cache_binary(db, storage, tool, resolved, os, arch)
+    except CacheOnlyError as e:
+        # Sealed mode + cache miss — genuinely not available; don't fetch upstream.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
     except Exception as e:
@@ -128,6 +135,65 @@ async def download_binary(
 
     await db.commit()
     return RedirectResponse(url=url, status_code=status.HTTP_302_FOUND)
+
+
+@router.get("/binary-cache/{tool}/{version}/sha256sums")
+async def get_binary_sha256sums(
+    tool: str,
+    version: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+    storage: ObjectStore = Depends(get_storage),
+) -> Response:
+    """Serve the publisher SHA256SUMS manifest for a tool/version (#607).
+
+    The runner fetches this (and `.sig`) to independently verify the executable
+    against the publisher's signature with its own pinned key. Lazily warmed
+    from upstream if not yet persisted. Same source as the binary (cache path).
+    """
+    if not settings.registry.binary_cache.enabled:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Binary cache is disabled"
+        )
+    try:
+        resolved = await resolve_version(tool, version)
+        manifest, _sig = await get_or_cache_sums(storage, tool, resolved)
+    except CacheOnlyError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to obtain SHA256SUMS for {tool} {version}: {e}",
+        ) from e
+    return Response(content=manifest, media_type="text/plain")
+
+
+@router.get("/binary-cache/{tool}/{version}/sha256sums.sig")
+async def get_binary_sha256sums_sig(
+    tool: str,
+    version: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+    storage: ObjectStore = Depends(get_storage),
+) -> Response:
+    """Serve the detached GPG signature over the SHA256SUMS manifest (#607)."""
+    if not settings.registry.binary_cache.enabled:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Binary cache is disabled"
+        )
+    try:
+        resolved = await resolve_version(tool, version)
+        _manifest, sig = await get_or_cache_sums(storage, tool, resolved)
+    except CacheOnlyError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to obtain SHA256SUMS signature for {tool} {version}: {e}",
+        ) from e
+    return Response(content=sig, media_type="application/pgp-signature")
 
 
 # --- Admin endpoints ---
@@ -154,7 +220,7 @@ async def list_cached_binaries_endpoint(
                         "arch": e.arch,
                         "shasum": e.shasum,
                         "download-url": e.download_url,
-                        "cached-at": e.cached_at.isoformat() if e.cached_at else None,
+                        "cached-at": rfc3339(e.cached_at),
                     },
                 }
                 for e in entries
@@ -179,6 +245,9 @@ async def warm_binary_endpoint(
 
     try:
         url = await warm_binary(db, storage, body.tool, body.version, body.os, body.arch)
+    except CacheOnlyError as e:
+        # Sealed mode can't fetch upstream — warming must run before sealing.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
     except Exception as e:
@@ -191,6 +260,49 @@ async def warm_binary_endpoint(
     return JSONResponse(
         status_code=status.HTTP_200_OK,
         content={"status": "cached", "download_url": url},
+    )
+
+
+class BulkWarmRequest(BaseModel):
+    """Bulk cache pre-population request — warm many binaries + provider
+    platforms in one call. Powers the admin UI bulk-warm and automation."""
+
+    binaries: list[WarmBinaryEntry] = []
+    providers: list[WarmProviderEntry] = []
+
+
+@router.post("/admin/binary-cache/warm-bulk")
+async def warm_bulk_endpoint(
+    body: BulkWarmRequest,
+    user: AuthenticatedUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    storage: ObjectStore = Depends(get_storage),
+) -> JSONResponse:
+    """Warm a batch of binaries and/or provider platforms.
+
+    Resilient: each (entry, platform) is warmed independently and reported back
+    with its own ok/error, so one missing version doesn't fail the whole batch.
+    Returns HTTP 200 with per-entry results even when some entries failed; the
+    caller inspects `failed`/`results` to surface partial outcomes.
+    """
+    if not body.binaries and not body.providers:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No entries to warm — provide at least one binary or provider.",
+        )
+
+    summary = await warm_from_manifest(db, storage, body.binaries, body.providers)
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={
+            "total": summary.total,
+            "succeeded": summary.succeeded,
+            "failed": summary.failed,
+            "results": [
+                {"kind": r.kind, "ref": r.ref, "ok": r.ok, "error": r.error}
+                for r in summary.results
+            ],
+        },
     )
 
 
@@ -235,7 +347,7 @@ async def list_cached_providers_endpoint(
                         "os": e.os,
                         "arch": e.arch,
                         "shasum": e.shasum,
-                        "cached-at": e.cached_at.isoformat() if e.cached_at else None,
+                        "cached-at": rfc3339(e.cached_at),
                     },
                 }
                 for e in entries

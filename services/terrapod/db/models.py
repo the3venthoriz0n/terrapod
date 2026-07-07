@@ -23,9 +23,12 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+from terrapod.crypto.types import EncryptedText
 
 
 def generate_uuid7() -> uuid.UUID:
@@ -97,12 +100,19 @@ class Role(Base):
     allow_names: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
     deny_labels: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
     deny_names: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
-    workspace_permission: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="read"
-    )  # read, plan, write, admin
-    pool_permission: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="read", server_default="read"
-    )  # read, write, admin
+
+    # The role's grant is its explicit capability set (#585) — the SINGLE
+    # persisted source of truth for enforcement. The legacy hierarchical
+    # permission *levels* (workspace/pool/registry/catalog) are NOT stored: they
+    # are only an authoring shorthand (expanded into `capabilities` on write) and
+    # a derived summary computed on read (terrapod.auth.capabilities). A JSONB
+    # list of "<resource>:<verb>" strings; never indexed/unique.
+    # server_default mirrors the migration so schemas built from metadata
+    # (integration tests, which bypass the ORM Python default on raw inserts)
+    # also default to an empty list instead of violating NOT NULL.
+    capabilities: Mapped[list[str]] = mapped_column(
+        JSONB, default=list, server_default="[]", nullable=False
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=now_utc, nullable=False
@@ -161,17 +171,31 @@ class APIToken(Base):
     id: Mapped[str] = mapped_column(String(63), primary_key=True)  # "at-{uuid7}"
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     description: Mapped[str] = mapped_column(String(255), nullable=False, default="")
-    user_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    token_type: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="user"
-    )  # "user", "organization"
+    # Token kind (#495): interactive (terraform login / UI), service_bound
+    # (user-bound automation; perms = min(pinned, owner live)), service_detached
+    # (admin-managed M2M; absolute pinned perms; exempt from idle-login rejection).
+    kind: Mapped[str] = mapped_column(String(20), nullable=False, default="interactive")
+    # Owning identity. NULL <=> detached (no user binding). Bare email string,
+    # NOT an FK: SSO users have no `users` row (sso_service: "SSO users are NOT
+    # stored in the users table"), so an FK would reject their tokens. Integrity
+    # via live role-intersection + idle-login window + local is_active check.
+    bound_to: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # The minter (audit). Always set, even for detached (its only creator record).
+    created_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    # Token's own pinned role set (service tokens). Resolved through label-RBAC.
+    pinned_roles: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    # Legacy TFE-shaped field, superseded by `kind`. Retained (unread) for
+    # response back-compat; dropped in a later release.
+    token_type: Mapped[str] = mapped_column(String(20), nullable=False, default="user")
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=now_utc, nullable=False
     )
+    # Set by the rotate action; expiry basis = rotated_at or created_at.
+    rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     lifespan_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    __table_args__ = (Index("ix_api_tokens_user_email", "user_email"),)
+    __table_args__ = (Index("ix_api_tokens_bound_to", "bound_to"),)
 
 
 class AgentPool(Base):
@@ -260,6 +284,12 @@ class Workspace(Base):
         String(20), nullable=False, default="tofu"
     )  # tofu, terraform
     terraform_version: Mapped[str] = mapped_column(String(20), nullable=False, default="1.12")
+    # Terragrunt single-unit support (#534): when enabled the runner invokes
+    # `terragrunt` wrapping the tofu/terraform binary (via TG_TF_PATH). Version
+    # is partial (e.g. "0.67"), resolved via the binary cache like
+    # terraform_version; empty → latest stable.
+    terragrunt_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    terragrunt_version: Mapped[str] = mapped_column(String(20), nullable=False, default="1.0")
     working_directory: Mapped[str] = mapped_column(String(500), nullable=False, default="")
     locked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     lock_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -330,6 +360,11 @@ class Workspace(Base):
         String(20), nullable=False, server_default="merge", default="merge"
     )  # merge, squash, rebase
 
+    # Plan expiry (#646): an apply-capable run that has sat in `planned` longer than
+    # this TTL (from plan_finished_at) can no longer be applied — it is auto-discarded
+    # and must be re-planned. NULL / 0 = disabled (default) = current behaviour.
+    plan_expiry_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     # Drift detection
     drift_detection_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     drift_detection_interval_seconds: Mapped[int] = mapped_column(
@@ -341,9 +376,34 @@ class Workspace(Base):
     drift_status: Mapped[str] = mapped_column(
         String(20), nullable=False, default=""
     )  # "", "no_drift", "drifted", "errored"
+    # The run that produced the current `drift_status`. Lets the workspace-list
+    # UI link the Drifted / Errored badge straight to the run, instead of the
+    # operator hunting through the runs list. Plain nullable UUID, no FK — a
+    # later artifact-retention sweep may delete the run row, and we don't want
+    # that to break workspace deletion via cascade. The UI handles a 404 on the
+    # click-through gracefully.
+    drift_latest_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # Per-workspace allowlist of resource-address + attribute-path glob
+    # patterns (#482). When a drift run reports `has_changes=True`, every
+    # changed attribute is matched against this list before drift_status
+    # is computed. If every change matches a rule → drift_status=no_drift.
+    # Empty list (default) means classic behaviour: every change counts
+    # as drift. Examples:
+    #   "aws_iam_role.foo.tags.Environment"   (single attr on one resource)
+    #   "module.eks*.argocd_cluster.*.config.tls_client_config.ca_data"
+    #   "aws_autoscaling_group.workers[*]"   (any change to any workers[i])
+    drift_ignore_rules: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, server_default="[]", default=list
+    )
 
     # State divergence — set when an apply Job succeeds but state upload fails
     state_diverged: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+
+    # Slack app run notifications (#556): channel this workspace's interactive
+    # approval / auto-apply / errored / drift messages post to. Opt-in — empty
+    # means this workspace posts NOTHING; there is no config-level fan-out. Only
+    # used when the Slack app is enabled.
+    slack_channel: Mapped[str] = mapped_column(String(128), nullable=False, server_default="")
 
     # AI plan summary (#401). `ai_summary_mode` is a three-state opt-in:
     # - "default": follow the global ai_summary.enabled toggle
@@ -385,6 +445,21 @@ class Workspace(Base):
         nullable=True,
     )
 
+    # Service Catalog provenance (#535). Set when this workspace was
+    # provisioned from a catalog item — the workspace IS the instance. A
+    # workspace is "catalog-managed" iff catalog_item_id is not NULL: such
+    # workspaces are admin-managed (non-admins act on them only through the
+    # catalog API). catalog_version_pin NULL = float (track latest module
+    # version via the module_workspace_link); set = pinned. catalog_input_values
+    # is the (sensitive-redacted) snapshot of the provision form values.
+    catalog_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("catalog_items.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    catalog_version_pin: Mapped[str | None] = mapped_column(String(63), nullable=True)
+    catalog_input_values: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=now_utc, nullable=False
     )
@@ -424,7 +499,13 @@ class StateVersion(Base):
     )
     serial: Mapped[int] = mapped_column(Integer, nullable=False)
     lineage: Mapped[str] = mapped_column(String(63), nullable=False, default="")
+    # `md5` is part of the TFE/go-tfe state-version contract and is kept for
+    # compatibility. `sha256` is Terrapod-internal and is the hash used for
+    # the state-divergence equality check (an md5 collision must not be able
+    # to suppress a genuine divergence flag). Nullable/empty for rows written
+    # before the column existed — the divergence check falls back to md5 then.
     md5: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default="")
     state_size: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     run_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
@@ -572,6 +653,96 @@ class ModuleWorkspaceLink(Base):
     )
 
 
+class ProviderTemplate(Base):
+    """Admin-managed, parameterized provider configuration for the Service
+    Catalog (#535).
+
+    Managed like a policy set (CRUD + RBAC + audit), authored as code via the
+    Terraform provider. `body` is an HCL `provider "x" { ... }` snippet that
+    references `var.*`; `parameters` declares the inputs (region, account_id,
+    …) the consumer fills at provision. The catalog wrapper renders the body
+    into the generated ROOT module (never into the registry module) and
+    declares the params as root variables — values flow as Terraform variables,
+    so there is no server-side string interpolation.
+    """
+
+    __tablename__ = "provider_templates"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=generate_uuid7
+    )
+    name: Mapped[str] = mapped_column(String(63), nullable=False)
+    provider_type: Mapped[str] = mapped_column(String(63), nullable=False)  # aws, gcp, azure, …
+    body: Mapped[str] = mapped_column(Text, nullable=False)  # HCL provider block referencing var.*
+    # [{name, type, required, default, sensitive}] — the consumer-supplied params.
+    parameters: Mapped[list[Any]] = mapped_column(JSONB, default=list, nullable=False)
+    labels: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    owner_email: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now_utc, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now_utc, onupdate=now_utc, nullable=False
+    )
+
+    __table_args__ = (sa.UniqueConstraint("name", name="uq_provider_templates"),)
+
+
+class CatalogItem(Base):
+    """A blessed, version-pinnable designation over a registry module for
+    no-code self-service provisioning (#535).
+
+    NOT a copy of the module — a designation + form-constraint overlay. The
+    provisioning form derives from the module version's extracted interface
+    (RegistryModuleVersion.inputs) plus `variable_options`; provisioning
+    creates an ordinary agent-mode, non-VCS workspace whose config is a
+    server-generated wrapper that calls this module.
+    """
+
+    __tablename__ = "catalog_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=generate_uuid7
+    )
+    module_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("registry_modules.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # Item-level default pin (NULL = float / track latest; instances may override).
+    default_version_pin: Mapped[str | None] = mapped_column(String(63), nullable=True)
+    name: Mapped[str] = mapped_column(String(90), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # FK lists kept as JSONB (not association tables) — always loaded with the item.
+    provider_template_ids: Mapped[list[Any]] = mapped_column(JSONB, default=list, nullable=False)
+    # NULL/empty = any pool the consumer can use; else scopes the offered pools.
+    allowed_agent_pool_ids: Mapped[list[Any] | None] = mapped_column(JSONB, nullable=True)
+    # Per-variable overlay: [{name, options[], default, sensitive, hidden}].
+    # `hidden: true` (with a fixed `default`) removes the input from the
+    # provision form and wires the default; `options` constrains the choice;
+    # `default` presets an editable value.
+    variable_options: Mapped[list[Any]] = mapped_column(JSONB, default=list, nullable=False)
+    labels: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    owner_email: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now_utc, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now_utc, onupdate=now_utc, nullable=False
+    )
+
+    module: Mapped["RegistryModule"] = relationship(lazy="joined")
+
+    __table_args__ = (
+        sa.UniqueConstraint("name", name="uq_catalog_items"),
+        Index("ix_catalog_items_module_id", "module_id"),
+    )
+
+
 class RegistryProvider(Base):
     """Top-level provider entity in the private registry."""
 
@@ -684,6 +855,7 @@ class RegistryProviderPlatform(Base):
     shasum: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     filename: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     upload_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    h1_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=now_utc, nullable=False
@@ -778,7 +950,34 @@ class CertificateAuthorityModel(Base):
         UUID(as_uuid=True), primary_key=True, default=generate_uuid7
     )
     ca_cert: Mapped[str] = mapped_column(Text, nullable=False)
-    ca_key_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    # The CA private key as a PKCS8 PEM. Stored via EncryptedText (#553): when
+    # app-layer encryption at rest is enabled it is envelope-encrypted, otherwise
+    # it is plaintext and at-rest protection comes from the database's own
+    # encryption (RDS/Azure/GCS-managed). The DB column is still TEXT either way.
+    ca_key_pem: Mapped[str] = mapped_column(EncryptedText, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now_utc, nullable=False
+    )
+
+
+class CryptoKey(Base):
+    """Wrapped data-encryption keys for app-layer encryption at rest (#553).
+
+    Each row is a DEK version, KEK-wrapped by the configured provider. The raw
+    DEK is never stored — it is unwrapped into memory at startup. ``canary`` is a
+    known plaintext encrypted under the DEK, verified on every boot.
+    """
+
+    __tablename__ = "crypto_keys"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=generate_uuid7
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    wrapped_dek: Mapped[str] = mapped_column(Text, nullable=False)
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    canary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=now_utc, nullable=False
     )
@@ -810,8 +1009,8 @@ class VCSConnection(Base):
         String(500), nullable=False, default=""
     )  # e.g. https://gitlab.example.com, https://github.example.com
     token: Mapped[str | None] = mapped_column(
-        Text, nullable=True
-    )  # PAT (GitLab) or PEM private key (GitHub App)
+        EncryptedText, nullable=True
+    )  # PAT (GitLab) or PEM private key (GitHub App) — app-encrypted at rest (#553)
 
     # GitHub-specific
     github_app_id: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -820,6 +1019,13 @@ class VCSConnection(Base):
     github_account_type: Mapped[str] = mapped_column(
         String(20), nullable=False, default=""
     )  # Organization, User (GitHub only)
+
+    # Per-connection webhook HMAC secret (GitHub). Optional: when set it is
+    # used to validate this connection's inbound webhooks, falling back to the
+    # global vcs.github.webhook_secret when null. Write-only via the API.
+    # EncryptedText (#553): the DB column was widened VARCHAR(255)→TEXT so an
+    # encryption envelope never overflows it. App-encrypted at rest when enabled.
+    webhook_secret: Mapped[str | None] = mapped_column(EncryptedText, nullable=True)
 
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="active"
@@ -901,6 +1107,9 @@ class AutodiscoveryRule(Base):
     notification_templates: Mapped[list[dict[str, Any]]] = mapped_column(
         JSONB, default=list, nullable=False
     )
+    # #672: execution hooks (by id) to associate with every workspace this rule
+    # materialises, so discovered workspaces inherit their hooks automatically.
+    execution_hook_templates: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
     # #314 deletion lifecycle: what to do when a discovered directory is
     # removed on the tracked branch. "flag" (default, safe) marks the
     # workspace pending_deletion and requires an explicit operator
@@ -1008,7 +1217,7 @@ class Variable(Base):
         nullable=False,
     )
     key: Mapped[str] = mapped_column(String(255), nullable=False)
-    value: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    value: Mapped[str] = mapped_column(EncryptedText, nullable=False, default="")
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     category: Mapped[str] = mapped_column(
         String(20), nullable=False, default="terraform"
@@ -1076,7 +1285,7 @@ class VariableSetVariable(Base):
         nullable=False,
     )
     key: Mapped[str] = mapped_column(String(255), nullable=False)
-    value: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    value: Mapped[str] = mapped_column(EncryptedText, nullable=False, default="")
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     category: Mapped[str] = mapped_column(String(20), nullable=False, default="terraform")
     hcl: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -1115,6 +1324,111 @@ class VariableSetWorkspace(Base):
     )
 
     workspace: Mapped["Workspace"] = relationship(lazy="joined")
+
+
+# --- Execution Hooks (#619) ---
+
+# Valid hook points, in execution order. A hook fires inside the runner Job at
+# one of these boundaries with the run's env, working dir, and cloud identity
+# already established.
+EXECUTION_HOOK_POINTS = (
+    "pre_init",
+    "pre_plan",
+    "post_plan",
+    "pre_apply",
+    "post_apply",
+)
+
+
+class ExecutionHook(Base):
+    """A reusable custom-shell hook run inside the runner Job at a fixed point.
+
+    Mirrors the variable-set model (a reusable library entry associated with
+    workspaces), but with NO `global` flag — a hook only runs on workspaces it
+    is explicitly associated with via ``ExecutionHookWorkspace``. That bounds
+    the blast radius: no single hook object can touch every workspace's secrets
+    or state. Managing hooks is platform-admin-gated. The script body is
+    non-sensitive by contract (secrets a hook needs come via the per-run vars
+    Secret, never inlined here).
+    """
+
+    __tablename__ = "execution_hooks"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=generate_uuid7
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # One of EXECUTION_HOOK_POINTS. Validated at the service layer (422).
+    hook_point: Mapped[str] = mapped_column(String(20), nullable=False)
+    # Operator-supplied shell body, run via `/bin/sh -c`. Non-sensitive.
+    script: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Deterministic ordering when several associated hooks share a point:
+    # (priority ASC, name ASC).
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now_utc, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now_utc, onupdate=now_utc, nullable=False
+    )
+
+    workspace_assignments: Mapped[list["ExecutionHookWorkspace"]] = relationship(
+        cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (sa.UniqueConstraint("name", name="uq_execution_hooks"),)
+
+
+class ExecutionHookWorkspace(Base):
+    """Junction table associating execution hooks with workspaces."""
+
+    __tablename__ = "execution_hook_workspaces"
+
+    hook_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("execution_hooks.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    workspace: Mapped["Workspace"] = relationship(lazy="joined")
+
+
+# --- Slack identity linking (#556) ---
+
+
+class SlackIdentityLink(Base):
+    """Durable binding of a Slack user to a Terrapod identity (#556).
+
+    Established once via an explicit login (the "connect your account" flow), then
+    reused for every subsequent Slack-initiated action. Long-lived **identity**,
+    never entitlement: authorization (RBAC) is re-checked live on each action, so a
+    persistent binding never grants standing permission. Keyed by
+    (team, user) so one Terrapod can serve multiple Slack workspaces.
+    """
+
+    __tablename__ = "slack_identity_links"
+    __table_args__ = (UniqueConstraint("slack_team_id", "slack_user_id", name="uq_slack_identity"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=generate_uuid7
+    )
+    slack_team_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    slack_user_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    # The bound Terrapod principal. Email-first identity; no FK (a user row may not
+    # exist for SSO-only identities, mirroring role_assignments' email keying).
+    terrapod_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    linked_via: Mapped[str] = mapped_column(String(32), nullable=False, default="slash_command")
+    linked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=now_utc
+    )
 
 
 # --- Configuration Versions ---
@@ -1184,6 +1498,10 @@ class Run(Base):
         String(20), nullable=False, default="tofu"
     )  # tofu, terraform
     terraform_version: Mapped[str] = mapped_column(String(20), nullable=False, default="")
+    # Terragrunt snapshot (#534) — frozen from the workspace at run creation so
+    # later workspace edits don't change an in-flight run's execution tool.
+    terragrunt_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    terragrunt_version: Mapped[str] = mapped_column(String(20), nullable=False, default="")
     resource_cpu: Mapped[str] = mapped_column(String(20), nullable=False, default="1")
     resource_memory: Mapped[str] = mapped_column(String(20), nullable=False, default="2Gi")
     pool_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -1265,6 +1583,14 @@ class Run(Base):
     plan_finished_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # The workspace state-version serial this run planned against, captured when the
+    # run enters `planning` (#647). NULL = no baseline (first apply, or a plan-only
+    # run) → the state-staleness guard never fires. If the workspace's current serial
+    # later advances past this, the plan is stale and the run is auto-discarded.
+    plan_state_serial: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Human-readable reason a run was discarded (state changed / plan expired /
+    # superseded), surfaced as `discard-reason` in the run serializer (#646/#647).
+    discard_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
     apply_started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -1461,7 +1787,7 @@ class NotificationConfiguration(Base):
         String(20), nullable=False
     )  # generic, slack, email
     url: Mapped[str] = mapped_column(String(2000), nullable=False, default="")
-    token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    token: Mapped[str | None] = mapped_column(EncryptedText, nullable=True)  # app-encrypted (#553)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     triggers: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=list)
     email_addresses: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=list)
@@ -1820,3 +2146,61 @@ class PlanSummary(Base):
     )
 
     __table_args__ = (sa.UniqueConstraint("run_id", name="uq_plan_summaries_run"),)
+
+
+class PlanSummaryMessage(Base):
+    """One turn in the AI plan-summary chat thread (#463).
+
+    Attached to a PlanSummary; the initial structured summary stays on
+    the parent `PlanSummary` row (description + risk_factors). This
+    table only stores conversational follow-ups — user questions and
+    assistant replies — that build on top of that initial summary.
+
+    Roles:
+      - "user": operator follow-up question
+      - "assistant": model reply
+
+    Each assistant row carries its own telemetry (model, token counts,
+    error) so the daily-budget gate debits per turn and an operator
+    can audit cost across the thread. User rows have zero tokens; the
+    columns exist so the table shape is uniform.
+
+    Ordering is by `(plan_summary_id, created_at)` — the SDK / API
+    returns rows in chronological order. uuid7 IDs are time-ordered
+    too, so PK order matches `created_at` order for any sane clock.
+    """
+
+    __tablename__ = "plan_summary_messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=generate_uuid7
+    )
+    plan_summary_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("plan_summaries.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    # Telemetry — meaningful on assistant rows, zero on user rows.
+    model: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now_utc, nullable=False
+    )
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            "role IN ('user', 'assistant')",
+            name="ck_plan_summary_messages_role",
+        ),
+        sa.Index(
+            "ix_plan_summary_messages_plan_created",
+            "plan_summary_id",
+            "created_at",
+        ),
+    )

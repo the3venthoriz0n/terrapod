@@ -9,6 +9,7 @@ from httpx import ASGITransport, AsyncClient
 
 from terrapod.api.app import create_application as create_app
 from terrapod.api.dependencies import AuthenticatedUser, get_current_user
+from terrapod.auth.capabilities import caps_for_level
 from terrapod.db.models import StateVersion
 from terrapod.db.session import get_db
 
@@ -82,7 +83,7 @@ class TestDeleteStateVersion:
     @patch("terrapod.api.app.init_db")
     @patch("terrapod.redis.client.publish_workspace_event", new_callable=AsyncMock)
     @patch("terrapod.api.routers.state_management.get_storage")
-    @patch("terrapod.api.routers.state_management.resolve_workspace_permission")
+    @patch("terrapod.api.routers.state_management.resolve_workspace_capabilities_for")
     async def test_delete_non_current_state_version(
         self,
         mock_resolve,
@@ -96,7 +97,7 @@ class TestDeleteStateVersion:
         ws = _mock_workspace(ws_id=ws_id, owner_email="test@example.com")
         sv = _mock_state_version(ws_id, serial=1)
 
-        mock_resolve.return_value = "admin"
+        mock_resolve.return_value = caps_for_level("admin")
 
         mock_db = AsyncMock()
         # First execute: get state version
@@ -126,7 +127,7 @@ class TestDeleteStateVersion:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.state_management.resolve_workspace_permission")
+    @patch("terrapod.api.routers.state_management.resolve_workspace_capabilities_for")
     async def test_delete_current_state_version_rejected(
         self,
         mock_resolve,
@@ -138,7 +139,7 @@ class TestDeleteStateVersion:
         ws = _mock_workspace(ws_id=ws_id, owner_email="test@example.com")
         sv = _mock_state_version(ws_id, serial=3)
 
-        mock_resolve.return_value = "admin"
+        mock_resolve.return_value = caps_for_level("admin")
 
         mock_db = AsyncMock()
         mock_db.execute.side_effect = [
@@ -162,7 +163,7 @@ class TestDeleteStateVersion:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.state_management.resolve_workspace_permission")
+    @patch("terrapod.api.routers.state_management.resolve_workspace_capabilities_for")
     async def test_delete_state_requires_admin(
         self,
         mock_resolve,
@@ -174,7 +175,7 @@ class TestDeleteStateVersion:
         ws = _mock_workspace(ws_id=ws_id)
         sv = _mock_state_version(ws_id, serial=1)
 
-        mock_resolve.return_value = "write"  # not admin
+        mock_resolve.return_value = caps_for_level("write")  # not admin
 
         mock_db = AsyncMock()
         mock_db.execute.return_value = _scalar_result(sv)
@@ -203,7 +204,7 @@ class TestRollbackStateVersion:
     @patch("terrapod.api.metrics.STATE_VERSIONS_CREATED")
     @patch("terrapod.api.routers.tfe_v2._state_version_json")
     @patch("terrapod.api.routers.state_management.get_storage")
-    @patch("terrapod.api.routers.state_management.resolve_workspace_permission")
+    @patch("terrapod.api.routers.state_management.resolve_workspace_capabilities_for")
     async def test_rollback_creates_new_version(
         self,
         mock_resolve,
@@ -219,7 +220,7 @@ class TestRollbackStateVersion:
         ws = _mock_workspace(ws_id=ws_id, owner_email="test@example.com")
         sv = _mock_state_version(ws_id, serial=1)
 
-        mock_resolve.return_value = "write"
+        mock_resolve.return_value = caps_for_level("write")
 
         state_bytes = b'{"version": 4, "serial": 1, "lineage": "test"}'
         mock_storage = AsyncMock()
@@ -231,9 +232,13 @@ class TestRollbackStateVersion:
         }
 
         mock_db = AsyncMock()
+        # 3rd execute: the #647 discard-stale-plans hook (returns no planned runs).
+        _no_runs = MagicMock()
+        _no_runs.scalars.return_value.all.return_value = []
         mock_db.execute.side_effect = [
             _scalar_result(sv),  # get state version
             _scalar_result(3),  # get max serial
+            _no_runs,  # discard_stale_plans_for_state_change query
         ]
         mock_db.get.return_value = ws
 
@@ -255,7 +260,7 @@ class TestRollbackStateVersion:
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
     @patch("terrapod.api.routers.state_management.get_storage")
-    @patch("terrapod.api.routers.state_management.resolve_workspace_permission")
+    @patch("terrapod.api.routers.state_management.resolve_workspace_capabilities_for")
     async def test_rollback_missing_storage_returns_404(
         self,
         mock_resolve,
@@ -268,7 +273,7 @@ class TestRollbackStateVersion:
         ws = _mock_workspace(ws_id=ws_id, owner_email="test@example.com")
         sv = _mock_state_version(ws_id, serial=1)
 
-        mock_resolve.return_value = "write"
+        mock_resolve.return_value = caps_for_level("write")
 
         mock_storage = AsyncMock()
         mock_storage.get.side_effect = Exception("Not found")
@@ -301,7 +306,7 @@ class TestUploadState:
     @patch("terrapod.api.metrics.STATE_VERSIONS_CREATED")
     @patch("terrapod.api.routers.tfe_v2._state_version_json")
     @patch("terrapod.api.routers.state_management.get_storage")
-    @patch("terrapod.api.routers.state_management.resolve_workspace_permission")
+    @patch("terrapod.api.routers.state_management.resolve_workspace_capabilities_for")
     @patch("terrapod.api.routers.tfe_v2._get_workspace_by_id")
     async def test_upload_state_manual(
         self,
@@ -318,7 +323,7 @@ class TestUploadState:
         ws_id = uuid.uuid4()
         ws = _mock_workspace(ws_id=ws_id)
         mock_get_ws.return_value = ws
-        mock_resolve.return_value = "write"
+        mock_resolve.return_value = caps_for_level("write")
 
         mock_sv_json.return_value = {
             "data": {"id": "sv-new", "type": "state-versions", "attributes": {}}
@@ -344,13 +349,16 @@ class TestUploadState:
 
         assert resp.status_code == 201
         mock_db.add.assert_called_once()
-        mock_storage.put.assert_called_once()
+        # Manual state upload streams the body to a PVC tempfile, then
+        # `put_stream`s it to storage — never buffers it in RAM (CLAUDE.md #14).
+        mock_storage.put_stream.assert_called_once()
+        mock_storage.put.assert_not_called()
         mock_counter.inc.assert_called_once()
 
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.state_management.resolve_workspace_permission")
+    @patch("terrapod.api.routers.state_management.resolve_workspace_capabilities_for")
     @patch("terrapod.api.routers.tfe_v2._get_workspace_by_id")
     async def test_upload_state_requires_write(
         self,
@@ -362,7 +370,7 @@ class TestUploadState:
     ):
         ws = _mock_workspace()
         mock_get_ws.return_value = ws
-        mock_resolve.return_value = "read"  # not write
+        mock_resolve.return_value = caps_for_level("read")  # not write
 
         mock_db = AsyncMock()
         user = _user(roles=["everyone"])
@@ -381,7 +389,7 @@ class TestUploadState:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.state_management.resolve_workspace_permission")
+    @patch("terrapod.api.routers.state_management.resolve_workspace_capabilities_for")
     @patch("terrapod.api.routers.tfe_v2._get_workspace_by_id")
     async def test_upload_invalid_json_returns_400(
         self,
@@ -393,7 +401,7 @@ class TestUploadState:
     ):
         ws = _mock_workspace()
         mock_get_ws.return_value = ws
-        mock_resolve.return_value = "write"
+        mock_resolve.return_value = caps_for_level("write")
 
         mock_db = AsyncMock()
         user = _user(email="test@example.com")
@@ -478,7 +486,7 @@ class TestRunDetailStateVersion:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.runs.resolve_workspace_permission")
+    @patch("terrapod.api.routers.runs.resolve_workspace_capabilities_for")
     @patch("terrapod.api.routers.runs.run_service.get_run")
     async def test_show_run_includes_state_version(
         self,
