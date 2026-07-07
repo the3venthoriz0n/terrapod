@@ -60,6 +60,8 @@ type workspaceModel struct {
 	AutoApply                     types.Bool   `tfsdk:"auto_apply"`
 	ExecutionBackend              types.String `tfsdk:"execution_backend"`
 	TerraformVersion              types.String `tfsdk:"terraform_version"`
+	TerragruntEnabled             types.Bool   `tfsdk:"terragrunt_enabled"`
+	TerragruntVersion             types.String `tfsdk:"terragrunt_version"`
 	WorkingDirectory              types.String `tfsdk:"working_directory"`
 	ResourceCPU                   types.String `tfsdk:"resource_cpu"`
 	ResourceMemory                types.String `tfsdk:"resource_memory"`
@@ -76,8 +78,10 @@ type workspaceModel struct {
 	DriftIgnoreRules              types.List   `tfsdk:"drift_ignore_rules"`
 	DriftDetectionEnabled         types.Bool   `tfsdk:"drift_detection_enabled"`
 	DriftDetectionIntervalSeconds types.Int64  `tfsdk:"drift_detection_interval_seconds"`
+	PlanExpirySeconds             types.Int64  `tfsdk:"plan_expiry_seconds"`
 	AISummaryMode                 types.String `tfsdk:"ai_summary_mode"`
 	AISummaryContext              types.String `tfsdk:"ai_summary_context"`
+	SlackChannel                  types.String `tfsdk:"slack_channel"`
 
 	// Set of workspace IDs authorized to read this workspace's state
 	// via `terraform_remote_state` (#344). Producer-controlled

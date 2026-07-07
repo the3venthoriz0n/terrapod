@@ -21,8 +21,7 @@ Consumers:
         DELETE /api/terrapod/v1/auth/sessions/user/{email} — admin revoke
 """
 
-import base64
-import hashlib
+import hmac
 from datetime import datetime
 from urllib.parse import quote
 
@@ -42,6 +41,7 @@ from terrapod.auth.auth_state import (
     store_auth_state,
 )
 from terrapod.auth.connectors import get_connector, get_default_connector, list_connectors
+from terrapod.auth.pkce import s256_challenge
 from terrapod.auth.sessions import (
     create_session,
     get_session,
@@ -175,6 +175,7 @@ async def authorize(
         code_challenge_method=code_challenge_method,
         idp_state=idp_state,
         nonce=auth_request.nonce,
+        idp_code_verifier=auth_request.code_verifier,
     )
     await store_auth_state(auth_state)
 
@@ -360,6 +361,7 @@ async def cli_sso_redirect(
         code_challenge_method=auth_state.code_challenge_method,
         idp_state=idp_state,
         nonce=auth_request.nonce,
+        idp_code_verifier=auth_request.code_verifier,
         credential_type="api_token",
     )
     await store_auth_state(new_state)
@@ -400,6 +402,7 @@ async def callback(
             callback_url=callback_url,
             code=code,
             state=state,
+            code_verifier=auth_state.idp_code_verifier,
         )
     except ValueError as e:
         logger.error("SSO callback failed", provider=auth_state.provider_name, error=str(e))
@@ -703,10 +706,10 @@ def _verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:
     if method != "S256":
         return False
 
-    # S256: BASE64URL(SHA256(code_verifier)) == code_challenge
-    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
-    computed_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-    return computed_challenge == code_challenge
+    computed_challenge = s256_challenge(code_verifier)
+    # Timing-safe — the PKCE challenge is attacker-influenced in the token
+    # exchange; match every other secret comparison in the codebase.
+    return hmac.compare_digest(computed_challenge, code_challenge)
 
 
 def _enforce_external_sso_requirement(provider_name: str, roles: list[str]) -> None:

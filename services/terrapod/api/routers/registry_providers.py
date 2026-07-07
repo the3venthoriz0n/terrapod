@@ -49,9 +49,13 @@ from terrapod.api.dependencies import (
     require_non_runner,
 )
 from terrapod.api.labels import validate_labels
+from terrapod.api.serialization import rfc3339
+from terrapod.auth import capabilities as cap
+from terrapod.auth.capabilities import has_capability
 from terrapod.config import settings
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
+from terrapod.services.cache_errors import CacheOnlyError
 from terrapod.services.platform_provider_service import (
     get_download_info as platform_get_download_info,
 )
@@ -75,9 +79,7 @@ from terrapod.services.registry_provider_service import (
     store_provider_shasums,
 )
 from terrapod.services.registry_rbac_service import (
-    REGISTRY_PERMISSION_HIERARCHY,
-    has_registry_permission,
-    resolve_registry_permission_for,
+    resolve_registry_capabilities_for,
 )
 from terrapod.storage import get_storage
 from terrapod.storage.protocol import ObjectStore
@@ -111,8 +113,8 @@ class CreateProviderRequest(BaseModel):
 # --- JSON:API serialization ---
 
 
-def _provider_to_jsonapi(provider, effective_permission: str | None = None) -> dict:  # type: ignore[no-untyped-def]
-    perm = effective_permission
+def _provider_to_jsonapi(provider, caps: frozenset[str] | None = None) -> dict:  # type: ignore[no-untyped-def]
+    caps = caps or frozenset()
     return {
         "id": str(provider.id),
         "type": "registry-providers",
@@ -121,12 +123,12 @@ def _provider_to_jsonapi(provider, effective_permission: str | None = None) -> d
             "namespace": provider.namespace,
             "labels": provider.labels or {},
             "owner-email": provider.owner_email,
-            "created-at": provider.created_at.isoformat() if provider.created_at else None,
-            "updated-at": provider.updated_at.isoformat() if provider.updated_at else None,
+            "created-at": rfc3339(provider.created_at),
+            "updated-at": rfc3339(provider.updated_at),
             "permissions": {
-                "can-update": has_registry_permission(perm, "admin"),
-                "can-destroy": has_registry_permission(perm, "admin"),
-                "can-create-version": has_registry_permission(perm, "write"),
+                "can-update": has_capability(caps, cap.REGISTRY_ADMIN),
+                "can-destroy": has_capability(caps, cap.REGISTRY_ADMIN),
+                "can-create-version": has_capability(caps, cap.REGISTRY_WRITE),
             },
         },
     }
@@ -145,7 +147,7 @@ def _version_to_jsonapi(version, upload_links: dict | None = None) -> dict:  # t
             "shasums-uploaded": version.shasums_uploaded,
             "shasums-sig-uploaded": version.shasums_sig_uploaded,
             "platforms": platforms,
-            "created-at": version.created_at.isoformat() if version.created_at else None,
+            "created-at": rfc3339(version.created_at),
         },
     }
     if upload_links:
@@ -173,24 +175,24 @@ def _platform_to_jsonapi(platform, upload_link: str | None = None) -> dict:  # t
 # --- Helper ---
 
 
-async def _require_provider_permission(
+async def _require_provider_capability(
     db: AsyncSession,
     user: AuthenticatedUser,
     provider,
-    required: str,
+    required_cap: str,
 ) -> None:
-    """Check registry permission on a provider or raise 403."""
-    perm = await resolve_registry_permission_for(
+    """Check the required registry capability on a provider or raise 403."""
+    caps = await resolve_registry_capabilities_for(
         db,
         user,
         provider.name,
         provider.labels or {},
         provider.owner_email,
     )
-    if not has_registry_permission(perm, required):
+    if not has_capability(caps, required_cap):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Requires {required} permission on provider",
+            detail=f"Requires {required_cap} capability on provider",
         )
 
 
@@ -218,14 +220,14 @@ async def list_provider_versions_cli(
     if provider is None:
         raise HTTPException(status_code=404, detail="Provider not found")
 
-    perm = await resolve_registry_permission_for(
+    caps = await resolve_registry_capabilities_for(
         db,
         user,
         provider.name,
         provider.labels or {},
         provider.owner_email,
     )
-    if not has_registry_permission(perm, "read"):
+    if not has_capability(caps, cap.REGISTRY_READ):
         raise HTTPException(status_code=404, detail="Provider not found")
 
     versions = []
@@ -265,6 +267,9 @@ async def download_provider_cli(
         try:
             info = await platform_get_download_info(storage, version, os, arch)
             return JSONResponse(content=info)
+        except CacheOnlyError as e:
+            # Sealed mode + not cached — actionable 404, never fetch upstream.
+            raise HTTPException(status_code=404, detail=str(e)) from e
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
         except RuntimeError as e:
@@ -272,14 +277,14 @@ async def download_provider_cli(
 
     provider = await get_provider(db, namespace, name)
     if provider is not None:
-        perm = await resolve_registry_permission_for(
+        caps = await resolve_registry_capabilities_for(
             db,
             user,
             provider.name,
             provider.labels or {},
             provider.owner_email,
         )
-        if not has_registry_permission(perm, "read"):
+        if not has_capability(caps, cap.REGISTRY_READ):
             raise HTTPException(status_code=404, detail="Provider platform not found")
 
     info = await get_provider_download_info(db, storage, namespace, name, version, os, arch)
@@ -325,15 +330,15 @@ async def list_providers_endpoint(
     providers = await list_providers(db)
     visible = []
     for p in providers:
-        perm = await resolve_registry_permission_for(
+        caps = await resolve_registry_capabilities_for(
             db,
             user,
             p.name,
             p.labels or {},
             p.owner_email,
         )
-        if perm is not None:
-            visible.append(_provider_to_jsonapi(p, perm))
+        if caps:
+            visible.append(_provider_to_jsonapi(p, caps))
     return JSONResponse(content={"data": visible})
 
 
@@ -348,17 +353,17 @@ async def show_provider_endpoint(
     if provider is None:
         raise HTTPException(status_code=404, detail="Provider not found")
 
-    perm = await resolve_registry_permission_for(
+    caps = await resolve_registry_capabilities_for(
         db,
         user,
         provider.name,
         provider.labels or {},
         provider.owner_email,
     )
-    if not has_registry_permission(perm, "read"):
+    if not has_capability(caps, cap.REGISTRY_READ):
         raise HTTPException(status_code=404, detail="Provider not found")
 
-    return JSONResponse(content={"data": _provider_to_jsonapi(provider, perm)})
+    return JSONResponse(content={"data": _provider_to_jsonapi(provider, caps)})
 
 
 @management_router.delete(_BASE + "/private/default/{name}")
@@ -373,7 +378,7 @@ async def delete_provider_endpoint(
     if provider is None:
         raise HTTPException(status_code=404, detail="Provider not found")
 
-    await _require_provider_permission(db, user, provider, "admin")
+    await _require_provider_capability(db, user, provider, cap.REGISTRY_ADMIN)
 
     deleted = await delete_provider(db, storage, "default", name)
     if not deleted:
@@ -395,14 +400,14 @@ async def update_provider_endpoint(
     if provider is None:
         raise HTTPException(status_code=404, detail="Provider not found")
 
-    perm = await resolve_registry_permission_for(
+    caps = await resolve_registry_capabilities_for(
         db,
         user,
         provider.name,
         provider.labels or {},
         provider.owner_email,
     )
-    if not has_registry_permission(perm, "admin"):
+    if not has_capability(caps, cap.REGISTRY_ADMIN):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Requires admin permission on provider",
@@ -422,24 +427,23 @@ async def update_provider_endpoint(
         # Validate up-front (size limits + reserved-key check). Raises 422
         # before any self-lockout logic.
         new_labels = validate_labels(attrs["labels"])
-        # Self-lockout check: warn if label change would reduce user's access
+        # Self-lockout check: refuse (409) if the label change would remove any
+        # capability the caller currently holds. Capability sets are a partial
+        # order, so the guard is set-difference, not a level comparison.
         if (
             new_labels != (provider.labels or {})
             and not attrs.get("force")
             and "admin" not in effective_platform_roles(user)
             and provider.owner_email != user.email
         ):
-            new_perm = await resolve_registry_permission_for(
+            new_caps = await resolve_registry_capabilities_for(
                 db,
                 user,
                 provider.name,
                 new_labels,
                 provider.owner_email,
             )
-            if new_perm is None or REGISTRY_PERMISSION_HIERARCHY.get(
-                new_perm, -1
-            ) < REGISTRY_PERMISSION_HIERARCHY.get(perm, -1):
-                new_level = new_perm or "none"
+            if caps - new_caps:
                 return JSONResponse(
                     status_code=409,
                     content={
@@ -448,9 +452,9 @@ async def update_provider_endpoint(
                                 "status": "409",
                                 "title": "Label change would reduce your access",
                                 "detail": (
-                                    f"This label change would reduce your access from "
-                                    f"{perm} to {new_level} on this provider. "
-                                    f'Re-submit with "force": true to confirm.'
+                                    "This label change would remove capabilities you "
+                                    "currently hold on this provider. "
+                                    'Re-submit with "force": true to confirm.'
                                 ),
                             }
                         ]
@@ -460,7 +464,7 @@ async def update_provider_endpoint(
 
     await db.commit()
     await db.refresh(provider)
-    return JSONResponse(content={"data": _provider_to_jsonapi(provider, perm)})
+    return JSONResponse(content={"data": _provider_to_jsonapi(provider, caps)})
 
 
 # --- Version Management ---
@@ -503,7 +507,7 @@ async def upload_provider_shasums_endpoint(
     provider = await get_provider(db, "default", name)
     if provider is None:
         raise HTTPException(status_code=404, detail="Provider not found")
-    await _require_provider_permission(db, user, provider, "write")
+    await _require_provider_capability(db, user, provider, cap.REGISTRY_WRITE)
 
     data = await request.body()
     if not data:
@@ -538,7 +542,7 @@ async def upload_provider_shasums_sig_endpoint(
     provider = await get_provider(db, "default", name)
     if provider is None:
         raise HTTPException(status_code=404, detail="Provider not found")
-    await _require_provider_permission(db, user, provider, "write")
+    await _require_provider_capability(db, user, provider, cap.REGISTRY_WRITE)
 
     data = await request.body()
     if not data:
@@ -572,14 +576,14 @@ async def list_provider_versions_endpoint(
     if provider is None:
         raise HTTPException(status_code=404, detail="Provider not found")
 
-    perm = await resolve_registry_permission_for(
+    caps = await resolve_registry_capabilities_for(
         db,
         user,
         provider.name,
         provider.labels or {},
         provider.owner_email,
     )
-    if not has_registry_permission(perm, "read"):
+    if not has_capability(caps, cap.REGISTRY_READ):
         raise HTTPException(status_code=404, detail="Provider not found")
 
     versions = await list_provider_versions(db, provider.id)
@@ -599,7 +603,7 @@ async def delete_provider_version_endpoint(
     """Delete a provider version and its platforms. Requires admin."""
     provider = await get_provider(db, "default", name)
     if provider is not None:
-        await _require_provider_permission(db, user, provider, "admin")
+        await _require_provider_capability(db, user, provider, cap.REGISTRY_ADMIN)
 
     deleted = await delete_provider_version(db, storage, "default", name, version)
     if not deleted:
@@ -624,14 +628,14 @@ async def list_provider_platforms_endpoint(
     if provider is None:
         raise HTTPException(status_code=404, detail="Provider not found")
 
-    perm = await resolve_registry_permission_for(
+    caps = await resolve_registry_capabilities_for(
         db,
         user,
         provider.name,
         provider.labels or {},
         provider.owner_email,
     )
-    if not has_registry_permission(perm, "read"):
+    if not has_capability(caps, cap.REGISTRY_READ):
         raise HTTPException(status_code=404, detail="Provider not found")
 
     prov_version = await get_provider_version(db, provider.id, version)
@@ -666,7 +670,7 @@ async def upload_provider_platform_endpoint(
     provider = await get_provider(db, "default", name)
     if provider is None:
         raise HTTPException(status_code=404, detail="Provider not found")
-    await _require_provider_permission(db, user, provider, "write")
+    await _require_provider_capability(db, user, provider, cap.REGISTRY_WRITE)
 
     declared = request.headers.get("content-length")
     if declared is not None:
@@ -752,7 +756,7 @@ async def delete_provider_platform_endpoint(
     """Delete a specific provider platform binary. Requires admin."""
     provider = await get_provider(db, "default", name)
     if provider is not None:
-        await _require_provider_permission(db, user, provider, "admin")
+        await _require_provider_capability(db, user, provider, cap.REGISTRY_ADMIN)
 
     deleted = await delete_provider_platform(db, storage, "default", name, version, os, arch)
     if not deleted:

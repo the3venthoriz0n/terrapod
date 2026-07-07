@@ -3,7 +3,7 @@
 import { useEffect, useState, useSyncExternalStore } from 'react'
 import Link from 'next/link'
 import { usePathname, useRouter } from 'next/navigation'
-import { Layers, Package, Blocks, Key, Activity, HardDrive, GitBranch, Users, Shield, Server, Variable, FileText, BookOpen, Code, LogOut, Menu, X, Tags, Compass, Wrench, ScrollText } from 'lucide-react'
+import { Layers, Package, Blocks, Key, Activity, HardDrive, GitBranch, Users, Shield, Server, Variable, FileText, BookOpen, Code, LogOut, Menu, X, Tags, Compass, Wrench, ScrollText, LayoutGrid, Boxes, TerminalSquare } from 'lucide-react'
 import { clearAuth, isAdmin, isAdminOrAudit } from '@/lib/auth'
 import { SessionExpiryBanner } from '@/components/session-expiry-banner'
 import { TokenExpiryBanner } from '@/components/token-expiry-banner'
@@ -68,6 +68,10 @@ export default function NavBar() {
         <Blocks size={16} />
         Providers
       </NavLink>
+      <NavLink href="/catalog" onClick={closeMenu}>
+        <LayoutGrid size={16} />
+        Catalog
+      </NavLink>
       <NavLink href="/settings/tokens" onClick={closeMenu}>
         <Key size={16} />
         API Tokens
@@ -106,6 +110,10 @@ export default function NavBar() {
             <Variable size={16} />
             Variable Sets
           </NavLink>
+          <NavLink href="/admin/execution-hooks" onClick={closeMenu}>
+            <TerminalSquare size={16} />
+            Execution Hooks
+          </NavLink>
           <NavLink href="/admin/policy-sets" onClick={closeMenu}>
             <ScrollText size={16} />
             Policy Sets
@@ -117,6 +125,14 @@ export default function NavBar() {
           <NavLink href="/admin/bulk-update" onClick={closeMenu}>
             <Wrench size={16} />
             Bulk Update
+          </NavLink>
+          <NavLink href="/admin/catalog" onClick={closeMenu}>
+            <Boxes size={16} />
+            Catalog Admin
+          </NavLink>
+          <NavLink href="/admin/provider-templates" onClick={closeMenu}>
+            <Code size={16} />
+            Provider Templates
           </NavLink>
         </>
       )}
@@ -179,12 +195,16 @@ export default function NavBar() {
                 href="https://github.com/mattrobinsonsre/terrapod/blob/main/docs/index.md"
                 target="_blank"
                 rel="noopener noreferrer"
+                aria-label="Documentation"
                 className="p-2 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors"
               >
                 <BookOpen size={20} />
               </a>
               <button
                 onClick={() => setMenuOpen(!menuOpen)}
+                aria-label={menuOpen ? 'Close menu' : 'Open menu'}
+                aria-expanded={menuOpen}
+                aria-controls="mobile-nav-menu"
                 className="p-2 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors"
               >
                 {menuOpen ? <X size={20} /> : <Menu size={20} />}
@@ -199,7 +219,7 @@ export default function NavBar() {
             </div>
           </div>
           {menuOpen && (
-            <div className="md:hidden flex flex-col gap-1 pb-3">
+            <div id="mobile-nav-menu" className="md:hidden flex flex-col gap-1 pb-3">
               {navLinks}
               <NavLink href="/api-docs" onClick={closeMenu}>
                 <Code size={16} />

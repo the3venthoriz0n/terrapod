@@ -12,6 +12,7 @@ from terrapod.api.dependencies import (
     require_admin,
     require_admin_or_audit,
 )
+from terrapod.auth.capabilities import expand_preset
 from terrapod.db.session import get_db
 
 _BASE = "http://test"
@@ -28,7 +29,7 @@ def _user(email="admin@example.com", roles=None):
     )
 
 
-def _mock_role(name="dev-team", ws_perm="read", reg_perm="read"):
+def _mock_role(name="dev-team", ws_perm="read", reg_perm="read", catalog_perm="none"):
     role = MagicMock()
     role.name = name
     role.description = "A custom role"
@@ -39,6 +40,15 @@ def _mock_role(name="dev-team", ws_perm="read", reg_perm="read"):
     role.workspace_permission = ws_perm
     role.pool_permission = "read"
     role.registry_permission = reg_perm
+    role.catalog_permission = catalog_perm
+    # Capabilities are expanded from the levels (#585); set a real list so the
+    # mock serialises (an unset MagicMock attr isn't JSON-serialisable).
+    role.capabilities = expand_preset(
+        workspace_permission=ws_perm,
+        pool_permission="read",
+        registry_permission=reg_perm,
+        catalog_permission=catalog_perm,
+    )
     role.created_at = datetime(2026, 1, 1, tzinfo=UTC)
     role.updated_at = datetime(2026, 1, 1, tzinfo=UTC)
     return role
@@ -100,7 +110,14 @@ class TestListRoles:
         user = _user(roles=["admin"])
         app, mock_db = _make_app(user)
         role = _mock_role("pool-role")
-        role.pool_permission = "write"
+        # The pool level is derived from the stored capabilities (#585): build a
+        # role whose capabilities include the pool-write preset.
+        role.capabilities = expand_preset(
+            workspace_permission="read",
+            pool_permission="write",
+            registry_permission="read",
+            catalog_permission="none",
+        )
         mock_result = MagicMock()
         mock_result.scalars.return_value.all.return_value = [role]
         mock_db.execute.return_value = mock_result
@@ -173,6 +190,31 @@ class TestCreateRole:
                 headers=_AUTH,
             )
         assert resp.status_code == 201
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    async def test_concurrent_duplicate_returns_409_not_500(self, *mocks):
+        """The pre-check then INSERT races under multiple replicas; the loser
+        hits the unique constraint. The global IntegrityError handler maps that
+        to 409, not a 500."""
+        from sqlalchemy.exc import IntegrityError
+
+        user = _user(roles=["admin"])
+        mock_db = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = None  # pre-check sees no row
+        mock_db.execute.return_value = mock_result
+        mock_db.commit = AsyncMock(side_effect=IntegrityError("dup", {}, Exception()))
+        app, _ = _make_app(user, mock_db=mock_db)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.post(
+                "/api/terrapod/v1/roles",
+                json={"data": {"name": "racy", "attributes": {"workspace-permission": "read"}}},
+                headers=_AUTH,
+            )
+        assert resp.status_code == 409
 
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
@@ -352,6 +394,88 @@ class TestCreateRole:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
+    async def test_create_with_catalog_permission(self, *mocks):
+        """A custom role can carry catalog-permission so non-admins can be
+        granted catalog use (the v0.42.0 axis was ungrantable via any consumer)."""
+        user = _user(roles=["admin"])
+        app, mock_db = _make_app(user)
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = None
+        mock_db.execute.return_value = mock_result
+        mock_db.refresh = AsyncMock()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.post(
+                "/api/terrapod/v1/roles",
+                json={
+                    "data": {
+                        "name": "catalog-user-role",
+                        "attributes": {
+                            "workspace-permission": "read",
+                            "catalog-permission": "use",
+                        },
+                    }
+                },
+                headers=_AUTH,
+            )
+        assert resp.status_code == 201
+        assert resp.json()["data"]["attributes"]["catalog-permission"] == "use"
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    async def test_create_invalid_catalog_permission_rejected(self, *mocks):
+        user = _user(roles=["admin"])
+        app, mock_db = _make_app(user)
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = None
+        mock_db.execute.return_value = mock_result
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.post(
+                "/api/terrapod/v1/roles",
+                json={
+                    "data": {
+                        "name": "bad-catalog",
+                        "attributes": {
+                            "workspace-permission": "read",
+                            "catalog-permission": "superuse",
+                        },
+                    }
+                },
+                headers=_AUTH,
+            )
+        assert resp.status_code == 422
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    async def test_create_defaults_catalog_permission_to_none(self, *mocks):
+        """Omitting catalog-permission defaults to 'none' (opt-in, no floor)."""
+        user = _user(roles=["admin"])
+        app, mock_db = _make_app(user)
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = None
+        mock_db.execute.return_value = mock_result
+        mock_db.refresh = AsyncMock()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.post(
+                "/api/terrapod/v1/roles",
+                json={
+                    "data": {
+                        "name": "no-catalog-role",
+                        "attributes": {"workspace-permission": "read"},
+                    }
+                },
+                headers=_AUTH,
+            )
+        assert resp.status_code == 201
+        assert resp.json()["data"]["attributes"]["catalog-permission"] == "none"
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
     async def test_list_includes_registry_permission(self, *mocks):
         user = _user(roles=["admin"])
         app, mock_db = _make_app(user)
@@ -429,7 +553,14 @@ class TestShowRole:
     @patch("terrapod.api.app.init_db")
     async def test_show_role_includes_pool_permission(self, *mocks):
         role = _mock_role("pool-role")
-        role.pool_permission = "write"
+        # The pool level is derived from the stored capabilities (#585): build a
+        # role whose capabilities include the pool-write preset.
+        role.capabilities = expand_preset(
+            workspace_permission="read",
+            pool_permission="write",
+            registry_permission="read",
+            catalog_permission="none",
+        )
         app, mock_db = _make_app(_user(roles=["admin"]))
         mock_result = MagicMock()
         mock_result.scalar_one_or_none.return_value = role
@@ -664,3 +795,140 @@ class TestRoleAssignments:
                 headers=_AUTH,
             )
         assert resp.status_code == 404
+
+
+class TestCapabilityAuthoring:
+    """Direct capability authoring on roles (#585)."""
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    async def test_create_with_granular_capabilities(self, *mocks):
+        from terrapod.auth import capabilities as cap
+
+        granular = [cap.RUN_READ, cap.RUN_PLAN, cap.VAR_READ, cap.VAR_WRITE]
+        app, mock_db = _make_app(_user())
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = None
+        mock_db.execute.return_value = result
+        mock_db.refresh = AsyncMock()
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.post(
+                "/api/terrapod/v1/roles",
+                json={"data": {"name": "granular", "attributes": {"capabilities": granular}}},
+                headers=_AUTH,
+            )
+        assert resp.status_code == 201
+        attrs = resp.json()["data"]["attributes"]
+        # Round-trips as the stored truth; the level field is the derived summary
+        # ("custom" — this set matches no preset).
+        assert set(attrs["capabilities"]) == set(granular)
+        assert attrs["workspace-permission"] == "custom"
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    async def test_create_rejects_ungrantable_capability(self, *mocks):
+        app, mock_db = _make_app(_user())
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = None
+        mock_db.execute.return_value = result
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.post(
+                "/api/terrapod/v1/roles",
+                json={
+                    "data": {
+                        "name": "bad",
+                        # platform:* is not grantable (it's #642, not this feature).
+                        "attributes": {"capabilities": ["workspace:read", "platform:role-admin"]},
+                    }
+                },
+                headers=_AUTH,
+            )
+        assert resp.status_code == 422
+        assert "platform:role-admin" in resp.json()["detail"]
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    async def test_update_with_capabilities_replaces(self, *mocks):
+        from terrapod.auth import capabilities as cap
+
+        role = _mock_role(name="dev-team", ws_perm="read")
+        app, mock_db = _make_app(_user())
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = role
+        mock_db.execute.return_value = result
+        mock_db.refresh = AsyncMock()
+        new_caps = [cap.RUN_READ, cap.VAR_READ, cap.VAR_WRITE]
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.patch(
+                "/api/terrapod/v1/roles/dev-team",
+                json={"data": {"attributes": {"capabilities": new_caps}}},
+                headers=_AUTH,
+            )
+        assert resp.status_code == 200
+        assert set(resp.json()["data"]["attributes"]["capabilities"]) == set(new_caps)
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    async def test_update_level_edit_reexpands_stored_caps(self, *mocks):
+        from terrapod.auth import capabilities as cap
+
+        # A migrated/cap-authored role whose stored caps are for "read"; editing
+        # the level to "admin" must take effect (the levels re-expand into the
+        # persisted capability set).
+        role = _mock_role(name="dev-team", ws_perm="read")
+        app, mock_db = _make_app(_user())
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = role
+        mock_db.execute.return_value = result
+        mock_db.refresh = AsyncMock()
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.patch(
+                "/api/terrapod/v1/roles/dev-team",
+                json={"data": {"attributes": {"workspace-permission": "admin"}}},
+                headers=_AUTH,
+            )
+        assert resp.status_code == 200
+        attrs = resp.json()["data"]["attributes"]
+        assert attrs["workspace-permission"] == "admin"
+        # The effective caps now reflect admin (a delete cap the old "read" lacked).
+        assert cap.WORKSPACE_DELETE in attrs["capabilities"]
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    async def test_partial_level_edit_preserves_granular_caps_on_other_axes(self, *mocks):
+        from terrapod.auth import capabilities as cap
+
+        # The headline authoring behaviour: a role holding a GRANULAR workspace
+        # set (plan-but-not-apply — matches no preset) gets a level edit on a
+        # DIFFERENT axis (pool → admin). The pool axis must be replaced while the
+        # granular workspace capabilities survive untouched.
+        role = _mock_role(name="dev-team")
+        role.capabilities = [cap.WORKSPACE_READ, cap.RUN_READ, cap.RUN_PLAN, cap.VAR_READ]
+        app, mock_db = _make_app(_user())
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = role
+        mock_db.execute.return_value = result
+        mock_db.refresh = AsyncMock()
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.patch(
+                "/api/terrapod/v1/roles/dev-team",
+                json={"data": {"attributes": {"pool-permission": "admin"}}},
+                headers=_AUTH,
+            )
+        assert resp.status_code == 200
+        attrs = resp.json()["data"]["attributes"]
+        caps = set(attrs["capabilities"])
+        # Pool axis was replaced with the admin set.
+        assert cap.POOL_MANAGE in caps
+        assert attrs["pool-permission"] == "admin"
+        # The granular workspace capabilities are preserved: plan yes, apply no.
+        assert cap.RUN_PLAN in caps
+        assert cap.RUN_APPLY not in caps
+        assert cap.WORKSPACE_DELETE not in caps
+        # Workspace axis stays non-preset → derived summary is "custom".
+        assert attrs["workspace-permission"] == "custom"

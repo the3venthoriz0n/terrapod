@@ -56,6 +56,30 @@ Pool permission resolution follows the same order as workspace permissions:
 5. **`everyone` role** — pools with label `access: everyone` → `read`
 6. **Default** → no access (pool is invisible)
 
+### Fine-grained capabilities
+
+The permission *levels* above (read/plan/write/admin, etc.) are **presets** over
+an explicit set of **capabilities** — `resource:verb` tokens such as `run:plan`,
+`run:apply`, `run:apply-destroy`, `var:write`, `state:read`, `workspace:delete`.
+Enforcement checks the specific capability a request needs, so a role can grant,
+for example, *plan but not apply*, or *apply but not destroy*, or *manage
+variables without confirming applies* — grants the four levels cannot express.
+
+- A role is either **level-authored** (pick a preset per axis — the common case)
+  or **capability-authored** (supply an explicit `capabilities` list). When you
+  author capabilities, the level fields become a derived summary (a preset name,
+  or `custom`).
+- A role's API response always includes its **effective** `capabilities` (the
+  explicit set, or the expansion of its levels), so the API/UI show exactly what
+  is enforced.
+- Existing roles were migrated faithfully — turning on capability enforcement
+  changed nothing for them.
+
+See **[Capability-based RBAC](rbac-capabilities.md)** for the full capability
+catalogue and the gate → capability mapping. Author capabilities via the API
+(`capabilities` attribute on create/update role), the `terrapod_role` provider
+resource (`capabilities`), or the web roles page ("Advanced — capabilities").
+
 ### Platform Permissions
 
 | Operation | Required Role |
@@ -109,18 +133,25 @@ When a user accesses a workspace, permissions are resolved in this order. The fi
      a. Check allow rules (labels + names)
      b. Check deny rules (labels + names)
      c. If workspace matches allow AND does NOT match deny:
-        collect that role's workspace_permission
-   Take the HIGHEST collected permission
+        add that role's capabilities (scoped to this axis) to the set
+   Union the capabilities collected across all matching roles
    |
-   v (if any permission found, use it)
+   v (if any capability granted, use the union)
 
 5. "everyone" role:
-   If workspace has label "access: everyone" --> read permission
+   If workspace has label "access: everyone" --> read-floor capabilities
    |
    v (otherwise)
 
 6. Default: no access (403)
 ```
+
+> **Capabilities, not a scalar max.** Since #585 the enforced grant is the
+> **union of capabilities** across every matching role — not the single highest
+> permission *level*. Two roles granting `run:plan` and `run:apply` respectively
+> combine to plan+apply. The permission *levels* (read/plan/write/admin) are
+> authoring shorthand and a derived read-only summary, not the stored/enforced
+> grant. See [Capability-based RBAC](rbac-capabilities.md).
 
 ---
 
@@ -156,8 +187,9 @@ curl -X POST https://terrapod.example.com/api/terrapod/v1/roles \
 |---|---|---|
 | `name` | string | Unique role name (lowercase, alphanumeric + hyphens) |
 | `description` | string | Human-readable description |
-| `workspace-permission` | string | One of: `read`, `plan`, `write`, `admin` |
-| `pool-permission` | string | One of: `read`, `write`, `admin` (default: `read`) |
+| `capabilities` | array | The role's grant — a list of `resource:verb` tokens (e.g. `run:plan`, `run:apply`, `workspace:delete`). The single stored source of truth for enforcement (#585). On write, sending `capabilities` takes precedence over the level fields; on read it is always returned. See [Capability-based RBAC](rbac-capabilities.md). |
+| `workspace-permission` | string | Authoring shorthand + derived summary. One of: `read`, `plan`, `write`, `admin`, or `custom` (read-only, when the capabilities match no preset) |
+| `pool-permission` | string | Authoring shorthand + derived summary. One of: `read`, `write`, `admin` (default: `read`), or `custom` |
 | `allow-labels` | object | Label key-value pairs that grant access |
 | `allow-names` | array | Explicit workspace names that grant access |
 | `deny-labels` | object | Label key-value pairs that deny access (overrides allow) |
@@ -327,6 +359,8 @@ A small set of label keys are reserved as **virtual filter fields** in the works
 | `vcs` | `true`/`false` — has VCS connection | reserved (planned virtual) |
 | `locked` | `true`/`false` — currently locked | reserved (planned virtual) |
 | `branch` | `vcs_branch` | reserved (planned virtual) |
+
+The `status` field also accepts one **aggregate** value beyond the per-status values above: `status:unhealthy` matches any workspace with at least one active **health condition** (state diverged, no agent pool assigned, VCS polling error, drift detected, or drift-detection errored). It is the roll-up behind the **Health Issues** summary card on the workspace list — clicking the card when the count is non-zero toggles this filter so you can jump straight to the affected workspaces (and click again to clear). Because it rides the already-reserved `status` field, no additional label key is reserved for it. It is deliberately broader than any single status value: a workspace awaiting confirmation shows as `needs-confirm` even when its state has diverged, and the `no_agent_pool`/`drift_errored` conditions have no standalone status value at all — `status:unhealthy` catches all of them.
 
 The set is intentionally aggressive: reserving a key today is near-zero cost (no virtual implementation required), but adding a reservation later — once the key is in customer use as a literal label — is a migration.
 

@@ -6,9 +6,12 @@
 
 .PHONY: lint lint-python \
 	test test-python test-e2e test-e2e-down \
+	helm-config-contract \
 	build images \
 	pentest pentest-sast pentest-images pentest-dast \
 	dev dev-down \
+	ai-eval \
+	preflight-identity \
 	clean test-down \
 	help
 
@@ -25,6 +28,15 @@ test:               ## Test all (Python) in Docker
 
 test-python:        ## Test Python only (Docker)
 	scripts/test.sh python
+
+helm-config-contract: ## Config-channel contract: render chart + parse via real config models (#617)
+	scripts/helm-config-contract.sh
+
+preflight-identity:  ## Cloud-identity preflight against a running release. e.g. RELEASE=tp NAMESPACE=infra make preflight-identity
+	scripts/preflight-identity.sh
+
+ai-eval:            ## Run the AI-analysis eval harness (live model). e.g. make ai-eval ARGS="run --model bedrock/us.anthropic.claude-sonnet-4-6 -n 3"
+	scripts/ai-eval.sh $(ARGS)
 
 test-e2e:           ## Run Playwright E2E tests (Docker Compose stack)
 	scripts/e2e.sh
@@ -56,6 +68,13 @@ dev:                ## Start Tilt development environment (port 10352)
 
 dev-down:           ## Stop Tilt
 	tilt down --port 10352
+
+# ── Evaluation (one-command kind/k3d quickstart) ─────────
+eval:               ## Stand up a throwaway Terrapod for evaluation (kind/k3d)
+	scripts/eval.sh up
+
+eval-down:          ## Delete the evaluation cluster
+	scripts/eval.sh down
 
 # ── Utility ──────────────────────────────────────────────
 clean:              ## Clean build artifacts

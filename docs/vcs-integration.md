@@ -39,10 +39,13 @@ Terrapod's background poller checks your VCS providers every 60 seconds (configu
 - **Branch push -> full plan/apply run** -- when a new commit lands on the tracked branch, Terrapod downloads the code and queues a normal run (plan, then apply if auto-apply is on or manually confirmed).
 - **Pull request / merge request -> speculative plan** -- when an open PR/MR targets the tracked branch and has a new head commit, Terrapod queues a plan-only run. The plan shows what _would_ change if the PR were merged, but it can never be applied. A new speculative run is created each time the PR/MR is updated with a new commit.
 
-### Polling-First Design
+### Webhooks are supported — and polling means they're never required
 
-- **No inbound connections required** -- Terrapod only makes outbound HTTPS calls to VCS provider APIs, so it works behind firewalls and NATs without any ingress configuration.
-- **Webhooks are optional** (GitHub only, currently) -- if you want faster feedback (sub-second instead of up to 60s), you can configure GitHub webhooks. The webhook tells the poller to check immediately rather than waiting for the next cycle.
+Terrapod **does support inbound VCS webhooks** for instant triggers, *and* it polls, so it works with or without them. The two are complementary, not either/or:
+
+- **Webhooks are supported for both GitHub and GitLab.** GitHub posts to `POST /api/terrapod/v1/vcs-events/github` (HMAC-SHA256 signature); GitLab posts to `POST /api/terrapod/v1/vcs-events/gitlab` (`X-Gitlab-Token` secret). Configure one and a push or PR/MR triggers a run within ~a second instead of waiting for the next poll cycle. The webhook simply tells the poller to check *now*. Exposing only the webhook path publicly (so the rest of the platform can stay private) is covered in [Optional webhook ingress](deployment-webhook-ingress.md).
+- **Polling is the resilient default, so webhooks are optional.** Terrapod polls each connected repo over **outbound HTTPS** every `poll_interval_seconds` (default 60). This requires **no inbound connections**, so it works behind firewalls and NATs with zero ingress configuration — and it means **nothing is lost without a webhook**: the same runs are created on the next poll cycle, just up to 60s later. A webhook is a latency optimization, never a dependency.
+- **Why polling-first** — many self-hosted deployments sit in networks where a VCS provider cannot deliver an inbound webhook at all. Polling guarantees the integration works everywhere; webhooks make it faster where inbound delivery is available.
 
 ### Sparse fetch + caching
 
@@ -279,6 +282,19 @@ curl -X POST https://terrapod.example.com/api/terrapod/v1/vcs-connections \
     }
   }'
 ```
+
+#### Step 3 (optional): Configure a GitLab webhook for instant triggers
+
+Polling already picks up pushes and merge requests within `poll_interval_seconds` (default 60). To get near-instant (~1s) triggers, add a webhook in GitLab — this is **optional**; everything works on polling alone.
+
+1. Set a webhook secret on the connection (or rely on the global `vcs.gitlab.webhook_secret`). The per-connection secret is write-only and takes precedence; set it via `PATCH` on the connection with a `webhook-secret` attribute.
+2. In GitLab, go to the project (or group) **Settings → Webhooks → Add new webhook**:
+   - **URL**: `https://terrapod.example.com/api/terrapod/v1/vcs-events/gitlab`
+   - **Secret token**: the secret from step 1 (GitLab sends it verbatim in the `X-Gitlab-Token` header — Terrapod compares it timing-safe; unlike GitHub there is no HMAC signature).
+   - **Trigger** on **Push events**, **Tag push events**, and **Merge request events**.
+3. GitLab's "Test" button (or any real push/MR) should return 200 and trigger an immediate poll.
+
+If the webhook can't reach Terrapod (e.g. the management plane is private), that's fine — polling continues to deliver the same runs. To expose only the webhook path publicly, see [Optional webhook ingress](deployment-webhook-ingress.md).
 
 ---
 
@@ -577,6 +593,22 @@ api:
 ```
 
 When a push event arrives, the webhook handler validates the HMAC-SHA256 signature and triggers an immediate poll for the affected repository. The poller still does all the work -- the webhook just makes it faster.
+
+### Per-connection webhook secret
+
+The Helm value above sets a single **global** webhook secret used to validate
+every GitHub installation's webhooks. If you connect more than one GitHub
+installation, you can instead set a **per-connection** secret so that one
+installation's secret can't be used to forge another's webhooks.
+
+Set it when creating or editing a VCS connection — in the admin UI
+(*Admin → VCS Connections → Webhook Secret*), via the API as the write-only
+`webhook-secret` attribute, or via the Terraform provider's
+`terrapod_vcs_connection.webhook_secret`. It is never returned by the API
+(`has-webhook-secret` indicates only whether one is set). When a connection
+has its own secret, that connection's webhooks are validated against it; when
+it doesn't, validation falls back to the global secret — so existing
+single-secret deployments are unaffected.
 
 > GitLab webhook support is not yet implemented. GitLab connections use polling only.
 

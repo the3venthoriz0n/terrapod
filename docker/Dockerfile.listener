@@ -21,7 +21,7 @@ LABEL org.opencontainers.image.source=https://github.com/mattrobinsonsre/terrapo
 
 # Bump APT_REFRESH to bust the cached apt layer and re-pull Debian
 # security patches (CVE-2026-27135 etc.) — see Dockerfile.api.
-ARG APT_REFRESH=2026-06-04
+ARG APT_REFRESH=2026-06-26
 RUN echo "apt-refresh=${APT_REFRESH}" \
     && apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     curl \
@@ -33,9 +33,10 @@ WORKDIR /app
 COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Only the modules the listener imports: config, logging_config, runner/
+# Only the modules the listener imports: config, logging_config, http_retry, runner/
 COPY services/terrapod/config.py ./terrapod/config.py
 COPY services/terrapod/logging_config.py ./terrapod/logging_config.py
+COPY services/terrapod/http_retry.py ./terrapod/http_retry.py
 COPY services/terrapod/runner/ ./terrapod/runner/
 
 # Create non-root user and data directories

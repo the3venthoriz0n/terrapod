@@ -221,6 +221,36 @@ For detailed state recovery procedures, see [disaster-recovery.md](disaster-reco
 
 ---
 
+## Planned Run Auto-Discarded (Stale Plan)
+
+A run sitting in `planned` (waiting for a confirm) was automatically moved to `discarded` — this is **expected behaviour**, not a fault. Terrapod invalidates a saved plan once it can no longer be applied safely, so a stale plan can never apply outdated config.
+
+### Symptoms
+
+- A `planned` run flips to `discarded` without anyone clicking Discard.
+- The run carries a `discard-reason`, e.g. `state changed since plan (serial 6 → 7)` or `plan expired (older than 3600s)`.
+- A confirm attempt (`POST /api/v2/runs/{id}/actions/apply`) returns **409** with the same reason.
+
+### Diagnosis
+
+Two guards discard stale plans:
+
+1. **State drift (always on, #647)** — the workspace's state version advanced (a newer apply, a rollback, or a manual/CLI state upload) *after* this run was planned, so the plan was computed against an older state. Reason: `state changed since plan (serial N → M)`.
+2. **Plan expiry (opt-in, #646)** — the workspace sets `plan-expiry-seconds` and the plan is older than that TTL. Reason: `plan expired (older than <N>s)`. Off unless configured per workspace.
+
+In-flight `confirmed`/`applying` runs are never discarded; only waiting `planned`/`pending`/`queued` apply-capable runs are. Plan-only/speculative/drift runs are exempt.
+
+### Resolution
+
+- **This is normal** — just **re-plan** (queue a new run) and confirm that one. The new plan reflects current state.
+- If plan expiry is firing too aggressively for a workspace with a slow human approval loop, raise or clear `plan-expiry-seconds` on that workspace (it is per-workspace; unset = no time-based expiry).
+
+### Verification
+
+- The freshly queued run reaches `planned` against the current state serial and applies cleanly.
+
+---
+
 ## Scheduler Stall
 
 All background tasks (reconciler, VCS poller, drift detection, audit retention) are coordinated via the distributed scheduler using Redis. If the scheduler stalls, no periodic tasks run across any replica.
@@ -983,3 +1013,299 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 - Re-running the diagnosis list query returns no tokens for the email.
 - An attempt to use one of the revoked tokens returns `401`.
 - For the idle path: with the `tp:user_seen:<email>` key absent, a previously-working bound token now returns `401`.
+
+---
+
+## Service Catalog — instance lifecycle incidents
+
+The catalog provisions **and** destroys real infrastructure on behalf of self-service users, so its failure modes touch live infra. A catalog instance is an ordinary agent-mode workspace stamped with `catalog_item_id`; manage it through the catalog surface (`/api/terrapod/v1/catalog-instances/...`), not the raw workspace API (which 409s on catalog workspaces).
+
+### Destroy failed and exhausted its retries (instance stuck `errored`)
+
+**Symptom**: a catalog destroy ran, failed, was auto-retried (`runners.lifecycleDestroyRetries`, default 2), and the instance is still present with its latest run `errored`. The workspace was **not** archived (archive only happens on a *successful* destroy), so no data was lost — the infra may be fully or partially still up.
+
+1. **Find the failing run + reason.** Open the instance's **workspace page** (`/workspaces/{id}`) — run status, plan/apply output, and the AI failure analysis live there. Catalog/UI surfaces show no per-instance run detail; the workspace is where you diagnose.
+   ```bash
+   kubectl logs deploy/terrapod-api --tail=3000 | grep -E "Lifecycle destroy retry|catalog-lifecycle"
+   ```
+   `Lifecycle destroy retry queued attempt=N/M` shows the attempts; `skipped: no uploaded configuration version` means the config version is gone (see below).
+2. **Decide if it's transient.** Most destroy failures are ordering/eventual-consistency (an ENI still attached, a bucket not empty, an LB draining). If so, re-trigger the destroy once the dependency clears: `POST /api/terrapod/v1/catalog-instances/{id}/destroy` with `auto-apply: true` (catalog `use`). On success the workspace archives.
+3. **If it's a real blocker** (a `prevent_destroy` lifecycle, a protected resource, a permission gap), fix the underlying cause, then re-destroy. The retry budget resets each "episode" (consecutive errored lifecycle destroys), so a fresh destroy after a successful intervening run starts clean.
+4. **No config version** (`get_latest_uploaded_cv` is None): the retry intentionally skips (a config-less destroy can't target anything). Re-publish/reconfigure the instance (`PATCH .../catalog-instances/{id}`) to regenerate a config version, then destroy.
+
+**Verification**: `GET /catalog-instances/{id}` 404s or the workspace `lifecycle-state` is `archived`; no further `Lifecycle destroy retry queued` log lines for that workspace.
+
+### Orphaned instance (infra abandoned, untracked)
+
+**Symptom**: someone used the discouraged **Orphan** escape hatch (`DELETE /catalog-instances/{id}?orphan=true`, or the admin-only UI action) — the catalog record is gone but the cloud resources are still running, now unmanaged.
+
+1. **Confirm via audit.** The orphan is audit-logged (`Catalog instance orphaned: workspace deleted, infrastructure abandoned`, with workspace name + actor) and captured by the audit middleware (`/api/terrapod/v1/audit?action=DELETE`).
+2. **Reclaim the infra.** There is no Terrapod state for it anymore — adopt it back under IaC: re-provision the same catalog item (or a plain workspace) and `terraform import` the live resources, or tear it down directly in the cloud console. Prefer `destroy` over `orphan` next time so this doesn't recur.
+
+### Stuck provision (run never progresses)
+
+**Symptom**: a provision returned `201` (instance + workspace created) but the first run sits in `pending`/`queued`/`planning` and never applies.
+
+1. This is an ordinary agent-run stall — follow **[Stale Run](#stale-run-errored-after-timeout)** and **[Listener Offline](#listener-offline)**: check the instance's workspace page for the run, confirm the agent pool (the item's `allowed-agent-pool-ids`) has an online listener, and check `kubectl get jobs -n terrapod-runners`.
+2. **Non-auto-apply provisions wait for confirmation.** If the run is `planned` and waiting, confirm it from the catalog surface (`POST /catalog-instances/{id}/confirm`, catalog `use`) — the workspace clamp means the provisioner can't confirm via the workspace run API.
+3. A common first-provision failure is the **module isn't resolvable** (no uploaded version, or a private registry the runner can't reach) — the workspace's run log shows the `init` error.
+
+### Recover an archived catalog workspace
+
+**Symptom**: an instance was destroyed (archived) and you need its history or state back (e.g. a destroy you regret, or to audit what was provisioned).
+
+- **Archive is a soft delete** — the workspace row, its state versions, and run history are **retained** (`lifecycle_state = "archived"`), only hidden from the active catalog/workspace lists. State and audit are recoverable.
+- To restore visibility, flip `lifecycle_state` back to `active` on the workspace row (DBA action — there is intentionally no API to "un-destroy", since the infra was torn down). The workspace's last state version is still in object storage under its state key.
+- If you need the **infrastructure** back (not just the record), re-provision the catalog item with the same inputs — the wrapper is regenerated deterministically from the item + inputs.
+
+---
+
+## Sealed (cache-only) mode — runs failing with cache-miss 404
+
+**Symptom**: after enabling `registry.cache_only: true` (air-gap / sealed mode), runner Jobs fail early — `terraform`/`tofu` `init` can't fetch its CLI binary or a provider, and the API logs / run errors show a **404** with a message like *"… is not in the cache and sealed (cache_only) mode is enabled. Pre-populate it … before sealing, or disable registry.cache_only."* Every run that needs an un-cached artifact fails; runs whose binary + providers are all cached keep working.
+
+This is **by design** — sealed mode guarantees no upstream fetch ever happens, so a cache miss is an actionable error rather than a silent (and, with no egress, doomed) upstream attempt. It is not data loss; nothing is destroyed.
+
+### Diagnosis
+
+- Confirm sealed mode is on: `registry.cache_only` in the API ConfigMap (`helm get values` / the rendered `config.yaml`).
+- Identify the missing artifact from the 404 detail (tool+version+os/arch, or provider `host/ns/type@version`).
+- List what IS cached: `GET /api/terrapod/v1/admin/binary-cache` and `GET /api/terrapod/v1/admin/provider-cache` (admin), or the `/admin/binary-cache` UI.
+- Remember partial versions resolve **only against the cache** when sealed — a workspace pinned to `terraform_version = "1.12"` needs a cached `1.12.x`; if none is cached the resolve itself 404s.
+- The **platform Terrapod provider** (`<host>/default/terrapod`) and the **SHA256SUMS** used for runner re-verification are subject to the same gate — they must be cached too (SHA256SUMS are persisted when the binary is warmed under `verify=signature`).
+
+### Resolution
+
+1. **Preferred — warm the missing artifacts, keep sealed.** Sealed mode refuses to fetch, so warm from a path that *can* reach the source:
+   - Temporarily set `registry.cache_only: false` (optionally with the upstream overrides pointing at an internal mirror), bulk-warm the needed entries via `POST /api/terrapod/v1/admin/binary-cache/warm-bulk` or the **Warm cache** UI panel, confirm they appear in the cache lists, then set `cache_only: true` again. See [Cache pre-population](registry.md#cache-pre-population).
+   - Or warm a staging Terrapod that shares/replicates the same object store + DB, so the sealed instance sees the artifacts.
+2. **Escape hatch — unseal.** Set `registry.cache_only: false` to re-allow upstream fall-through (only viable if the instance actually has egress to upstream or an internal mirror).
+
+### Verification
+
+- Re-list the binary/provider caches and confirm the previously-missing artifact (and the right partial-version match) is present.
+- Re-queue the failed run; `init` now resolves the binary + providers from cache and the run proceeds.
+- Note: the artifact-retention sweeper intentionally **skips** the binary/provider caches while sealed, so warmed artifacts won't be evicted out from under a sealed instance.
+
+---
+
+## API Down / Not Ready
+
+Fires from the bundled `TerrapodAPIDown` alert: no `terrapod-api` scrape target has been healthy for 2 minutes. The platform is unavailable to the UI, CLI, runners, and listeners.
+
+### Symptoms
+
+- `max(up{job=~".*terrapod-api.*"}) == 0`
+- The UI returns 502/503 through the ingress; `terraform`/`tofu` against the cloud backend hang or error.
+- `/ready` failing on the API pods.
+
+### Diagnosis
+
+1. **Pod state:**
+   ```bash
+   kubectl get pods -n <ns> -l app.kubernetes.io/component=api
+   kubectl describe pod <api-pod> -n <ns>
+   ```
+   Look for `CrashLoopBackOff`, `OOMKilled`, failing readiness probes, or `Pending` (unschedulable).
+2. **Readiness detail** — `/ready` checks DB + Redis + storage + **migrations** and reports each in a `checks` map. Hit it from inside the cluster:
+   ```bash
+   kubectl exec -n <ns> deploy/terrapod-api -- python -c "import urllib.request;print(urllib.request.urlopen('http://localhost:8000/ready').read())" 2>&1 || true
+   ```
+   Read the `checks` map: a `database`/`redis` down almost always means a dependency is down — see [DB Pool Exhaustion](#db-pool-exhaustion) / [Redis Connection Loss](#redis-connection-loss). A `"migrations": "behind: ..."` means **app ↔ schema skew** (#544) — this pod's code expects a migration the DB hasn't got, so it deliberately reports NOT READY (and is pulled from the LB) instead of 500-ing every request against the missing column. Startup also logs a loud `SCHEMA SKEW` warning.
+3. **Recent rollout:**
+   ```bash
+   kubectl rollout history deploy/terrapod-api -n <ns>
+   ```
+   A bad image/config (e.g. a migration that didn't run) often correlates with the outage start.
+4. **Migrations** — if `checks.migrations` is `behind`, the migration Job for the current version did not apply (failed pre-upgrade hook that let the rollout proceed, a bare `kubectl set image`, or ArgoCD sync ordering). The `detail` names the DB revision vs the code head.
+
+### Resolution
+
+- **Dependency down** → restore Postgres/Redis (their runbooks above); the API recovers on the next readiness probe.
+- **Schema skew (`checks.migrations` behind)** → run the Alembic migration Job (`helm upgrade` re-runs the pre-upgrade hook, or trigger the migration Job directly). Once the DB reaches the code head, the pods flip to ready on the next probe with no restart needed.
+- **Bad rollout** → `kubectl rollout undo deploy/terrapod-api -n <ns>`.
+- **OOM/crash** → check `kubectl logs --previous`; raise `api.resources` if genuinely under-provisioned (confirm with the OOM `reason` field, don't assume).
+- **Unschedulable** → free capacity or fix nodeSelector/taints.
+
+### Verification
+
+- `max(up{job=~".*terrapod-api.*"}) == 1` and `/ready` returns 200.
+- The UI loads and a `terraform plan` against the cloud backend succeeds.
+
+---
+
+## High API Error Rate
+
+Fires from `TerrapodHighErrorRate`: more than 5% of API requests returned 5xx over 5 minutes.
+
+### Symptoms
+
+- `sum(rate(terrapod_http_requests_total{status=~"5.."}[5m])) / sum(rate(terrapod_http_requests_total[5m])) > 0.05`
+- Intermittent UI/CLI failures rather than a hard outage.
+
+### Diagnosis
+
+1. **Which routes?**
+   ```promql
+   topk(10, sum by (path_template, status) (rate(terrapod_http_requests_total{status=~"5.."}[5m])))
+   ```
+2. **Dependency errors** correlate with most 5xx spikes:
+   ```promql
+   rate(terrapod_db_errors_total[5m]) ; rate(terrapod_redis_errors_total[5m]) ; rate(terrapod_storage_errors_total[5m])
+   ```
+   Follow the matching runbook ([DB](#db-pool-exhaustion) / [Redis](#redis-connection-loss) / [Storage](#storage-errors)).
+3. **Logs** for the offending route:
+   ```logql
+   {namespace="<ns>", pod=~"terrapod-api.*"} | json | status >= 500
+   ```
+
+### Resolution
+
+- Fix the underlying dependency error surfaced above (the common case).
+- If 5xx is concentrated on one route after a deploy, roll back (`kubectl rollout undo`) and open a bug.
+- If it's load-driven (paired with [High API Latency](#high-api-latency)), scale the API (`api.replicas` / HPA) and check DB pool size.
+
+### Verification
+
+- The 5xx ratio drops back below 5% and stays there.
+- `topk` over `{status=~"5.."}` is empty for the previously-failing route.
+
+---
+
+## High API Latency
+
+Fires from `TerrapodHighRequestLatency`: p99 request latency above 5s for 10 minutes.
+
+### Symptoms
+
+- `histogram_quantile(0.99, sum(rate(terrapod_http_request_duration_seconds_bucket[5m])) by (le)) > 5`
+- The UI feels slow; SSE reconnects; CLI operations time out.
+
+### Diagnosis
+
+1. **Slow routes:**
+   ```promql
+   topk(10, histogram_quantile(0.95, sum by (le, path_template) (rate(terrapod_http_request_duration_seconds_bucket[5m]))))
+   ```
+2. **DB/Redis pressure** — latency usually tracks a saturated dependency. Check connection-pool saturation (see [DB Pool Exhaustion](#db-pool-exhaustion)) and Redis latency.
+3. **Event-loop starvation** — a sync call in an async handler stalls the whole worker (see the no-sync-work-in-async invariant). Check for a recent change on the slow route; look for liveness-probe restarts in `kubectl get pods`.
+4. **Run load** — a burst of concurrent runs/log-streaming can saturate the API.
+
+### Resolution
+
+- Relieve the saturated dependency (scale Postgres connections / Redis, or the API replicas).
+- If a specific route regressed, roll back and fix the blocking call (wrap in `asyncio.to_thread` or make the endpoint `def`).
+- Scale API replicas / enable the HPA for sustained load.
+
+### Verification
+
+- p99 latency returns under threshold.
+- No API pods are being restarted by the liveness probe.
+
+---
+
+## High Cache Miss Rate
+
+Fires from `TerrapodHighBinaryCacheMissRate` (info): the terraform/tofu binary cache hit rate fell below 50% over the last hour. Not an outage — runs still work by falling back upstream — but slower, and a problem in restricted-network/air-gapped installs.
+
+### Symptoms
+
+- `sum(rate(terrapod_binary_cache_requests_total{result="miss"}[1h])) / sum(rate(terrapod_binary_cache_requests_total[1h])) > 0.5`
+- `terraform init` slower than usual; runner egress to `releases.hashicorp.com` / GitHub increasing.
+
+### Diagnosis
+
+1. **Version spread** — many distinct tool versions in use means each is a legitimate first-time miss. Check the workspace `terraform_version` distribution.
+2. **Eviction too aggressive** — `registry.cache_ttl_days` (default 30, evicted on last-access) may be reclaiming entries between uses on a low-traffic instance.
+3. **Sealed mode** — if `registry.cache_only` is on, a miss is a hard 404, not a slow fall-through; see [Sealed (cache-only) mode](#sealed-cache-only-mode--runs-failing-with-cache-miss-404) instead.
+
+### Resolution
+
+- **Pre-warm** the versions your fleet pins via `POST /api/terrapod/v1/admin/binary-cache/warm-bulk` or the **Warm cache** UI panel ([Cache pre-population](registry.md#cache-pre-population)).
+- **Raise** `registry.cache_ttl_days` if eviction is the cause.
+- **Consolidate** on fewer tool versions where practical.
+
+### Verification
+
+- The hit ratio recovers above 50% as warmed/again-cached versions are served.
+- Per-tool: `sum by (tool) (rate(terrapod_binary_cache_requests_total{result="hit"}[1h]))` rises.
+
+---
+
+## DR restore drill failed
+
+The shipped restore-verify CronJob (`<release>-terrapod-restore-verify`) restores the latest backup into a throwaway sidecar Postgres and asserts core invariants. A failed Job means **the latest backup did not restore cleanly** — treat it as urgent: your backups may not be recoverable.
+
+### Symptoms
+
+- The `restore-verify` Job is in `Failed` state (surfaced by kube-state-metrics / your Job-failure alerts).
+- Job logs end with `DR drill FAILED:` and one or more `✗` invariant lines, **or** never get that far (download / restore error).
+
+### Diagnosis
+
+```bash
+kubectl logs job/<failed-restore-verify-job> -n <ns>
+```
+
+Read the failure mode:
+- **`TP_RESTORE_TARGET_URL must not equal DATABASE_URL — refusing`** — misconfiguration: the drill was pointed at the live DB. It refuses by design. Fix the chart values (the bundled CronJob always targets the sidecar; this only happens with a hand-edited Job).
+- **`no backups found under 'backups/'`** — the backup CronJob hasn't produced a dump (check `backup.enabled`, its schedule, and that its Jobs are succeeding). Without a backup there is nothing to restore.
+- **`pg_restore exited N`** (warning) followed by invariant failures — the dump is corrupt or partial. Check the **backup** Job's logs for a truncated `pg_dump` (OOM, timeout, storage write error).
+- **`certificate_authority is empty` / `workspaces not queryable`** — the restore ran but the data isn't there: suspect a `pg_dump` that captured an empty/wrong database, or a dump format mismatch (the `pg_dump`/`pg_restore` client major must be ≥ the server major).
+- **`state version(s) in DB but no readable object under state/`** — the DB restored but the object store the drill reads is missing state objects: the DB snapshot and object store are badly time-skewed, or the store/credentials are wrong.
+
+### Resolution
+
+1. Fix the root cause surfaced above (most often: the backup Job itself is failing/truncating — fix that first, then a fresh backup gives the drill something restorable).
+2. If `pg_dump`/`pg_restore` version mismatch: align the API image's `postgresql-client` major with your server major (the client must be ≥ server).
+3. Re-run the drill on demand once a good backup exists:
+   ```bash
+   kubectl create job --from=cronjob/<release>-terrapod-restore-verify drill-now -n <ns>
+   kubectl logs -f job/drill-now -n <ns>
+   ```
+
+### Verification
+
+- A fresh drill logs `DR drill PASSED — backup <key> restored and verified` and the Job completes successfully.
+- The backup CronJob's most recent Job is `Complete` and a new `backups/<ts>.dump` object exists.
+
+---
+
+## Encryption key lost or unusable (`decryptable: false`)
+
+App-layer encryption at rest (#553) failed its decryptability check. **This is potentially data loss** — secrets encrypted under a key you can no longer use are unrecoverable. Act carefully and do **not** rotate or delete anything until the key is restored.
+
+### Symptoms
+
+- `GET /api/terrapod/v1/admin/encryption` returns `decryptable: false` (or `canary_ok: false`).
+- `python -m terrapod.cli.encryption_doctor` exits non-zero with `unwrap failed` / `canary did not decrypt`.
+- The API **fails to start** with `encryption canary mismatch — refusing to start` (it fails closed rather than serving/writing unreadable data).
+
+### Diagnosis
+
+Run the doctor to see which versions fail and why:
+```bash
+kubectl exec deploy/terrapod-api -- python -m terrapod.cli.encryption_doctor
+```
+Map the failure to the provider:
+- **`static`** — the master key env (`TERRAPOD_ENCRYPTION__STATIC_KEY`, from the K8s Secret) changed, was lost, or doesn't match what encrypted the data. Compare against your out-of-band backup.
+- **`vault_transit`** — Vault unreachable, the token lacks `decrypt` on the transit key, the key was rotated with `min_decryption_version` advanced past the stored version, or the key was deleted.
+- **`awskms`** — the KMS key was disabled/scheduled-for-deletion, or the pod's IAM identity lost `kms:Decrypt`.
+
+### Resolution
+
+1. **Restore the exact prior key material / permission** — do not improvise:
+   - `static`: put the original master secret back in the Secret (`kubectl edit secret …` from your backup), restart the API.
+   - `vault_transit`: restore Vault availability, re-grant `decrypt`, lower `min_decryption_version` to include the stored version, or undelete the key.
+   - `awskms`: re-enable the key / cancel deletion, restore `kms:Decrypt` on the role.
+2. **Restart the API.** The boot canary re-verifies; a clean start means recovery succeeded (fail-closed guarantees you can't half-recover).
+3. If the key is **genuinely unrecoverable**, the encrypted columns are lost. Restore the database (and key) from a backup taken while the key was valid (see [disaster-recovery.md](disaster-recovery.md)). The CA private key can instead be regenerated (re-issues listener certs); workspace secrets cannot.
+
+### Verification
+
+- `python -m terrapod.cli.encryption_doctor` exits 0: "all encrypted data is decryptable".
+- `GET /api/terrapod/v1/admin/encryption` shows `decryptable: true`.
+
+### Prevention
+
+- Back up the KEK out-of-band **before** enabling (esp. `static`). Schedule the doctor so a broken key path is caught before a restart forces it. Never change the provider/key on a deployment with encrypted rows without proving the new path unwraps the existing DEKs first. See [encryption-at-rest.md](encryption-at-rest.md#recovery).

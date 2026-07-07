@@ -9,13 +9,29 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, PostgresDsn, RedisDsn
+from pydantic import BaseModel, Field, PostgresDsn, RedisDsn, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 def yaml_config_settings_source() -> dict[str, Any]:
     """Load configuration from YAML file."""
     config_path = Path("/etc/terrapod/config.yaml")
+    if config_path.exists():
+        with open(config_path) as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+def runners_yaml_config_settings_source() -> dict[str, Any]:
+    """Load runner/listener configuration from the runner ConfigMap (runners.yaml).
+
+    The listener mounts this ConfigMap at /etc/terrapod/runners.yaml. Mirrors
+    `yaml_config_settings_source` so `RunnerConfig` layers defaults → file → env
+    via pydantic-settings, instead of the listener hand-reading os.environ. The
+    file is absent in the API pod (which only consumes a few runner defaults via
+    `load_runner_config`), so it falls back to defaults + env there.
+    """
+    config_path = Path("/etc/terrapod/runners.yaml")
     if config_path.exists():
         with open(config_path) as f:
             return yaml.safe_load(f) or {}
@@ -36,21 +52,101 @@ class RunnerImageConfig(BaseModel):
     pull_policy: str = Field(default="IfNotPresent")
 
 
-class RunnerConfig(BaseModel):
-    """Runner configuration, loaded from /etc/terrapod/runners.yaml.
+class RunnerProxyConfig(BaseModel):
+    """Forward-proxy settings forwarded into runner Jobs (#592).
 
-    Separate from main Settings because listeners need their own
-    config independent of the API server's config.
+    Rendered into runners.yaml from the chart's top-level .Values.proxy. The
+    listener injects these as HTTP(S)_PROXY/NO_PROXY (upper + lower case) env
+    vars on the runner Job so `terraform init` reaches PUBLIC registry/git
+    module sources through a corporate proxy. no_proxy is pre-resolved by the
+    chart (cluster-local defaults + operator list); we do NOT assume the
+    runner→API hop is proxy-exempt — in split-cluster it traverses the proxy.
     """
+
+    http_proxy: str = Field(default="")
+    https_proxy: str = Field(default="")
+    no_proxy: str = Field(default="")
+
+
+class RunnerConfig(BaseSettings):
+    """Runner + listener configuration, layered defaults → runners.yaml → env.
+
+    A pydantic-settings model (like `Settings`) so the listener reads ONE
+    config object instead of hand-reading os.environ: the runner ConfigMap
+    (runners.yaml) is the file source, `TERRAPOD_*` env vars override it, and
+    field defaults backstop both. This carries BOTH the runner-Job settings
+    (image, resources, proxy/CA) AND the listener's own operational settings
+    (name, namespaces, API URLs, health port, cert TTL, SSE/heartbeat/poll
+    knobs) — all non-sensitive, so they flow through the ConfigMap, not via
+    chart-set Deployment env vars. Secrets (the join token) and runtime values
+    (POD_NAME) stay as Deployment env and are NOT fields here.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="TERRAPOD_",
+        env_nested_delimiter="__",
+        extra="ignore",
+    )
 
     image: RunnerImageConfig = Field(default_factory=RunnerImageConfig)
     server_url: str = Field(
         default="",
-        description="Internal API URL for runner Jobs (e.g. http://terrapod-api:8000). "
-        "Used as base URL for presigned storage URLs. Falls back to TERRAPOD_API_URL env var.",
+        description="Internal API URL the listener + runner Jobs call "
+        "(e.g. http://terrapod-api:8000). Also the base for presigned storage URLs. "
+        "Env override: TERRAPOD_SERVER_URL.",
     )
     default_terraform_version: str = Field(default="1.12")
     default_execution_backend: str = Field(default="tofu")
+    # --- Listener operational settings (non-sensitive; from runners.yaml) ---
+    # Previously read by the listener directly from os.environ; now layered
+    # through this config object so they are ConfigMap-driven, not chart-env.
+    listener_name: str = Field(
+        default="listener",
+        description="Base listener name; the pod name is appended per replica.",
+    )
+    runner_namespace: str = Field(
+        default="terrapod-runners",
+        description="Namespace the listener creates runner Jobs + per-run Secrets in.",
+    )
+    listener_namespace: str = Field(
+        default="terrapod",
+        description="Fallback namespace for the listener's own resources when the "
+        "in-pod service-account namespace file is unreadable (local/dev).",
+    )
+    credentials_secret_name: str = Field(
+        default="",
+        description="Explicit name for the listener credentials Secret. Empty → "
+        "derived as '{listener_name}-credentials'. Set by the chart to tie the "
+        "Secret to the Deployment lifecycle (a Secret NAME, not a secret value).",
+    )
+    health_port: int = Field(default=8081, description="Listener health/readiness port.")
+    public_api_url: str = Field(
+        default="",
+        description="Public/canonical API URL forwarded to runner Jobs as "
+        "TP_PUBLIC_API_URL when it differs from server_url (canonical→internal "
+        "host redirect). Empty in single-network deployments.",
+    )
+    listener_cert_ttl_seconds: int = Field(
+        default=3600,
+        description="Listener certificate validity; drives the renewal threshold. "
+        "Must match api.config.agent_pools.listener_cert_ttl_seconds.",
+    )
+    heartbeat_interval: int = Field(default=60, description="Listener heartbeat interval (s).")
+    max_concurrent: int = Field(
+        default=3, description="Max concurrent run launches per listener pod."
+    )
+    poll_interval: int = Field(
+        default=30, description="Fallback poll interval when SSE is idle (s)."
+    )
+    sse_read_timeout: int = Field(
+        default=30, description="SSE read timeout — silence beyond this reconnects (s)."
+    )
+    sse_max_age: int = Field(
+        default=600, description="Max SSE connection age before a proactive reconnect (s)."
+    )
+    sse_retry_interval: int = Field(
+        default=5, description="Backoff between SSE reconnect attempts (s)."
+    )
     service_account_name: str = Field(default="")
     azure_workload_identity: bool = Field(default=False)
     ttl_seconds_after_finished: int = Field(default=600)
@@ -70,6 +166,23 @@ class RunnerConfig(BaseModel):
     image_pull_secrets: list[str] = Field(default_factory=list)
     extra_env: list[dict] = Field(default_factory=list)
     extra_env_from: list[dict] = Field(default_factory=list)
+    # Forward proxy + custom CA trust bundle (#592). Rendered into runners.yaml
+    # by the chart from top-level .Values.proxy / .Values.caBundle. The listener
+    # forwards these into every runner Job: proxy env vars (so terraform init can
+    # fetch PUBLIC registry/git modules through a corporate proxy) and the custom
+    # CA (so the runner trusts a TLS-intercepting proxy / private registry).
+    proxy: RunnerProxyConfig | None = Field(default=None)
+    ca_bundle_enabled: bool = Field(default=False)
+    ca_bundle_source_path: str = Field(
+        default="",
+        description=(
+            "Path on the LISTENER pod to the raw custom CA file (mounted from "
+            "the chart's caBundle source). The listener reads it at Job-launch "
+            "time and ships it into a per-run Secret in the runner namespace, "
+            "where the runner Job's init container merges it with the runner "
+            "image's own system roots."
+        ),
+    )
     stale_timeout_seconds: int = Field(
         default=3600,
         description="Seconds before a run with no Job status is marked errored",
@@ -101,15 +214,68 @@ class RunnerConfig(BaseModel):
             "you still want drift on; set to 0 to disable the cap."
         ),
     )
+    lifecycle_destroy_retries: int = Field(
+        default=2,
+        description=(
+            "How many times to automatically retry a FAILED platform-initiated "
+            "lifecycle destroy — a catalog instance destroy (source "
+            "`catalog-lifecycle`) or an autodiscovery directory destroy (source "
+            "`autodiscovery-lifecycle`) — before leaving it errored for an "
+            "operator. terraform destroy is commonly transiently flaky "
+            "(dependency-release ordering, eventual consistency, draining load "
+            "balancers / releasing ENIs / emptying buckets) and re-running is "
+            "safe because destroy is declarative and incremental. The workspace "
+            "is only archived on a SUCCESSFUL destroy, so retries never lose "
+            "data: they either eventually succeed and archive, or exhaust the "
+            "cap and stay errored. A user's own CLI `terraform destroy` is "
+            "never auto-retried. Set to 0 to disable. Default 2 (3 attempts)."
+        ),
+    )
+    lifecycle_destroy_retry_backoff_seconds: int = Field(
+        default=45,
+        description=(
+            "Seconds to wait after a lifecycle-destroy run errors before "
+            "queuing the next retry, giving transient dependencies time to "
+            "settle before terraform tries the teardown again."
+        ),
+    )
+    hooks_enabled: bool = Field(
+        default=True,
+        description=(
+            "Kill-switch for execution hooks (#619). When false, the listener "
+            "drops all hooks resolved for a run before building the Job, so no "
+            "operator shell runs in the runner. For security-conscious / sealed "
+            "deployments that want to forbid custom-shell hooks entirely."
+        ),
+    )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: Any,
+        env_settings: Any,
+        dotenv_settings: Any,
+        file_secret_settings: Any,
+    ) -> tuple[Any, ...]:
+        """Layer sources: init args > env vars > runners.yaml > defaults."""
+        return (
+            init_settings,
+            env_settings,
+            runners_yaml_config_settings_source,
+            dotenv_settings,
+            file_secret_settings,
+        )
 
 
 def load_runner_config(path: str = "/etc/terrapod/runners.yaml") -> RunnerConfig:
-    """Load runner configuration from YAML file."""
-    config_path = Path(path)
-    if config_path.exists():
-        with open(config_path) as f:
-            data = yaml.safe_load(f) or {}
-        return RunnerConfig(**data)
+    """Construct the runner/listener config (defaults → runners.yaml → env).
+
+    The `path` argument is retained for backward compatibility but ignored: the
+    runners.yaml file is now a pydantic-settings source on `RunnerConfig`
+    (`runners_yaml_config_settings_source`, fixed at /etc/terrapod/runners.yaml),
+    so the layering — and env overrides — happen inside the model.
+    """
     return RunnerConfig()
 
 
@@ -371,6 +537,56 @@ class NotificationsConfig(BaseModel):
 # --- Registry Configuration ---
 
 
+class WarmPlatform(BaseModel):
+    """A single os/arch target for cache pre-population."""
+
+    os: str
+    arch: str
+
+
+class WarmBinaryEntry(BaseModel):
+    """A declarative binary-cache pre-population entry.
+
+    Pulled into the cache by the post-install/upgrade warm Job and by the
+    bulk-warm admin endpoint. An empty `platforms` list falls back to the
+    default warm platforms (linux/amd64 + linux/arm64) so the common case is
+    just {tool, version}.
+    """
+
+    tool: Literal["terraform", "tofu", "terragrunt"] = "terraform"
+    version: str
+    platforms: list[WarmPlatform] = Field(default_factory=list)
+
+
+class WarmProviderEntry(BaseModel):
+    """A declarative provider-cache pre-population entry.
+
+    `source` is the provider address `hostname/namespace/type`
+    (e.g. `registry.terraform.io/hashicorp/aws`). An empty `platforms` list
+    falls back to `provider_cache.platforms`.
+    """
+
+    source: str
+    version: str
+    platforms: list[WarmPlatform] = Field(default_factory=list)
+
+    @field_validator("source")
+    @classmethod
+    def _validate_source(cls, v: str) -> str:
+        parts = v.split("/")
+        if len(parts) != 3 or not all(p.strip() for p in parts):
+            raise ValueError(
+                "provider warm source must be 'hostname/namespace/type' "
+                "(e.g. 'registry.terraform.io/hashicorp/aws')"
+            )
+        return v
+
+    @property
+    def coordinates(self) -> tuple[str, str, str]:
+        hostname, namespace, type_ = self.source.split("/")
+        return hostname, namespace, type_
+
+
 class ProviderCacheConfig(BaseModel):
     """Provider binary caching (network mirror) configuration."""
 
@@ -382,6 +598,25 @@ class ProviderCacheConfig(BaseModel):
     platforms: list[dict[str, str]] = Field(
         default=[{"os": "linux", "arch": "amd64"}, {"os": "linux", "arch": "arm64"}],
     )
+    verify: Literal["off", "checksum", "signature"] = Field(
+        default="signature",
+        description="Integrity verification for provider archives fetched from upstream. "
+        "'signature' (default, fail-closed): verify the archive's SHA-256 against the "
+        "registry-advertised shasum AND verify the registry's SHA256SUMS GPG signature "
+        "against the registry-advertised signing key (mirrors `terraform init`). "
+        "'checksum': verify the SHA-256 against the advertised shasum only. "
+        "'off': no verification (NOT recommended — the mirror would trust any bytes). "
+        "On failure the fetch is rejected; nothing is cached or served.",
+    )
+    allow_unsigned: bool = Field(
+        default=False,
+        description="In 'signature' mode, what to do when the upstream advertises NO "
+        "signature material (some private registries / non-signing network mirrors, "
+        "and some community providers). Default false = fail closed (strict). Set true "
+        "to gracefully degrade to a shasum-only check (with a warning) for those "
+        "providers instead of rejecting them — the archive checksum is still verified "
+        "against the advertised shasum. Only relevant when verify='signature'.",
+    )
 
 
 class BinaryCacheConfig(BaseModel):
@@ -390,14 +625,72 @@ class BinaryCacheConfig(BaseModel):
     enabled: bool = Field(default=True)
     terraform_mirror_url: str = Field(default="https://releases.hashicorp.com/terraform")
     tofu_mirror_url: str = Field(default="https://github.com/opentofu/opentofu/releases/download")
+    terragrunt_mirror_url: str = Field(
+        default="https://github.com/gruntwork-io/terragrunt/releases/download",
+        description="Upstream download base for terragrunt binaries (GitHub releases). "
+        "Terragrunt ships a bare per-platform binary asset (terragrunt_<os>_<arch>), "
+        "not a zip/tarball — the pull-through cache stores it as-is. Only used by "
+        "workspaces with terragrunt enabled.",
+    )
+    # --- Version-index (listing / partial-version resolution) sources ---
+    # The *_mirror_url fields above are the per-binary download bases. These are
+    # the separate endpoints the cache reads to LIST available versions and to
+    # resolve a partial version (e.g. "1.12" -> "1.12.3"). Upstream they live on
+    # different hosts from the download base (terraform's index is on
+    # releases.hashicorp.com, tofu's on get.opentofu.org, terragrunt's on the
+    # GitHub API), so an internal-mirror / air-gapped deployment must override
+    # BOTH the download base and the version-index source for each tool. A mirror
+    # MUST serve the same response shape as the upstream it replaces (documented
+    # per field below), since the cache parses the upstream JSON format.
+    terraform_version_index_url: str = Field(
+        default="https://releases.hashicorp.com/terraform/index.json",
+        description="Version-index source for terraform. Must return the HashiCorp "
+        "releases index JSON shape: a top-level object with a `versions` map keyed "
+        'by version string (e.g. {"versions": {"1.12.3": {...}}}). Used for '
+        "version listing and partial-version resolution.",
+    )
+    tofu_version_index_url: str = Field(
+        default="https://get.opentofu.org/tofu/api.json",
+        description="Version-index source for tofu. Must return the OpenTofu index "
+        'JSON shape: {"versions": [{"id": "1.12.3"}, ...]} with ids carrying no '
+        "leading 'v'. (Distinct from tofu_mirror_url, which is the GitHub releases "
+        "download base.) Used for version listing and partial-version resolution.",
+    )
+    terragrunt_version_index_url: str = Field(
+        default="https://api.github.com/repos/gruntwork-io/terragrunt/releases",
+        description="Version-index source for terragrunt. Must return the GitHub "
+        "releases API shape: a JSON array of objects with `tag_name` (e.g. "
+        '"v0.58.0") and `prerelease`. Used for version listing and '
+        "partial-version resolution.",
+    )
     allow_prerelease: Literal["none", "rc", "beta", "alpha", "dev"] = Field(
         default="none",
-        description="Lowest pre-release tier to accept for terraform/tofu CLI version "
+        description="Lowest pre-release tier to accept for terraform/tofu/terragrunt CLI version "
         "resolution and caching. The value names the LEAST stable tier allowed; every "
         "more-stable tier is also allowed. 'none' (default) permits only GA releases. "
         "'rc' allows release candidates and GA. 'dev' allows everything. "
         "Intended for dev/staging deployments trying upcoming releases such as "
         "terraform 1.15-rc or tofu 1.12-beta.",
+    )
+    verify: Literal["off", "checksum", "signature"] = Field(
+        default="signature",
+        description="Integrity verification for terraform/tofu/terragrunt binaries fetched "
+        "from upstream. 'signature' (default, fail-closed): verify the upstream SHA256SUMS "
+        "GPG signature against the pinned publisher key (HashiCorp / OpenTofu / Gruntwork) "
+        "AND verify the downloaded binary's SHA-256 against that signed manifest. "
+        "'checksum': verify against the SHA256SUMS manifest only (no signature check). "
+        "'off': no verification (NOT recommended — the binary is executed on every run). "
+        "On failure the fetch is rejected; nothing is cached or served.",
+    )
+    signing_keys: dict[str, str] = Field(
+        default_factory=dict,
+        description="Operator override for the pinned publisher public keys used to verify "
+        "binary SHA256SUMS, keyed by tool ('terraform'/'tofu'/'terragrunt') → ASCII-armored "
+        "public key. Empty (default) uses the keys bundled in the image (HashiCorp "
+        "34365D9472D7468F, OpenTofu 0C0AF313E5FD9F80, Gruntwork 577774ACA847CC49). Supply a "
+        "key here to bridge an upstream key rotation without waiting for a Terrapod release, "
+        "or to trust an internal re-signing mirror. Provided keys are propagated to runner "
+        "Jobs so runner-side verification honours the same trust set.",
     )
 
 
@@ -411,6 +704,20 @@ class RegistryConfig(BaseModel):
     """Private registry and caching configuration."""
 
     enabled: bool = Field(default=True)
+    cache_only: bool = Field(
+        default=False,
+        description="Sealed (cache-only) mode for air-gapped deployments. When true, "
+        "NO upstream fetch ever happens across the binary cache, provider network "
+        "mirror, terragrunt binary, and version resolution: a cache miss returns a "
+        "clear, actionable error instead of (and never even attempting) an upstream "
+        "request, partial-version resolution (e.g. '1.12') resolves ONLY against "
+        "cached entries, and the artifact-retention sweeper skips the binary/provider "
+        "caches (evicting an un-refetchable artifact would lose it permanently). "
+        "Pre-populate the cache first (bulk-warm admin endpoint / UI) — typically "
+        "with cache_only off, pointing at an internal mirror — then seal. Pairs with "
+        "the forward proxy/CA as defense-in-depth: the proxy controls HOW upstream "
+        "would be reached; cache_only guarantees it ISN'T.",
+    )
     signing_key: str = Field(
         default="",
         description="ASCII-armored GPG private key for provider signing. "
@@ -421,6 +728,19 @@ class RegistryConfig(BaseModel):
     provider_cache: ProviderCacheConfig = Field(default_factory=ProviderCacheConfig)
     binary_cache: BinaryCacheConfig = Field(default_factory=BinaryCacheConfig)
     module_interface: ModuleInterfaceConfig = Field(default_factory=ModuleInterfaceConfig)
+
+
+class CatalogConfig(BaseModel):
+    """Service catalog: no-code self-service provisioning over the module
+    registry (#535).
+
+    On by default — it exposes the catalog RBAC axis (opt-in, default `none`,
+    so no user gains catalog access until granted), catalog-item and
+    provider-template management, and the provision flow. Set `enabled: false`
+    to hide the surface entirely (endpoints return 404).
+    """
+
+    enabled: bool = Field(default=True)
 
 
 # --- VCS Configuration ---
@@ -435,6 +755,20 @@ class GitHubWebhookConfig(BaseModel):
     )
 
 
+class GitLabWebhookConfig(BaseModel):
+    """GitLab webhook configuration (optional, for faster feedback).
+
+    GitLab does not HMAC-sign the body — it sends the configured secret
+    verbatim in the ``X-Gitlab-Token`` header. This global secret is the
+    fallback when a VCS connection does not set its own ``webhook_secret``.
+    """
+
+    webhook_secret: str = Field(
+        default="",
+        description="Webhook secret matched against the X-Gitlab-Token header (optional)",
+    )
+
+
 class VCSConfig(BaseModel):
     """VCS integration configuration."""
 
@@ -443,6 +777,7 @@ class VCSConfig(BaseModel):
         default=60, description="Polling interval in seconds for VCS changes"
     )
     github: GitHubWebhookConfig = Field(default_factory=GitHubWebhookConfig)
+    gitlab: GitLabWebhookConfig = Field(default_factory=GitLabWebhookConfig)
     tmpdir: str = Field(
         default="/var/lib/terrapod/tmp",
         description=(
@@ -496,6 +831,62 @@ class DriftDetectionConfig(BaseModel):
         default=3600,
         description="Minimum per-workspace drift check interval (floor, 1 hour)",
     )
+
+
+# --- Slack Integration ---
+
+
+class SlackConfig(BaseModel):
+    """Interactive Slack integration (#556).
+
+    Phase 1 wires the connection: an outbound **Socket Mode** WebSocket to Slack
+    (no public/inbound URL required, matching the restricted-network execution
+    model) plus a connectivity check. Later phases add action buttons, the
+    `/terrapod` slash command, and account-linked, RBAC-checked approve/discard.
+
+    The three tokens are **secrets** and arrive via env (secretKeyRef), never the
+    ConfigMap — `TERRAPOD_SLACK__BOT_TOKEN` / `__APP_TOKEN` / `__SIGNING_SECRET`.
+    Full operator setup (incl. the Slack-admin ↔ operator handoff): see
+    docs/slack-integration.md.
+    """
+
+    enabled: bool = Field(default=False, description="Enable the Slack integration")
+    socket_mode: bool = Field(
+        default=True,
+        description=(
+            "Use Socket Mode — an outbound WebSocket, no public URL. When false, "
+            "Slack reaches the Request-URL endpoint via the public webhook ingress."
+        ),
+    )
+    # Multi-deployment (#691): a Slack workspace treats a slash command as unique
+    # and every app is named "Terrapod", so several Terrapod deployments sharing
+    # one Slack workspace collide. Give each deployment a distinct `command`
+    # (matching the command set in its Slack app manifest) and a short `label`
+    # rendered in every message so a shared channel attributes each one.
+    command: str = Field(
+        default="/terrapod",
+        min_length=1,
+        description=(
+            "The slash command this deployment answers (must match the command in "
+            "its Slack app manifest). Give each deployment sharing one Slack "
+            "workspace a distinct command, e.g. /terrapod-prod. Must be non-empty — "
+            "an empty command would silently ignore every slash command."
+        ),
+    )
+    label: str = Field(
+        default="",
+        description=(
+            "Short human label for this deployment (e.g. 'prod', 'us-west-2'), shown "
+            "in Slack run messages so a shared channel can tell deployments apart. "
+            "Empty → omitted."
+        ),
+    )
+    # --- secrets: delivered via secretKeyRef → env, never rendered to the ConfigMap ---
+    bot_token: str = Field(default="", description="Bot User OAuth Token (xoxb-…)")
+    app_token: str = Field(
+        default="", description="App-Level Token with connections:write (xapp-…), for Socket Mode"
+    )
+    signing_secret: str = Field(default="", description="Slack app signing secret")
 
 
 # --- CORS Configuration ---
@@ -693,6 +1084,69 @@ class MetricsConfig(BaseModel):
     )
 
 
+class EncryptionConfig(BaseModel):
+    """Optional application-layer encryption at rest (#553).
+
+    OFF by default. For deployments WITHOUT a CSP at-rest encryption switch
+    (bare-metal / on-prem / niche cloud / air-gapped) this is the path to
+    encryption at rest; if your CSP already encrypts at rest (RDS/S3/Azure/GCS),
+    prefer that and treat this as belt-and-braces. Envelope encryption with a
+    pluggable KEK provider — see docs/encryption-at-rest.md.
+
+    Secrets (the static master key, the Vault token) are NOT here — they come
+    from env (`TERRAPOD_ENCRYPTION__STATIC_KEY` / `__VAULT_TOKEN`) via a K8s
+    Secret, never a ConfigMap.
+    """
+
+    enabled: bool = Field(default=False, description="Enable app-layer encryption at rest")
+    provider: str = Field(
+        default="static",
+        description="KEK provider: static | vault_transit | awskms",
+    )
+    # Vault Transit (CSP-agnostic; on-prem / air-gapped)
+    vault_address: str = Field(default="", description="Vault address, e.g. https://vault:8200")
+    vault_mount: str = Field(default="transit", description="Vault transit mount path")
+    vault_key_name: str = Field(default="terrapod", description="Vault transit key name")
+    vault_namespace: str = Field(default="", description="Vault namespace (Enterprise; optional)")
+    # AWS KMS (cloud belt-and-braces)
+    aws_kms_key_id: str = Field(default="", description="AWS KMS key ARN or id")
+    aws_kms_region: str = Field(default="", description="AWS region for KMS (optional)")
+
+    @field_validator("provider")
+    @classmethod
+    def _valid_provider(cls, v: str) -> str:
+        allowed = {"static", "vault_transit", "awskms"}
+        if v not in allowed:
+            raise ValueError(f"encryption.provider must be one of {sorted(allowed)}")
+        return v
+
+
+class BackupConfig(BaseModel):
+    """Logical PostgreSQL backup settings (consumed by terrapod.cli.backup).
+
+    The backup CronJob (off by default in the chart) runs ``pg_dump`` and
+    streams the dump to the configured object store under ``prefix``. This is a
+    logical dump — RPO is the dump interval, not point-in-time — and is the
+    baseline floor, not a replacement for RDS snapshots / WAL-G / pgBackRest.
+    See docs/disaster-recovery.md.
+    """
+
+    prefix: str = Field(
+        default="backups/",
+        description="Object-store key prefix backups are written under",
+    )
+    retention_keep: int = Field(
+        default=0,
+        ge=0,
+        description="Number of most-recent backups to keep (0 = keep all)",
+    )
+    retention_days: int = Field(
+        default=0,
+        ge=0,
+        description="Delete backups older than this many days (0 = disabled)",
+    )
+
+
 # --- AI Plan Summary Configuration ---
 
 
@@ -877,12 +1331,19 @@ class AISummaryConfig(BaseModel):
         ),
     )
     plan_json_max_bytes: int = Field(
-        default=500_000,
+        default=600_000,
         description=(
-            "Max bytes of plan JSON attached. The runner-uploaded "
-            "plan JSON is truncated to this cap (keeping resource_changes "
-            "intact via best-effort structural truncation). Defends "
-            "against pathological monorepos producing 50MB plan files."
+            "Max bytes of plan JSON attached to the model request. This is a "
+            "last-resort ceiling for the model's context window, not routine "
+            "trimming: the cap only engages on plans with ~1000+ resource "
+            "changes (a cleaned change is a few hundred bytes); everything "
+            "smaller is sent whole and untouched. When it does engage, the "
+            "reduction is STRUCTURAL (`_fit_plan_json`) — every change keeps "
+            "its address and `change.actions`, so a destroy can never be "
+            "hidden; only per-resource attribute detail is trimmed. Defends "
+            "against pathological monorepos producing tens-of-MB plan files "
+            "that would otherwise overflow the context window and hard-fail "
+            "the summary."
         ),
     )
     code_diff_max_bytes: int = Field(
@@ -956,6 +1417,99 @@ class DatabaseConfig(BaseModel):
         default=30,
         description="Seconds to wait for a query to complete",
     )
+    # --- Authentication mode (#573) ---
+    auth_mode: Literal["password", "aws_iam", "gcp_iam", "azure_ad"] = Field(
+        default="password",
+        description=(
+            "Database authentication. 'password' (default) uses the static "
+            "password in database_url — the existing, fully-supported behaviour. "
+            "The cloud-IAM modes mint a short-lived token per connection under the "
+            "API pod's workload identity — no static DB password, TLS required: "
+            "'aws_iam' (AWS RDS IAM, IRSA), 'gcp_iam' (GCP Cloud SQL IAM, WIF), "
+            "'azure_ad' (Azure Database for PostgreSQL Entra auth, Azure WI)."
+        ),
+    )
+    aws_iam_region: str = Field(
+        default="",
+        description=(
+            "AWS region used to sign RDS IAM auth tokens. Empty = botocore default "
+            "resolution (AWS_REGION / AWS_DEFAULT_REGION, set by IRSA). Only used "
+            "when auth_mode='aws_iam'."
+        ),
+    )
+    ssl_mode: str = Field(
+        default="",
+        description=(
+            "TLS mode for cloud-IAM auth: 'require' (encrypt, no cert check — "
+            "the default when empty), 'verify-ca' (verify the server cert chain) "
+            "or 'verify-full' (verify chain + hostname). 'verify-ca'/'verify-full' "
+            "require ssl_root_cert (or a system-trusted CA). Cloud IAM auth always "
+            "uses at least 'require'. Ignored when auth_mode='password'."
+        ),
+    )
+    ssl_root_cert: str = Field(
+        default="",
+        description=(
+            "Path to a CA bundle (PEM) used to verify the database server "
+            "certificate when ssl_mode is 'verify-ca'/'verify-full' (e.g. the AWS "
+            "RDS global-bundle.pem or the Cloud SQL server CA, mounted via "
+            "api.extraVolumes). Empty = the system trust store. Only used by the "
+            "cloud-IAM auth modes."
+        ),
+    )
+
+
+class RedisConfig(BaseModel):
+    """Redis/Valkey authentication settings (#579).
+
+    The connection URL itself stays in the top-level ``redis_url``; this block
+    only carries the cloud-IAM auth knobs. Default ``auth_mode='password'`` uses
+    the static auth string in ``redis_url`` and is fully supported.
+    """
+
+    auth_mode: Literal["password", "aws_iam", "gcp_iam", "azure_ad"] = Field(
+        default="password",
+        description=(
+            "Redis authentication. 'password' (default) uses the static auth "
+            "string in redis_url. The cloud-IAM modes mint a short-lived token "
+            "per connection under the API pod's workload identity — no static "
+            "Redis secret, TLS (rediss://) required: 'aws_iam' (AWS ElastiCache "
+            "IAM, IRSA), 'gcp_iam' (GCP Memorystore IAM, WIF), 'azure_ad' (Azure "
+            "Cache for Redis Entra auth, Azure WI)."
+        ),
+    )
+    username: str = Field(
+        default="",
+        description=(
+            "Redis ACL username for IAM auth — the ElastiCache User (AWS), the "
+            "IAM user (GCP), or the Entra principal object id (Azure). Required "
+            "for the cloud-IAM modes; ignored for 'password'."
+        ),
+    )
+    aws_iam_region: str = Field(
+        default="",
+        description=(
+            "AWS region used to sign ElastiCache IAM tokens. Empty = botocore "
+            "default resolution. Only used when auth_mode='aws_iam'."
+        ),
+    )
+    aws_cache_name: str = Field(
+        default="",
+        description=(
+            "ElastiCache cache identifier used for SigV4 signing — the "
+            "replication-group id or serverless cache name (NOT the endpoint "
+            "host). Required when auth_mode='aws_iam'."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _require_iam_fields(self) -> "RedisConfig":
+        """Fail fast on misconfigured IAM auth instead of an opaque connect error."""
+        if self.auth_mode in ("aws_iam", "gcp_iam", "azure_ad") and not self.username:
+            raise ValueError(f"redis.username is required for auth_mode={self.auth_mode!r}")
+        if self.auth_mode == "aws_iam" and not self.aws_cache_name:
+            raise ValueError("redis.aws_cache_name is required for auth_mode='aws_iam'")
+        return self
 
 
 # --- Main Settings ---
@@ -996,6 +1550,18 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Token signing — dedicated secret for stateless HMAC tokens (runner
+    # tokens + run-task callback tokens). When empty, the signing key falls
+    # back to sha256(database_url) for backward compatibility (no in-flight
+    # token is invalidated by upgrading). Set this (Helm: api.tokenSigningKey
+    # / env TERRAPOD_TOKEN_SIGNING_KEY) to decouple token-forgery resistance
+    # from database credentials. See auth/token_signing.py.
+    token_signing_key: str = Field(
+        default="",
+        description="Dedicated HMAC secret for runner + run-task tokens "
+        "(falls back to sha256(database_url) when empty).",
+    )
+
     # Database
     database_url: PostgresDsn = Field(
         default="postgresql+asyncpg://terrapod:terrapod@localhost:5432/terrapod",
@@ -1008,6 +1574,7 @@ class Settings(BaseSettings):
         default="redis://localhost:6379",
         description="Redis connection URL",
     )
+    redis: "RedisConfig" = Field(default_factory=lambda: RedisConfig())
 
     # Storage
     storage: StorageConfig = Field(default_factory=StorageConfig)
@@ -1021,6 +1588,9 @@ class Settings(BaseSettings):
     # Registry
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
 
+    # Service Catalog
+    catalog: CatalogConfig = Field(default_factory=CatalogConfig)
+
     # VCS
     vcs: VCSConfig = Field(default_factory=VCSConfig)
 
@@ -1029,6 +1599,9 @@ class Settings(BaseSettings):
 
     # Drift Detection
     drift_detection: DriftDetectionConfig = Field(default_factory=DriftDetectionConfig)
+
+    # Slack integration (#556)
+    slack: SlackConfig = Field(default_factory=SlackConfig)
 
     # CORS
     cors: CORSConfig = Field(default_factory=CORSConfig)
@@ -1044,6 +1617,12 @@ class Settings(BaseSettings):
 
     # Artifact Retention
     artifact_retention: ArtifactRetentionConfig = Field(default_factory=ArtifactRetentionConfig)
+
+    # Logical PostgreSQL backup (terrapod.cli.backup; CronJob off by default)
+    backup: BackupConfig = Field(default_factory=BackupConfig)
+
+    # Optional app-layer encryption at rest (#553; off by default)
+    encryption: EncryptionConfig = Field(default_factory=EncryptionConfig)
 
     # Runner artifact upload limits (API-side enforcement)
     runner_artifacts: RunnerArtifactsConfig = Field(default_factory=RunnerArtifactsConfig)

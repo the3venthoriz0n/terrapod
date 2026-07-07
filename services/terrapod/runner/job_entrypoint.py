@@ -41,14 +41,16 @@ import structlog
 from terrapod.runner import lock_extender, plan_artifacts
 from terrapod.runner.phases import (
     backend_backstop,
+    execution_hooks,
     init_phase,
     log_capture,
     mirror_config,
     opa,
     plan_apply,
     resource_profile,
-    setup_script,
+    terragrunt,
     tf_args,
+    tfvars,
     uploads,
     working_dir,
 )
@@ -62,6 +64,9 @@ from terrapod.runner.phases.state import (
 from terrapod.runner.runner_config import RunnerConfig
 
 _DEFAULT_WORK_DIR = Path("/workspace")
+# Per-run vars Secret mount (terraform variable values). Keep in sync with
+# runner/job_template.py (_TFVARS_MOUNT_DIR + _TFVARS_FILENAME).
+_VARS_FILE = Path("/var/run/terrapod/vars/terraform.tfvars.json")
 
 _COMBINED_LOG = Path("/tmp/combined.log")
 _INIT_LOG = Path("/tmp/init.log")
@@ -163,6 +168,20 @@ def _run_plan_phase(
     failure / OPA mandatory-set deny)."""
     log = structlog.get_logger("runner.job_entrypoint")
 
+    # pre_plan execution hooks (#619) — after init, before plan. A failing
+    # hook fails the run (no plan is produced).
+    try:
+        execution_hooks.run_point("pre_plan", env=os.environ.copy())
+    except execution_hooks.HookError as exc:
+        log.error("pre_plan hook failed", hook=exc.name, rc=exc.exit_code)
+        return exc.exit_code
+
+    # The plan binary lives at strip_dir, which for non-terragrunt runs is
+    # the process CWD and for terragrunt is the resolved `.terragrunt-cache`
+    # working dir where tofu actually runs (so `-out`/`show`/upload all target
+    # the real file rather than the unit dir the process is chdir'd into).
+    plan_file = strip_dir / "tfplan"
+
     # Lock-file h1 splice (best-effort) and lock-file upload. Done
     # BEFORE plan invocation so the apply phase's lock-file download
     # picks up the splice. The lock file lives at strip_dir.
@@ -228,6 +247,7 @@ def _run_plan_phase(
         var_file_args=var_file_argv,
         log_file=str(_PLAN_LOG),
         child_grace_seconds=child_grace,
+        plan_file=str(plan_file),
     )
     _flush_stdio()
     if plan_result.exit_code != 0:
@@ -273,9 +293,9 @@ def _run_plan_phase(
 
     # Export show -json (for OPA + UI artifact). Best-effort.
     plan_show_ok = False
-    if Path("tfplan").exists():
+    if plan_file.exists():
         plan_show_ok = plan_apply.run_plan_show_json(
-            binary=binary, plan_file="tfplan", json_out=str(_PLAN_JSON)
+            binary=binary, plan_file=str(plan_file), json_out=str(_PLAN_JSON)
         )
 
     # OPA evaluation. Mandatory-set denials → non-zero exit.
@@ -296,9 +316,9 @@ def _run_plan_phase(
         log.warning("plan-result raised (non-fatal)", err=str(exc))
 
     # Plan binary upload (skip for plan-only).
-    if Path("tfplan").exists() and not cfg.plan_only:
+    if plan_file.exists() and not cfg.plan_only:
         try:
-            uploads.upload_plan_file(cfg, Path("tfplan"))
+            uploads.upload_plan_file(cfg, plan_file)
         except Exception as exc:  # noqa: BLE001
             log.warning("plan-file upload raised (non-fatal)", err=str(exc))
 
@@ -308,6 +328,18 @@ def _run_plan_phase(
             uploads.upload_plan_json(cfg, _PLAN_JSON)
         except Exception as exc:  # noqa: BLE001
             log.warning("plan-json upload raised (non-fatal)", err=str(exc))
+
+    # post_plan execution hooks (#619) — after a successful plan and after its
+    # artifacts (plan file + show-json) are uploaded, so the hook can inspect
+    # the plan and the plan is visible in the UI regardless of the gate result.
+    # Runs last in the plan phase (mirroring post_apply): a failing hook returns
+    # non-zero, which errors the run and — for a plan+apply run — prevents the
+    # apply, the same way an OPA mandatory-set denial does.
+    try:
+        execution_hooks.run_point("post_plan", env=os.environ.copy())
+    except execution_hooks.HookError as exc:
+        log.error("post_plan hook failed", hook=exc.name, rc=exc.exit_code)
+        return exc.exit_code
 
     return 0
 
@@ -428,6 +460,14 @@ def _run_apply_phase(
             except OSError:
                 pass
 
+    # pre_apply execution hooks (#619) — after confirm/plan-file restore,
+    # before apply. A failing hook fails the run with nothing applied yet.
+    try:
+        execution_hooks.run_point("pre_apply", env=os.environ.copy())
+    except execution_hooks.HookError as exc:
+        log.error("pre_apply hook failed", hook=exc.name, rc=exc.exit_code)
+        return exc.exit_code
+
     _APPLY_LOG.write_bytes(b"")
     _flush_stdio()
     rc = plan_apply.run_apply(
@@ -437,6 +477,7 @@ def _run_apply_phase(
         log_file=str(_APPLY_LOG),
         has_plan_file=has_plan_file,
         child_grace_seconds=child_grace,
+        plan_file=str(plan_file),
     )
     _flush_stdio()
     if rc != 0:
@@ -481,6 +522,24 @@ def _run_apply_phase(
             if rc == 0:
                 rc = 1
 
+    # post_apply execution hooks (#619) — run ONLY after a successful apply AND
+    # a successful state upload (rc still 0), so state is already persisted. A
+    # failing post_apply hook fails the run WITHOUT losing state: the run
+    # surfaces as errored ("apply succeeded; post-apply hook failed") rather
+    # than silently passing. Runs before the apply-result POST so a failed hook
+    # doesn't report the apply as clean.
+    if rc == 0:
+        try:
+            execution_hooks.run_point("post_apply", env=os.environ.copy())
+        except execution_hooks.HookError as exc:
+            log.error(
+                "post_apply hook failed — apply and state upload succeeded; "
+                "failing the run to surface the hook error (state is safe)",
+                hook=exc.name,
+                rc=exc.exit_code,
+            )
+            return exc.exit_code
+
     if rc == 0:
         try:
             uploads.post_apply_result(cfg)
@@ -499,6 +558,18 @@ def _run_body(cfg: RunnerConfig, work_dir: Path) -> int:
     # ready" on success — no need to repeat it here.)
     binary_path = download_binary(cfg)
     binary = str(binary_path)
+
+    # 1b. Terragrunt (#534): wrap the cached tofu/terraform with terragrunt so
+    # every phase that invokes `binary` actually runs terragrunt. The tg-wrapper
+    # execs terragrunt with TG_TF_PATH pinned to the tf-wrapper, which drops the
+    # local-backend override into the tofu working dir (so Terrapod still owns
+    # state). Terragrunt copies the unit into a `.terragrunt-cache` subdir and
+    # runs tofu there; after init (step 9b) the orchestrator follows tofu into
+    # that dir for state + plan-file capture.
+    if cfg.terragrunt_enabled:
+        tg_bin = terragrunt.download_terragrunt(cfg)
+        binary = str(terragrunt.write_wrappers(terragrunt_bin=tg_bin, real_tf_bin=binary_path))
+        log.info("terragrunt enabled", tg_wrapper=binary)
 
     # 2. Configuration tarball.
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -520,6 +591,21 @@ def _run_body(cfg: RunnerConfig, work_dir: Path) -> int:
     cwd = working_dir.resolve_and_chdir(strip_dir, cfg.working_dir)
     log.info("chdir", cwd=str(cwd))
 
+    # 4b. Render terrapod.auto.tfvars from the mounted vars Secret (if any),
+    # BEFORE init so it's part of the post-init baseline (the plan-artifacts
+    # snapshot won't re-upload it). For terragrunt, cwd is the unit dir whose
+    # contents terragrunt copies into its cache. The file is absent when the
+    # workspace has no terraform variables.
+    if _VARS_FILE.exists():
+        try:
+            import json as _json
+
+            parsed = _json.loads(_VARS_FILE.read_text(encoding="utf-8"))
+            tfvars.write_auto_tfvars(cwd, parsed)
+        except (ValueError, OSError) as exc:
+            log.error("failed to render terraform variables", error=str(exc))
+            return 1
+
     # 5. State download — AFTER chdir so terraform.tfstate lands beside
     # the user's .tf files.
     state_present = download_state(cfg, strip_dir=cwd)
@@ -530,11 +616,15 @@ def _run_body(cfg: RunnerConfig, work_dir: Path) -> int:
     if cfg.phase == "apply":
         reuse_plan_lock_file(cfg, strip_dir=cwd)
 
-    # 7. Setup script (operator-supplied tfvars / cloud auth / etc.).
+    # 7. pre_init execution hooks (#619) — operator-supplied setup steps
+    # (cloud/secret auth, /etc/hosts entries, extra tooling) run for BOTH
+    # phases, before init. This supersedes the removed setup_script /
+    # TP_SETUP_SCRIPT slot (which was never wired to a delivery path). A
+    # failing hook fails the run.
     try:
-        setup_script.run(cfg.setup_script, env=os.environ.copy())
-    except setup_script.SetupScriptError as exc:
-        log.error("setup script failed", rc=exc.exit_code)
+        execution_hooks.run_point("pre_init", env=os.environ.copy())
+    except execution_hooks.HookError as exc:
+        log.error("pre_init hook failed", hook=exc.name, rc=exc.exit_code)
         return exc.exit_code
 
     # 8. Build var-file / target / replace argv pieces.
@@ -561,6 +651,22 @@ def _run_body(cfg: RunnerConfig, work_dir: Path) -> int:
         _flush_stdio()
         return exc.exit_code
     _flush_stdio()
+
+    # 9b. Terragrunt: after init, tofu's real working dir is the
+    # `.terragrunt-cache/<hash>/<hash>/` copy terragrunt makes of the unit —
+    # this happens for EVERY unit, not just `terraform { source = … }` ones.
+    # tofu reads/writes state and the plan file THERE, while the process stays
+    # chdir'd to the unit dir (where terragrunt.hcl lives, so terragrunt finds
+    # it). Relocate the state we downloaded into that cache dir and switch the
+    # orchestrator's working dir (`cwd`) to it, so the backend backstop, plan,
+    # apply, and state capture all target the directory tofu actually uses. If
+    # terragrunt ran tofu in place (no cache dir resolved), `cwd` is unchanged.
+    if cfg.terragrunt_enabled:
+        tg_work = terragrunt.resolve_working_dir(cwd)
+        if tg_work != cwd:
+            moved = terragrunt.relocate_state(src=cwd, dst=tg_work)
+            log.info("terragrunt working dir", work_dir=str(tg_work), state_moved=moved)
+            cwd = tg_work
 
     # 10. Backend backstop.
     try:

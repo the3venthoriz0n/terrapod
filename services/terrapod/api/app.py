@@ -36,6 +36,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     await init_db()
     logger.info("Database initialized")
 
+    # App ↔ schema skew guard (#544): warm the code-head cache and loudly warn
+    # if the DB schema is behind this app's expected migration head. Doesn't
+    # raise — a schema-behind pod boots and reports NOT READY via /ready.
+    from terrapod.db.schema_version import check_schema_at_startup
+
+    await check_schema_at_startup()
+
     await init_redis()
     logger.info("Redis initialized")
 
@@ -44,6 +51,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
     await init_storage()
     logger.info("Storage initialized")
+
+    # Initialize app-layer encryption at rest (#553) BEFORE the CA — the CA
+    # private key column is EncryptedText, so the service must be ready first.
+    # Fail CLOSED when encryption is enabled (a wrong/missing key must crash);
+    # tolerate errors only when disabled (e.g. table missing pre-migration).
+    from terrapod.config import settings as _settings
+    from terrapod.crypto.service import init_encryption
+
+    try:
+        async with get_db_session() as db:
+            await init_encryption(db)
+    except Exception as e:
+        if _settings.encryption.enabled:
+            raise
+        logger.warning("Encryption init skipped (disabled; migration may be pending)", error=str(e))
 
     # Initialize Certificate Authority
     from terrapod.auth.ca import init_ca
@@ -174,6 +196,30 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         description="Deliver workspace notification on run state change",
     )
 
+    # Slack app run notifications (#556) — approval / applied / errored / drift.
+    # Registered only when the Slack app is enabled; the handler also no-ops
+    # unless the target workspace opted in with its own channel.
+    if settings.slack.enabled:
+        from terrapod.services.slack_notify_service import (
+            handle_slack_run_notify,
+            slack_approval_backfill_cycle,
+        )
+
+        register_trigger_handler(
+            "slack_run_notify",
+            handler=handle_slack_run_notify,
+            description="Post/update the Slack run message for a run event",
+        )
+        # Safety net (#687): post any needs-approval message that was deferred
+        # to the AI summariser but never fired (e.g. the runner died before the
+        # plan-JSON upload). No-ops unless AI is on (nothing is deferred then).
+        register_periodic_task(
+            "slack_approval_backfill",
+            interval_seconds=60,
+            handler=slack_approval_backfill_cycle,
+            description="Backfill deferred Slack approval posts the summariser missed",
+        )
+
     # Run task webhook delivery handler
     from terrapod.services.run_task_dispatcher import handle_run_task_call
 
@@ -230,6 +276,30 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         description="Drive run state transitions based on Job outcomes",
     )
 
+    # Bounded auto-retry for failed platform-initiated lifecycle destroys
+    # (catalog + autodiscovery). Cheap no-op when there are none; the handler
+    # self-gates to 0 retries / no eligible runs.
+    from terrapod.services.lifecycle_destroy_retry import lifecycle_destroy_retry_cycle
+
+    register_periodic_task(
+        "lifecycle_destroy_retry",
+        interval_seconds=30,
+        handler=lifecycle_destroy_retry_cycle,
+        description="Retry failed catalog/autodiscovery lifecycle destroy runs",
+    )
+
+    # Plan expiry sweep (#646): discard apply-capable planned runs that have aged
+    # past their workspace's plan_expiry_seconds TTL. No-op when no workspace sets
+    # a TTL (the default). Cheap query gated on plan_expiry_seconds > 0.
+    from terrapod.services.run_service import expire_stale_plans_cycle
+
+    register_periodic_task(
+        "plan_expiry_sweep",
+        interval_seconds=60,
+        handler=expire_stale_plans_cycle,
+        description="Discard planned runs past their workspace plan-expiry TTL",
+    )
+
     # Audit log retention (daily)
     async def _audit_retention() -> None:
         from terrapod.services.audit_service import purge_old_entries
@@ -259,10 +329,39 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             description="Clean up old artifacts from object storage",
         )
 
+    # Encryption DEK refresh — multi-replica DEK propagation (no leader election).
+    # Lets a DEK rotated on one replica become usable on all replicas without a
+    # restart. Cheap no-op when nothing changed. Only when encryption is enabled.
+    if settings.encryption.enabled:
+
+        async def _encryption_key_refresh() -> None:
+            from terrapod.crypto.service import refresh_keys
+
+            async with get_db_session() as db:
+                await refresh_keys(db)
+
+        register_periodic_task(
+            "encryption_key_refresh",
+            interval_seconds=30,
+            handler=_encryption_key_refresh,
+            description="Propagate rotated DEKs to all replicas (multi-replica safe)",
+        )
+
     await start_scheduler()
     logger.info("Distributed scheduler started")
 
+    # Slack integration (#556) — best-effort outbound Socket Mode connection.
+    # Never fails startup: a misconfigured/disabled Slack just logs and skips.
+    from terrapod.services.slack_service import start_slack
+
+    await start_slack(settings)
+
     yield
+
+    # Stop Slack connection
+    from terrapod.services.slack_service import stop_slack
+
+    await stop_slack()
 
     # Stop scheduler
     await stop_scheduler()
@@ -476,6 +575,28 @@ def create_application() -> FastAPI:
             logger.warning("Failed to write audit log entry", exc_info=True)
 
         return response
+
+    # Uncaught unique/constraint violations are a CONFLICT, not a server error.
+    # Many create endpoints pre-check then INSERT, which races under multiple
+    # replicas (the SELECT can't see a concurrent uncommitted INSERT); the loser
+    # hits the unique constraint. get_db has already rolled the session back by
+    # the time we get here. Hot paths still catch IntegrityError in-handler for a
+    # specific message (e.g. catalog "name already exists"); this is the net so
+    # the generic case is 409, not 500. Registered before the Exception handler
+    # so the more specific type wins.
+    from sqlalchemy.exc import IntegrityError
+
+    @app.exception_handler(IntegrityError)
+    async def integrity_error_handler(request: Request, exc: IntegrityError) -> JSONResponse:
+        logger.warning(
+            "Integrity constraint violation",
+            path=str(request.url.path),
+            error=str(getattr(exc, "orig", exc)),
+        )
+        return JSONResponse(
+            status_code=409,
+            content={"detail": "Resource already exists or violates a constraint"},
+        )
 
     # Global exception handler
     @app.exception_handler(Exception)
@@ -703,6 +824,13 @@ def create_application() -> FastAPI:
 
     app.include_router(workspace_bulk_router, prefix=TERRAPOD_PREFIX)
 
+    # Service catalog (#535): provider-template + catalog-item management +
+    # provision flow. The router self-gates on settings.catalog.enabled (404
+    # when disabled), so it is always mounted.
+    from terrapod.api.routers.catalog import router as catalog_router
+
+    app.include_router(catalog_router, prefix=TERRAPOD_PREFIX)
+
     # VCS webhook event receiver — Terrapod-specific.
     from terrapod.api.routers.vcs_events import router as vcs_events_router
 
@@ -722,6 +850,19 @@ def create_application() -> FastAPI:
     from terrapod.api.routers.run_triggers import router as run_triggers_router
 
     include_terrapod(run_triggers_router)
+
+    # Execution hooks — Terrapod-native library of custom-shell steps run in the
+    # runner Job at fixed points (#619). Admin-managed; associated to workspaces.
+    from terrapod.api.routers.execution_hooks import (
+        router as execution_hooks_router,
+    )
+
+    include_terrapod(execution_hooks_router)
+
+    # Slack account-linking — bind a Slack identity to a Terrapod identity (#556).
+    from terrapod.api.routers.slack import router as slack_router
+
+    include_terrapod(slack_router)
 
     # Remote-state consumer allowlist — Terrapod-native management of the
     # producer-controlled cross-workspace `terraform_remote_state` grants
@@ -745,6 +886,11 @@ def create_application() -> FastAPI:
     from terrapod.api.routers.audit import router as audit_router
 
     include_terrapod(audit_router)
+
+    # Encryption-at-rest status (admin only) — Terrapod-specific (#553).
+    from terrapod.api.routers.encryption import router as encryption_router
+
+    include_terrapod(encryption_router)
 
     # User management endpoints — Terrapod-native. Canonical paths at
     # /api/terrapod/v1/users{,/{email}}.

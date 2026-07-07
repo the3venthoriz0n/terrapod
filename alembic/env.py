@@ -4,10 +4,10 @@ import asyncio
 import os
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
+from alembic import context
 from terrapod.db.models import Base
 
 config = context.config
@@ -52,6 +52,16 @@ async def run_async_migrations() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+    )
+
+    # Cloud-IAM DB auth (#573) for the migrations Job: mirror the API's
+    # per-connection token + TLS injection (shared with the bootstrap Job) so the
+    # Job authenticates the same way as the running app when an IAM auth_mode is
+    # set via TP_DB_* env. No-op for the default static-password mode.
+    from terrapod.db import iam_auth
+
+    iam_auth.register_engine_iam_auth(
+        connectable.sync_engine, config.get_main_option("sqlalchemy.url") or ""
     )
 
     async with connectable.connect() as connection:

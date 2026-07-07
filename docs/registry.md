@@ -666,8 +666,48 @@ api:
         enabled: true
         terraform_mirror_url: "https://releases.hashicorp.com/terraform"
         tofu_mirror_url: "https://github.com/opentofu/opentofu/releases/download"
+        terragrunt_mirror_url: "https://github.com/gruntwork-io/terragrunt/releases/download"
         allow_prerelease: none    # none | rc | beta | alpha | dev
 ```
+
+### Pointing the cache at an internal mirror (restricted-network / air-gapped)
+
+Every upstream the binary cache reaches is operator-overridable, so a deployment with no direct egress to `releases.hashicorp.com` / GitHub / `get.opentofu.org` can pull from an internal artifact repository (Artifactory, Nexus, an internal HTTP mirror) instead. There are **two distinct sources per tool**, and an internal-mirror deployment must override **both**:
+
+1. **Download base** (`*_mirror_url`) — where the per-platform binary is fetched.
+2. **Version index** (`*_version_index_url`) — the endpoint the cache reads to **list** versions and to resolve a partial version (e.g. `terraform_version = "1.12"` → `1.12.3`). Upstream these live on different hosts from the download base, which is why they are separate keys.
+
+```yaml
+api:
+  config:
+    registry:
+      binary_cache:
+        # Download bases
+        terraform_mirror_url:  "https://artifacts.internal/terraform"
+        tofu_mirror_url:       "https://artifacts.internal/opentofu/releases/download"
+        terragrunt_mirror_url: "https://artifacts.internal/terragrunt/releases/download"
+        # Version-index sources
+        terraform_version_index_url:  "https://artifacts.internal/terraform/index.json"
+        tofu_version_index_url:       "https://artifacts.internal/opentofu/api.json"
+        terragrunt_version_index_url: "https://artifacts.internal/terragrunt/releases"
+```
+
+A mirror **must serve the same response shape** as the upstream it replaces, because the cache parses the upstream JSON format:
+
+| Source | Expected response shape |
+|---|---|
+| `terraform_version_index_url` | HashiCorp releases index JSON: `{"versions": {"1.12.3": {...}, ...}}` |
+| `tofu_version_index_url` | OpenTofu index JSON: `{"versions": [{"id": "1.12.3"}, ...]}` (ids carry no leading `v`) |
+| `terragrunt_version_index_url` | GitHub releases array: `[{"tag_name": "v0.58.0", "prerelease": false}, ...]` |
+| `terraform_mirror_url` | `…/{version}/terraform_{version}_{os}_{arch}.zip` |
+| `tofu_mirror_url` | `…/v{version}/tofu_{version}_{os}_{arch}.zip` |
+| `terragrunt_mirror_url` | `…/v{version}/terragrunt_{os}_{arch}` (a bare binary, not an archive) |
+
+The provider network mirror has the equivalent override: `registry.provider_cache.upstream_registries` (see [Provider Caching](#provider-caching-network-mirror) above) — point it at an internal provider registry that implements the provider network-mirror protocol.
+
+All of these fetches go through the [forward proxy and custom CA](deployment-proxy.md) when configured (the API's HTTP client honours `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` / the mounted CA bundle), so an internal mirror reached only via a corporate egress proxy works without further changes. Integrity verification ([supply-chain verification](supply-chain-verification.md)) still applies to mirror-served artifacts — if the mirror re-signs binaries with its own key, supply the key via `binary_cache.signing_keys`.
+
+> This section covers pointing the pull-through caches at internal sources; the caches still fall through to those configured sources on a miss. To pre-fill the caches up front see [Cache pre-population](#cache-pre-population) below, and to forbid any upstream fall-through entirely (cache-miss must never reach upstream) see [Sealed (cache-only) mode](#sealed-cache-only-mode).
 
 ### Pre-release versions (`allow_prerelease`)
 
@@ -753,7 +793,30 @@ api:
 
 ### Admin UI
 
-The web UI includes a cache admin page at `/admin/binary-cache` (admin-only) for viewing and purging cached CLI binaries and provider binaries.
+The web UI includes a cache admin page at `/admin/binary-cache` (admin-only) for viewing and purging cached CLI binaries and provider binaries, and a **Warm cache** panel for bulk pre-population.
+
+---
+
+## Cache pre-population
+
+Both caches normally fill on demand (a cache miss fetches from upstream), but you can also seed them ahead of time — essential for restricted-network deployments and useful anywhere you want the first run to be fast.
+
+`POST /api/terrapod/v1/admin/binary-cache/warm-bulk` warms many binaries and provider platforms in one call (see [API reference](api-reference.md#bulk-warm-cache-admin)). The same operation is available interactively in the **Warm cache** panel on the `/admin/binary-cache` page — one entry per line. Warming is resilient: each (entry, platform) is warmed independently and reported back with its own success/error, so one missing version never fails the batch.
+
+Warming honours the upstream-source overrides (`*_mirror_url`, `*_version_index_url`, `provider_cache.upstream_registries`), so it pulls from your internal mirror when one is configured.
+
+---
+
+## Sealed (cache-only) mode
+
+For fully air-gapped deployments, set `registry.cache_only: true`. This is a hard guarantee that **no upstream fetch ever happens** — across the binary cache, the provider network mirror, the terragrunt binary, and version resolution. Specifically, when sealed:
+
+- **Cache miss → actionable 404.** A request for a binary or provider platform that isn't cached returns a clear `404` (e.g. *"terraform 1.12.3 (linux/amd64) is not in the cache and sealed (cache_only) mode is enabled. Pre-populate it via the bulk-warm admin endpoint before sealing, or disable registry.cache_only."*) instead of silently attempting (and failing) an upstream request.
+- **Partial-version resolution is cache-backed.** `terraform_version = "1.12"` resolves to the highest **cached** `1.12.x`, never the upstream version index. If nothing cached matches, resolution fails with the same actionable error. (Outside sealed mode, resolution still consults the upstream index as before.)
+- **The provider mirror serves cached-only.** The version index and platform list reflect exactly what's cached — no upstream metadata fetch, no eager caching, no upstream-direct download URLs.
+- **The artifact-retention sweeper skips the binary + provider caches.** Evicting an un-refetchable artifact would lose it permanently, so those categories are left untouched while sealed (other retention categories are unaffected).
+
+**Workflow:** pre-populate the cache *first* — typically with `cache_only` **off**, pointing the upstream overrides at an internal mirror and running [bulk warm](#cache-pre-population) — then flip `cache_only: true` to seal. Pairs with the [forward proxy / CA](deployment-proxy.md) as defense-in-depth: the proxy controls *how* upstream would be reached; `cache_only` guarantees it *isn't*.
 
 ---
 

@@ -13,6 +13,7 @@ Endpoints:
 import asyncio
 import hashlib
 import json
+import os
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response, status
 from fastapi.responses import JSONResponse
@@ -20,12 +21,14 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from terrapod.api.dependencies import AuthenticatedUser, get_current_user
+from terrapod.api.upload_stream import file_chunks, read_file_bytes, stream_to_tempfile
+from terrapod.auth import capabilities as cap
+from terrapod.auth.capabilities import has_capability
 from terrapod.db.models import StateVersion, Workspace
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
 from terrapod.services.workspace_rbac_service import (
-    has_permission,
-    resolve_workspace_permission_for,
+    resolve_workspace_capabilities_for,
 )
 from terrapod.storage import get_storage
 from terrapod.storage.keys import state_key
@@ -44,21 +47,40 @@ async def _get_state_version(state_version_id: str, db: AsyncSession) -> StateVe
     return sv
 
 
-async def _require_sv_workspace_permission(
+def _read_state_lineage_md5(path: str) -> tuple[str, str]:
+    """Read (lineage, md5) from a state file on disk (worker thread).
+
+    Both the md5 hash and `json.load` would block the event loop on a
+    multi-MB state if run inline (CLAUDE.md #13). The file lives on the
+    ephemeral PVC, not the worker heap (#14).
+    """
+    h = hashlib.md5()  # noqa: S324  # nosemgrep: insecure-hash-algorithm-md5
+    with open(path, "rb") as fh:
+        while True:
+            buf = fh.read(1024 * 1024)
+            if not buf:
+                break
+            h.update(buf)
+    with open(path, "rb") as fh:
+        state_data = json.load(fh)
+    return state_data.get("lineage", ""), h.hexdigest()
+
+
+async def _require_sv_workspace_capability(
     sv: StateVersion,
     required: str,
     user: AuthenticatedUser,
     db: AsyncSession,
 ) -> Workspace:
-    """Check permission on the state version's workspace. Returns workspace."""
+    """Check a capability on the state version's workspace. Returns workspace."""
     ws = await db.get(Workspace, sv.workspace_id)
     if ws is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
-    perm = await resolve_workspace_permission_for(db, user, ws)
-    if not has_permission(perm, required):
+    caps = await resolve_workspace_capabilities_for(db, user, ws)
+    if not has_capability(caps, required):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Requires {required} permission on workspace",
+            detail=f"Requires {required} capability on workspace",
         )
     return ws
 
@@ -75,7 +97,7 @@ async def delete_state_version(
     protects against accidentally removing the active workspace state.
     """
     sv = await _get_state_version(state_version_id, db)
-    ws = await _require_sv_workspace_permission(sv, "admin", user, db)
+    ws = await _require_sv_workspace_capability(sv, cap.STATE_DELETE, user, db)
 
     # Prevent deleting the current (latest) state version, UNLESS the
     # record is an unuploaded orphan placeholder. We can't gate on
@@ -145,13 +167,17 @@ async def rollback_state_version(
     — no versions are deleted, history is preserved.
     """
     sv = await _get_state_version(state_version_id, db)
-    ws = await _require_sv_workspace_permission(sv, "write", user, db)
+    ws = await _require_sv_workspace_capability(sv, cap.STATE_WRITE, user, db)
 
-    # Download the old state bytes
+    # Download the old state bytes (decrypting if app-layer state encryption was
+    # on when they were written, #635). Working in plaintext keeps md5/state_size
+    # below consistent; the re-store re-encrypts under the active DEK.
+    from terrapod.crypto.state import decrypt_state_bytes, encrypt_state_bytes
+
     storage = get_storage()
     old_key = state_key(str(sv.workspace_id), str(sv.id))
     try:
-        state_bytes = await storage.get(old_key)
+        state_bytes = await decrypt_state_bytes(await storage.get(old_key))
     except Exception:
         raise HTTPException(
             status_code=404,
@@ -180,9 +206,15 @@ async def rollback_state_version(
     db.add(new_sv)
     await db.flush()
 
-    # Store state bytes at new key
+    # A rollback advances the state serial → any apply-capable planned run now has
+    # a stale plan; auto-discard them (#647).
+    from terrapod.services import run_service
+
+    await run_service.discard_stale_plans_for_state_change(db, sv.workspace_id, new_serial)
+
+    # Store state bytes at new key (re-encrypted under the active DEK when on)
     new_key = state_key(str(sv.workspace_id), str(new_sv.id))
-    await storage.put(new_key, state_bytes)
+    await storage.put(new_key, await encrypt_state_bytes(state_bytes))
 
     await db.commit()
     await db.refresh(new_sv)
@@ -227,50 +259,75 @@ async def upload_state_manual(
     from terrapod.api.routers.tfe_v2 import _get_workspace_by_id
 
     ws = await _get_workspace_by_id(workspace_id, db)
-    perm = await resolve_workspace_permission_for(db, user, ws)
-    if not has_permission(perm, "write"):
+    caps = await resolve_workspace_capabilities_for(db, user, ws)
+    if not has_capability(caps, cap.STATE_WRITE):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Requires write permission on workspace",
+            detail="Requires state:write capability on workspace",
         )
 
-    body = await request.body()
-    if not body:
-        raise HTTPException(status_code=400, detail="Empty request body")
-
+    # Stream the state body to a capped tempfile on the ephemeral PVC rather
+    # than buffering it with `await request.body()` — a manually-uploaded
+    # state can be multi-MB and would OOM the API pod (CLAUDE.md #14). The
+    # lineage + md5 are read back off the event loop (#13).
+    tmp_path, state_size = await stream_to_tempfile(request, suffix=".state.json")
     try:
-        state_data = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise HTTPException(status_code=400, detail="Invalid state JSON") from exc
+        if state_size == 0:
+            raise HTTPException(status_code=400, detail="Empty request body")
 
-    lineage = state_data.get("lineage", "")
-    # Hash off the event loop — state uploads can be multi-MB
-    md5 = await asyncio.to_thread(lambda: hashlib.md5(body).hexdigest())  # noqa: S324  # nosemgrep: insecure-hash-algorithm-md5
+        try:
+            lineage, md5 = await asyncio.to_thread(_read_state_lineage_md5, tmp_path)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid state JSON") from exc
 
-    # Auto-assign serial
-    max_serial_result = await db.execute(
-        select(func.max(StateVersion.serial)).where(StateVersion.workspace_id == ws.id)
-    )
-    max_serial = max_serial_result.scalar_one() or 0
-    new_serial = max_serial + 1
+        # Auto-assign serial
+        max_serial_result = await db.execute(
+            select(func.max(StateVersion.serial)).where(StateVersion.workspace_id == ws.id)
+        )
+        max_serial = max_serial_result.scalar_one() or 0
+        new_serial = max_serial + 1
 
-    sv = StateVersion(
-        workspace_id=ws.id,
-        serial=new_serial,
-        lineage=lineage,
-        md5=md5,
-        state_size=len(body),
-        created_by=user.email,
-    )
-    db.add(sv)
-    await db.flush()
+        sv = StateVersion(
+            workspace_id=ws.id,
+            serial=new_serial,
+            lineage=lineage,
+            md5=md5,
+            state_size=state_size,
+            created_by=user.email,
+        )
+        db.add(sv)
+        await db.flush()
 
-    storage = get_storage()
-    key = state_key(str(ws.id), str(sv.id))
-    await storage.put(key, body)
+        # Stream straight to storage when state encryption is off; when on,
+        # envelope the whole blob first (#635). md5/state_size above are over the
+        # plaintext, which is what downloads/divergence checks compare.
+        from terrapod.crypto.state import encrypt_state_bytes, state_encryption_active
 
-    await db.commit()
-    await db.refresh(sv)
+        storage = get_storage()
+        key = state_key(str(ws.id), str(sv.id))
+        if state_encryption_active():
+            plaintext = await asyncio.to_thread(read_file_bytes, tmp_path)
+            await storage.put(
+                key, await encrypt_state_bytes(plaintext), content_type="application/octet-stream"
+            )
+        else:
+            await storage.put_stream(
+                key, file_chunks(tmp_path), content_type="application/octet-stream"
+            )
+
+        # A manual upload advances the state serial → any apply-capable planned
+        # run now has a stale plan; auto-discard them (#647).
+        from terrapod.services import run_service
+
+        await run_service.discard_stale_plans_for_state_change(db, ws.id, new_serial)
+
+        await db.commit()
+        await db.refresh(sv)
+    finally:
+        try:
+            await asyncio.to_thread(os.unlink, tmp_path)
+        except OSError:
+            pass
 
     logger.info(
         "state_version_uploaded_manually",

@@ -51,19 +51,6 @@ def test_resolve_workspace_mode_truth_table(global_enabled, mode, expected):
 # ── Truncation ───────────────────────────────────────────────────────────
 
 
-def test_truncate_head_preserves_head():
-    data = b"a" * 100 + b"TAIL"
-    out = summariser._truncate_head(data, 50)
-    assert out.startswith("a" * 50)
-    assert "TAIL" not in out
-    assert "truncated from tail" in out
-
-
-def test_truncate_head_no_op_when_under_cap():
-    data = b"small"
-    assert summariser._truncate_head(data, 100) == "small"
-
-
 def test_truncate_tail_preserves_tail():
     data = b"HEAD" + b"a" * 100
     out = summariser._truncate_tail(data, 50)
@@ -77,10 +64,9 @@ def test_truncate_tail_no_op_when_under_cap():
 
 
 def test_truncate_zero_cap_returns_full_string():
-    # 0 means "unlimited" in this helper — _gather_inputs uses the
-    # config value directly. Code-context max=0 disables code entirely,
-    # but the truncation primitives themselves are no-ops at 0.
-    assert summariser._truncate_head(b"abc", 0) == "abc"
+    # 0 means "unlimited" in these helpers — _gather_inputs uses the
+    # config value directly. The truncation primitives themselves no-op at 0.
+    assert summariser._truncate_tail(b"abc", 0) == "abc"
 
 
 # ── _extract_tf_sources ──────────────────────────────────────────────────
@@ -371,6 +357,35 @@ def test_build_litellm_kwargs_omits_role_when_unset():
         )
         assert "aws_role_name" not in kw
         assert "aws_external_id" not in kw
+
+
+def test_build_litellm_kwargs_includes_bounded_retry():
+    """The model call must carry a bounded retry so transient instant-failures
+    (Bedrock surfaces these as litellm.Timeout with ~0s elapsed under
+    concurrency) self-heal instead of failing the best-effort summary."""
+    with (
+        patch.object(summariser.settings.ai_summary, "model", "bedrock/anthropic.claude-opus-4-8"),
+        patch.object(summariser.settings.ai_summary, "api_base", ""),
+        patch.object(summariser.settings.ai_summary.auth, "api_key", ""),
+        patch.object(summariser.settings.ai_summary.auth, "aws_role_arn", ""),
+    ):
+        kw = summariser._build_litellm_kwargs(
+            kind="plan_summary",
+            system_message="sys",
+            user_message="usr",
+            max_output_tokens=100,
+        )
+        assert kw["num_retries"] == summariser._LLM_NUM_RETRIES >= 1
+        assert kw["retry_strategy"] == "exponential_backoff_retry"
+
+
+def test_litellm_logging_quieted_at_import():
+    """LiteLLM's chatty INFO logging is turned down so the per-call
+    'LiteLLM completion() model=…' banner stops flooding our logs."""
+    import logging
+
+    assert logging.getLogger("LiteLLM").level >= logging.WARNING
+    assert summariser.litellm.suppress_debug_info is True
 
 
 def test_build_litellm_kwargs_includes_tool_choice_for_plan_summary():

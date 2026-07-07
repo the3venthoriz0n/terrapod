@@ -8,6 +8,7 @@ from httpx import ASGITransport, AsyncClient
 
 from terrapod.api.app import create_application as create_app
 from terrapod.api.dependencies import AuthenticatedUser, get_current_user, require_admin
+from terrapod.auth.capabilities import caps_for_level
 from terrapod.db.session import get_db
 
 _BASE = "http://test"
@@ -72,9 +73,9 @@ class TestListVariables:
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
     @patch("terrapod.api.routers.variables.variable_service.list_variables")
-    @patch("terrapod.api.routers.variables.resolve_workspace_permission_for")
+    @patch("terrapod.api.routers.variables.resolve_workspace_capabilities_for")
     async def test_list_with_read_perm(self, mock_resolve, mock_list, *mocks):
-        mock_resolve.return_value = "read"
+        mock_resolve.return_value = caps_for_level("read")
         ws = _mock_workspace()
         var = _mock_var(ws_id=ws.id)
         mock_list.return_value = [var]
@@ -96,9 +97,9 @@ class TestListVariables:
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
     @patch("terrapod.api.routers.variables.variable_service.list_variables")
-    @patch("terrapod.api.routers.variables.resolve_workspace_permission_for")
+    @patch("terrapod.api.routers.variables.resolve_workspace_capabilities_for")
     async def test_sensitive_values_masked(self, mock_resolve, mock_list, *mocks):
-        mock_resolve.return_value = "read"
+        mock_resolve.return_value = caps_for_level("read")
         ws = _mock_workspace()
         var = _mock_var(key="secret", sensitive=True, ws_id=ws.id)
         mock_list.return_value = [var]
@@ -117,9 +118,9 @@ class TestListVariables:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.variables.resolve_workspace_permission_for")
+    @patch("terrapod.api.routers.variables.resolve_workspace_capabilities_for")
     async def test_list_no_permission_returns_403(self, mock_resolve, *mocks):
-        mock_resolve.return_value = None
+        mock_resolve.return_value = caps_for_level(None)
         ws = _mock_workspace()
         app, mock_db = _make_app(_user())
         mock_result = MagicMock()
@@ -139,9 +140,9 @@ class TestCreateVariable:
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
     @patch("terrapod.api.routers.variables.variable_service.create_variable")
-    @patch("terrapod.api.routers.variables.resolve_workspace_permission_for")
+    @patch("terrapod.api.routers.variables.resolve_workspace_capabilities_for")
     async def test_create_with_write_perm(self, mock_resolve, mock_create, *mocks):
-        mock_resolve.return_value = "write"
+        mock_resolve.return_value = caps_for_level("write")
         ws = _mock_workspace()
         var = _mock_var(ws_id=ws.id)
         mock_create.return_value = var
@@ -170,9 +171,9 @@ class TestCreateVariable:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.variables.resolve_workspace_permission_for")
+    @patch("terrapod.api.routers.variables.resolve_workspace_capabilities_for")
     async def test_create_missing_key_returns_422(self, mock_resolve, *mocks):
-        mock_resolve.return_value = "write"
+        mock_resolve.return_value = caps_for_level("write")
         ws = _mock_workspace()
         app, mock_db = _make_app(_user())
         mock_result = MagicMock()
@@ -190,9 +191,9 @@ class TestCreateVariable:
     @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
-    @patch("terrapod.api.routers.variables.resolve_workspace_permission_for")
+    @patch("terrapod.api.routers.variables.resolve_workspace_capabilities_for")
     async def test_create_read_only_returns_403(self, mock_resolve, *mocks):
-        mock_resolve.return_value = "read"
+        mock_resolve.return_value = caps_for_level("read")
         ws = _mock_workspace()
         app, mock_db = _make_app(_user())
         mock_result = MagicMock()
@@ -211,9 +212,9 @@ class TestCreateVariable:
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
     @patch("terrapod.api.routers.variables.variable_service.create_variable")
-    @patch("terrapod.api.routers.variables.resolve_workspace_permission_for")
+    @patch("terrapod.api.routers.variables.resolve_workspace_capabilities_for")
     async def test_create_encryption_error_returns_422(self, mock_resolve, mock_create, *mocks):
-        mock_resolve.return_value = "write"
+        mock_resolve.return_value = caps_for_level("write")
         mock_create.side_effect = ValueError("encryption not configured")
         ws = _mock_workspace()
         app, mock_db = _make_app(_user())
@@ -239,9 +240,9 @@ class TestUpdateVariable:
     @patch("terrapod.api.app.init_db")
     @patch("terrapod.api.routers.variables.variable_service.update_variable")
     @patch("terrapod.api.routers.variables.variable_service.get_variable")
-    @patch("terrapod.api.routers.variables.resolve_workspace_permission_for")
+    @patch("terrapod.api.routers.variables.resolve_workspace_capabilities_for")
     async def test_update_with_write_perm(self, mock_resolve, mock_get, mock_update, *mocks):
-        mock_resolve.return_value = "write"
+        mock_resolve.return_value = caps_for_level("write")
         ws = _mock_workspace()
         var = _mock_var(ws_id=ws.id)
         mock_get.return_value = var
@@ -264,9 +265,9 @@ class TestUpdateVariable:
     @patch("terrapod.api.app.init_redis")
     @patch("terrapod.api.app.init_db")
     @patch("terrapod.api.routers.variables.variable_service.get_variable")
-    @patch("terrapod.api.routers.variables.resolve_workspace_permission_for")
+    @patch("terrapod.api.routers.variables.resolve_workspace_capabilities_for")
     async def test_update_not_found_returns_404(self, mock_resolve, mock_get, *mocks):
-        mock_resolve.return_value = "write"
+        mock_resolve.return_value = caps_for_level("write")
         mock_get.return_value = None
         ws = _mock_workspace()
         app, mock_db = _make_app(_user())
@@ -292,9 +293,9 @@ class TestDeleteVariable:
     @patch("terrapod.api.app.init_db")
     @patch("terrapod.api.routers.variables.variable_service.delete_variable")
     @patch("terrapod.api.routers.variables.variable_service.get_variable")
-    @patch("terrapod.api.routers.variables.resolve_workspace_permission_for")
+    @patch("terrapod.api.routers.variables.resolve_workspace_capabilities_for")
     async def test_delete_with_write_perm(self, mock_resolve, mock_get, mock_delete, *mocks):
-        mock_resolve.return_value = "write"
+        mock_resolve.return_value = caps_for_level("write")
         ws = _mock_workspace()
         var = _mock_var(ws_id=ws.id)
         mock_get.return_value = var
@@ -389,3 +390,95 @@ class TestVariableSetCRUD:
                 headers=_AUTH,
             )
         assert resp.status_code == 403
+
+
+def _mock_vsvar(key="db_pass", value="s3cr3t", sensitive=True):
+    v = MagicMock()
+    v.id = uuid.uuid4()
+    v.variable_set_id = uuid.uuid4()
+    v.key = key
+    v.value = value
+    v.sensitive = sensitive
+    v.category = "terraform"
+    v.hcl = False
+    v.description = ""
+    v.version_id = "old-hash"
+    v.created_at = datetime(2026, 1, 1, tzinfo=UTC)
+    v.updated_at = datetime(2026, 1, 1, tzinfo=UTC)
+    return v
+
+
+class TestVarsetVarSensitiveDowngrade:
+    """The varset-var PATCH path must clear a previously-hidden secret when a
+    var is flipped sensitive→non-sensitive without a fresh value (mirrors the
+    workspace-var service-tier rule; the router does it inline)."""
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    @patch("terrapod.api.routers.variables._get_varset")
+    async def test_downgrade_without_value_clears_secret(self, mock_get_vs, *_mocks):
+        user = _user(roles=["admin"])
+        app, mock_db = _make_app(user)
+        mock_get_vs.return_value = _mock_varset()
+        vsv = _mock_vsvar(sensitive=True, value="s3cr3t")
+        lookup = MagicMock()
+        lookup.scalar_one_or_none.return_value = vsv
+        mock_db.execute = AsyncMock(return_value=lookup)
+        mock_db.refresh = AsyncMock()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.patch(
+                f"/api/v2/varsets/varset-{uuid.uuid4()}/relationships/vars/var-{vsv.id}",
+                json={"data": {"attributes": {"sensitive": False}}},
+                headers=_AUTH,
+            )
+        assert resp.status_code == 200
+        assert vsv.sensitive is False
+        assert vsv.value == ""
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    @patch("terrapod.api.routers.variables._get_varset")
+    async def test_downgrade_with_fresh_value_keeps_it(self, mock_get_vs, *_mocks):
+        user = _user(roles=["admin"])
+        app, mock_db = _make_app(user)
+        mock_get_vs.return_value = _mock_varset()
+        vsv = _mock_vsvar(sensitive=True, value="s3cr3t")
+        lookup = MagicMock()
+        lookup.scalar_one_or_none.return_value = vsv
+        mock_db.execute = AsyncMock(return_value=lookup)
+        mock_db.refresh = AsyncMock()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.patch(
+                f"/api/v2/varsets/varset-{uuid.uuid4()}/relationships/vars/var-{vsv.id}",
+                json={"data": {"attributes": {"sensitive": False, "value": "now-public"}}},
+                headers=_AUTH,
+            )
+        assert resp.status_code == 200
+        assert vsv.value == "now-public"
+
+    @patch("terrapod.api.app.init_storage", new_callable=AsyncMock)
+    @patch("terrapod.api.app.init_redis")
+    @patch("terrapod.api.app.init_db")
+    @patch("terrapod.api.routers.variables._get_varset")
+    async def test_non_sensitive_edit_keeps_value(self, mock_get_vs, *_mocks):
+        user = _user(roles=["admin"])
+        app, mock_db = _make_app(user)
+        mock_get_vs.return_value = _mock_varset()
+        vsv = _mock_vsvar(sensitive=False, value="keep-me")
+        lookup = MagicMock()
+        lookup.scalar_one_or_none.return_value = vsv
+        mock_db.execute = AsyncMock(return_value=lookup)
+        mock_db.refresh = AsyncMock()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url=_BASE) as c:
+            resp = await c.patch(
+                f"/api/v2/varsets/varset-{uuid.uuid4()}/relationships/vars/var-{vsv.id}",
+                json={"data": {"attributes": {"description": "new"}}},
+                headers=_AUTH,
+            )
+        assert resp.status_code == 200
+        assert vsv.value == "keep-me"

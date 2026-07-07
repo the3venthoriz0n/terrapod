@@ -10,6 +10,12 @@ metadata:
 data:
   config.yaml: |
     log_level: {{ .Values.api.config.log_level | quote }}
+    {{- if hasKey .Values.api.config "debug" }}
+    debug: {{ .Values.api.config.debug }}
+    {{- end }}
+    {{- if hasKey .Values.api.config "json_logs" }}
+    json_logs: {{ .Values.api.config.json_logs }}
+    {{- end }}
     {{- if .Values.api.config.external_url }}
     external_url: {{ .Values.api.config.external_url | quote }}
     {{- end }}
@@ -36,6 +42,21 @@ data:
       pool_timeout: {{ .Values.api.config.database.pool_timeout | default 30 }}
       connect_timeout: {{ .Values.api.config.database.connect_timeout | default 10 }}
       command_timeout: {{ .Values.api.config.database.command_timeout | default 30 }}
+      auth_mode: {{ .Values.api.config.database.auth_mode | default "password" | quote }}
+      aws_iam_region: {{ .Values.api.config.database.aws_iam_region | default "" | quote }}
+      ssl_mode: {{ .Values.api.config.database.ssl_mode | default "" | quote }}
+      {{- if or .Values.api.databaseCA.inline .Values.api.databaseCA.existingConfigMap }}
+      ssl_root_cert: {{ printf "/etc/terrapod/db-ca/%s" (.Values.api.databaseCA.key | default "ca.pem") | quote }}
+      {{- else }}
+      ssl_root_cert: {{ .Values.api.config.database.ssl_root_cert | default "" | quote }}
+      {{- end }}
+    {{- end }}
+    {{- if .Values.api.config.redis }}
+    redis:
+      auth_mode: {{ .Values.api.config.redis.auth_mode | default "password" | quote }}
+      username: {{ .Values.api.config.redis.username | default "" | quote }}
+      aws_iam_region: {{ .Values.api.config.redis.aws_iam_region | default "" | quote }}
+      aws_cache_name: {{ .Values.api.config.redis.aws_cache_name | default "" | quote }}
     {{- end }}
     storage:
       backend: {{ .Values.api.config.storage.backend | quote }}
@@ -132,6 +153,10 @@ data:
               - {{ . | quote }}
               {{- end }}
             {{- end }}
+            {{- if .claims_to_roles }}
+            claims_to_roles:
+              {{- toYaml .claims_to_roles | nindent 14 }}
+            {{- end }}
           {{- end }}
         {{- end }}
         {{- if .Values.api.config.auth.sso.saml }}
@@ -145,11 +170,18 @@ data:
             {{- if .entity_id }}
             entity_id: {{ .entity_id | quote }}
             {{- end }}
+            {{- if .acs_url }}
+            acs_url: {{ .acs_url | quote }}
+            {{- end }}
             {{- if .role_prefixes }}
             role_prefixes:
               {{- range .role_prefixes }}
               - {{ . | quote }}
               {{- end }}
+            {{- end }}
+            {{- if .claims_to_roles }}
+            claims_to_roles:
+              {{- toYaml .claims_to_roles | nindent 14 }}
             {{- end }}
           {{- end }}
         {{- end }}
@@ -158,6 +190,9 @@ data:
     {{- if .Values.api.config.registry }}
     registry:
       enabled: {{ .Values.api.config.registry.enabled }}
+      {{- if hasKey .Values.api.config.registry "cache_only" }}
+      cache_only: {{ .Values.api.config.registry.cache_only }}
+      {{- end }}
       {{- if .Values.api.config.registry.provider_cache }}
       provider_cache:
         enabled: {{ .Values.api.config.registry.provider_cache.enabled }}
@@ -175,6 +210,12 @@ data:
             arch: {{ .arch | quote }}
           {{- end }}
         {{- end }}
+        {{- if .Values.api.config.registry.provider_cache.verify }}
+        verify: {{ .Values.api.config.registry.provider_cache.verify | quote }}
+        {{- end }}
+        {{- if hasKey .Values.api.config.registry.provider_cache "allow_unsigned" }}
+        allow_unsigned: {{ .Values.api.config.registry.provider_cache.allow_unsigned }}
+        {{- end }}
       {{- end }}
       {{- if .Values.api.config.registry.binary_cache }}
       binary_cache:
@@ -185,10 +226,37 @@ data:
         {{- if .Values.api.config.registry.binary_cache.tofu_mirror_url }}
         tofu_mirror_url: {{ .Values.api.config.registry.binary_cache.tofu_mirror_url | quote }}
         {{- end }}
+        {{- if .Values.api.config.registry.binary_cache.terragrunt_mirror_url }}
+        terragrunt_mirror_url: {{ .Values.api.config.registry.binary_cache.terragrunt_mirror_url | quote }}
+        {{- end }}
+        {{- if .Values.api.config.registry.binary_cache.terraform_version_index_url }}
+        terraform_version_index_url: {{ .Values.api.config.registry.binary_cache.terraform_version_index_url | quote }}
+        {{- end }}
+        {{- if .Values.api.config.registry.binary_cache.tofu_version_index_url }}
+        tofu_version_index_url: {{ .Values.api.config.registry.binary_cache.tofu_version_index_url | quote }}
+        {{- end }}
+        {{- if .Values.api.config.registry.binary_cache.terragrunt_version_index_url }}
+        terragrunt_version_index_url: {{ .Values.api.config.registry.binary_cache.terragrunt_version_index_url | quote }}
+        {{- end }}
         {{- if .Values.api.config.registry.binary_cache.allow_prerelease }}
         allow_prerelease: {{ .Values.api.config.registry.binary_cache.allow_prerelease | quote }}
         {{- end }}
+        {{- if .Values.api.config.registry.binary_cache.verify }}
+        verify: {{ .Values.api.config.registry.binary_cache.verify | quote }}
+        {{- end }}
+        {{- if .Values.api.config.registry.binary_cache.signing_keys }}
+        signing_keys:
+          {{- toYaml .Values.api.config.registry.binary_cache.signing_keys | nindent 10 }}
+        {{- end }}
       {{- end }}
+      {{- if .Values.api.config.registry.module_interface }}
+      module_interface:
+        enabled: {{ .Values.api.config.registry.module_interface.enabled }}
+      {{- end }}
+    {{- end }}
+    {{- if .Values.api.config.catalog }}
+    catalog:
+      enabled: {{ .Values.api.config.catalog.enabled }}
     {{- end }}
     {{- if .Values.api.config.vcs }}
     vcs:
@@ -200,6 +268,9 @@ data:
       tmpdir: {{ .Values.api.config.vcs.tmpdir | default .Values.api.ephemeralStorage.mountPath | default "/var/lib/terrapod/tmp" | quote }}
       {{- with .Values.api.config.vcs.archive_cache_retention_days }}
       archive_cache_retention_days: {{ . }}
+      {{- end }}
+      {{- with .Values.api.config.vcs.tmpdir_min_free_bytes }}
+      tmpdir_min_free_bytes: {{ . | int64 }}
       {{- end }}
     {{- end }}
     {{- if .Values.api.config.audit }}
@@ -221,6 +292,16 @@ data:
       enabled: {{ .Values.api.config.drift_detection.enabled }}
       poll_interval_seconds: {{ .Values.api.config.drift_detection.poll_interval_seconds | default 300 }}
       min_workspace_interval_seconds: {{ .Values.api.config.drift_detection.min_workspace_interval_seconds | default 3600 }}
+    {{- end }}
+    {{- if .Values.api.config.slack }}
+    slack:
+      # Non-secret Slack settings only. The bot/app/signing tokens are secrets
+      # and are injected via secretKeyRef on the Deployment (see deployment-api.yaml),
+      # never rendered here.
+      enabled: {{ .Values.api.config.slack.enabled }}
+      socket_mode: {{ .Values.api.config.slack.socket_mode }}
+      command: {{ .Values.api.config.slack.command | default "/terrapod" | quote }}
+      label: {{ .Values.api.config.slack.label | default "" | quote }}
     {{- end }}
     {{- if .Values.api.config.notifications }}
     notifications:
@@ -260,6 +341,25 @@ data:
       provider_cache_retention_days: {{ .Values.api.config.artifact_retention.provider_cache_retention_days | default 30 }}
       binary_cache_retention_days: {{ .Values.api.config.artifact_retention.binary_cache_retention_days | default 30 }}
       module_overrides_retention_days: {{ .Values.api.config.artifact_retention.module_overrides_retention_days | default 14 }}
+    {{- end }}
+    {{- if .Values.backup }}
+    backup:
+      prefix: {{ .Values.backup.prefix | default "backups/" | quote }}
+      retention_keep: {{ (.Values.backup.retention).keep | default 0 }}
+      retention_days: {{ (.Values.backup.retention).days | default 0 }}
+    {{- end }}
+    {{- if .Values.api.config.encryption }}
+    # App-layer encryption at rest (#553) — non-secret config only; the static
+    # master key + Vault token arrive via secretKeyRef env, never here.
+    encryption:
+      enabled: {{ .Values.api.config.encryption.enabled | default false }}
+      provider: {{ .Values.api.config.encryption.provider | default "static" | quote }}
+      vault_address: {{ .Values.api.config.encryption.vault_address | default "" | quote }}
+      vault_mount: {{ .Values.api.config.encryption.vault_mount | default "transit" | quote }}
+      vault_key_name: {{ .Values.api.config.encryption.vault_key_name | default "terrapod" | quote }}
+      vault_namespace: {{ .Values.api.config.encryption.vault_namespace | default "" | quote }}
+      aws_kms_key_id: {{ .Values.api.config.encryption.aws_kms_key_id | default "" | quote }}
+      aws_kms_region: {{ .Values.api.config.encryption.aws_kms_region | default "" | quote }}
     {{- end }}
     {{- if .Values.api.config.ai_summary }}
     ai_summary:
@@ -303,11 +403,44 @@ data:
     {{- end }}
     default_execution_backend: {{ .Values.api.config.default_execution_backend | default "tofu" | quote }}
     default_terraform_version: {{ .Values.api.config.default_terraform_version | default "1.12" | quote }}
-    {{- if .Values.api.config.cors.allow_origins }}
+    {{- with .Values.api.config.cors }}
+    {{- /* Only emit `cors:` when at least one child renders — a bare `cors:`
+           serialises to null, which Settings (CORSConfig) rejects. The common
+           `cors: { allow_origins: [] }` default therefore renders nothing and
+           the API uses its CORSConfig default. */}}
+    {{- if or .allow_origins (hasKey . "allow_credentials") .allow_methods .allow_headers }}
     cors:
+      {{- with .allow_origins }}
       allow_origins:
-        {{- range .Values.api.config.cors.allow_origins }}
+        {{- range . }}
         - {{ . | quote }}
         {{- end }}
+      {{- end }}
+      {{- if hasKey . "allow_credentials" }}
+      allow_credentials: {{ .allow_credentials }}
+      {{- end }}
+      {{- with .allow_methods }}
+      allow_methods:
+        {{- range . }}
+        - {{ . | quote }}
+        {{- end }}
+      {{- end }}
+      {{- with .allow_headers }}
+      allow_headers:
+        {{- range . }}
+        - {{ . | quote }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- if .Values.api.config.rate_limit }}
+    rate_limit:
+      enabled: {{ .Values.api.config.rate_limit.enabled }}
+      {{- /* Rendered directly (no `| default`): 0 means "unlimited" for these
+             rates and Helm's `default` would silently rewrite a configured 0. */}}
+      requests_per_minute: {{ .Values.api.config.rate_limit.requests_per_minute }}
+      authenticated_requests_per_minute: {{ .Values.api.config.rate_limit.authenticated_requests_per_minute }}
+      runner_requests_per_minute: {{ .Values.api.config.rate_limit.runner_requests_per_minute }}
+      auth_requests_per_minute: {{ .Values.api.config.rate_limit.auth_requests_per_minute }}
     {{- end }}
 {{- end }}

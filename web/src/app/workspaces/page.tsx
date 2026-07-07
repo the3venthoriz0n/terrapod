@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import NavBar from '@/components/nav-bar'
 import { PageHeader } from '@/components/page-header'
+import { ConnectionStatus } from '@/components/connection-status'
 import { LoadingSpinner } from '@/components/loading-spinner'
 import { ErrorBanner } from '@/components/error-banner'
 import { EmptyState } from '@/components/empty-state'
@@ -16,6 +17,7 @@ import { useWorkspaceListEvents } from '@/lib/use-workspace-list-events'
 import {
   hasLabelTerm,
   hasStatusTerm,
+  HEALTH_ISSUE_STATUS,
   matchWorkspace,
   parseFilterQuery,
   removeTerm,
@@ -284,6 +286,10 @@ function WorkspacesPageInner() {
     if (!tok) return []
     const lower = tok.toLowerCase()
     const out: FilterSuggestion[] = []
+    // Aggregate health-issues count for the `status:unhealthy` suggestion.
+    const unhealthyCount = workspaces.filter(
+      ws => (ws.attributes['health-conditions'] || []).length > 0,
+    ).length
     const sepIdx = tok.search(/[:=]/)
     if (sepIdx >= 0) {
       // `key:partial` → suggest values for that key.
@@ -294,6 +300,8 @@ function WorkspacesPageInner() {
           if (!partial || s.filter.toLowerCase().includes(partial) || s.label.toLowerCase().includes(partial))
             out.push({ kind: 'status', insert: `status:${s.filter}`, display: `status:${s.filter}`, hint: 'status', dot: s.dot, count: statusCounts[s.filter] || 0 })
         }
+        if (unhealthyCount > 0 && (!partial || HEALTH_ISSUE_STATUS.includes(partial) || 'health issues'.includes(partial)))
+          out.push({ kind: 'status', insert: `status:${HEALTH_ISSUE_STATUS}`, display: `status:${HEALTH_ISSUE_STATUS}`, hint: 'health', dot: 'bg-red-400', count: unhealthyCount })
       } else {
         const values = labelIndex.get(key)
         if (values) {
@@ -319,6 +327,8 @@ function WorkspacesPageInner() {
         if (s.filter.toLowerCase().includes(lower) || s.label.toLowerCase().includes(lower))
           out.push({ kind: 'status', insert: `status:${s.filter}`, display: `status:${s.filter}`, hint: 'status', dot: s.dot, count: statusCounts[s.filter] || 0 })
       }
+      if (unhealthyCount > 0 && (HEALTH_ISSUE_STATUS.includes(lower) || 'health'.includes(lower) || 'issues'.includes(lower)))
+        out.push({ kind: 'status', insert: `status:${HEALTH_ISSUE_STATUS}`, display: `status:${HEALTH_ISSUE_STATUS}`, hint: 'health', dot: 'bg-red-400', count: unhealthyCount })
       for (const ws of workspaces) {
         const n = ws.attributes.name
         if (n.toLowerCase().includes(lower))
@@ -387,8 +397,11 @@ function WorkspacesPageInner() {
     loadWorkspaces()
   }, [router])
 
-  // Real-time workspace list updates via SSE
-  useWorkspaceListEvents(workspaces.length > 0, useCallback(() => {
+  // Real-time workspace list updates via SSE. Always-on (not gated on
+  // workspaces.length) so the FIRST workspace created from another tab / the
+  // CLI / a VCS push live-appears on an empty org instead of requiring a
+  // manual refresh — the empty state is exactly where live-update matters most.
+  const { connected: sseConnected } = useWorkspaceListEvents(true, useCallback(() => {
     loadWorkspaces()
   }, []))
 
@@ -501,12 +514,15 @@ function WorkspacesPageInner() {
           title="Workspaces"
           description="Manage Terraform workspaces, state, and runs"
           actions={
-            <button
-              onClick={() => setShowCreate(!showCreate)}
-              className="px-4 py-2 rounded-lg text-sm font-medium bg-brand-600 hover:bg-brand-500 text-white transition-colors btn-smoke"
-            >
-              {showCreate ? 'Cancel' : 'New Workspace'}
-            </button>
+            <div className="flex items-center gap-3">
+              <ConnectionStatus connected={sseConnected} />
+              <button
+                onClick={() => setShowCreate(!showCreate)}
+                className="px-4 py-2 rounded-lg text-sm font-medium bg-brand-600 hover:bg-brand-500 text-white transition-colors btn-smoke"
+              >
+                {showCreate ? 'Cancel' : 'New Workspace'}
+              </button>
+            </div>
           }
         />
 
@@ -695,16 +711,41 @@ function WorkspacesPageInner() {
           const total = workspaces.length
           const withConditions = workspaces.filter(ws => (ws.attributes['health-conditions'] || []).length > 0).length
           const locked = workspaces.filter(ws => ws.attributes.locked).length
+          const healthFilterActive = hasStatusTerm(parsedFilter, HEALTH_ISSUE_STATUS)
           return (
             <div className="grid grid-cols-3 gap-4 mb-6">
               <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 p-4">
                 <p className="text-xs text-slate-500 uppercase tracking-wider">Total</p>
                 <p className="text-2xl font-semibold text-slate-100 mt-1">{total}</p>
               </div>
-              <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 p-4">
-                <p className="text-xs text-slate-500 uppercase tracking-wider">Health Issues</p>
-                <p className={`text-2xl font-semibold mt-1 ${withConditions > 0 ? 'text-red-400' : 'text-slate-100'}`}>{withConditions}</p>
-              </div>
+              {/* Clicking a non-zero Health Issues count toggles the
+                  `status:unhealthy` filter so the operator can jump straight to
+                  the affected workspaces (and click again to clear). When the
+                  count is zero there's nothing to filter to, so it stays a
+                  plain card. */}
+              {withConditions > 0 ? (
+                <button
+                  type="button"
+                  aria-pressed={healthFilterActive}
+                  aria-label={healthFilterActive ? 'Clear health issues filter' : 'Filter to workspaces with health issues'}
+                  title={healthFilterActive ? 'Clear health issues filter' : 'Filter to workspaces with health issues'}
+                  onClick={() => setFilterInput(serializeFilter(toggleStatusTerm(parsedFilter, HEALTH_ISSUE_STATUS)))}
+                  className={
+                    'text-left rounded-lg border p-4 transition-colors focus:outline-none focus:ring-2 focus:ring-brand-500 ' +
+                    (healthFilterActive
+                      ? 'bg-red-500/10 border-red-500/50'
+                      : 'bg-slate-800/50 border-slate-700/50 hover:bg-slate-700/40 hover:border-slate-600')
+                  }
+                >
+                  <p className="text-xs text-slate-500 uppercase tracking-wider">Health Issues</p>
+                  <p className="text-2xl font-semibold mt-1 text-red-400">{withConditions}</p>
+                </button>
+              ) : (
+                <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 p-4">
+                  <p className="text-xs text-slate-500 uppercase tracking-wider">Health Issues</p>
+                  <p className="text-2xl font-semibold mt-1 text-slate-100">{withConditions}</p>
+                </div>
+              )}
               <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 p-4">
                 <p className="text-xs text-slate-500 uppercase tracking-wider">Locked</p>
                 <p className={`text-2xl font-semibold mt-1 ${locked > 0 ? 'text-amber-400' : 'text-slate-100'}`}>{locked}</p>
@@ -714,7 +755,13 @@ function WorkspacesPageInner() {
         })()}
 
         {!loading && workspaces.length > 0 && (() => {
-          const activeStatusCount = parsedFilter.terms.filter(t => t.kind === 'status').length
+          // The aggregate `unhealthy` term is driven by the Health Issues card
+          // + its filter chip, not the Status dropdown, so it doesn't count
+          // toward the dropdown's active badge (which would otherwise show a
+          // count with no matching checked row inside).
+          const activeStatusCount = parsedFilter.terms.filter(
+            t => t.kind === 'status' && t.value !== HEALTH_ISSUE_STATUS,
+          ).length
           return (
             <div className="mb-4">
               <div className="flex items-center gap-2">

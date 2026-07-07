@@ -1,0 +1,371 @@
+"""Encryption service singleton: DEK cache, canary, encrypt/decrypt.
+
+Lifecycle (in app lifespan, before init_ca which reads an encrypted column):
+  init_encryption(db) → if encryption is enabled (or any DEK rows already exist),
+  build the KEK provider, unwrap every DEK into an in-memory cache, and verify the
+  decryptability **canary**. A wrong/missing key fails loud here — we never serve
+  or write data we cannot read back.
+
+encrypt()/decrypt() are synchronous and local (AES-GCM on small secrets, with the
+cached DEK) — safe on the async hot path; only init/rotation touch the KEK.
+"""
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from terrapod.config import settings
+from terrapod.crypto import envelope
+from terrapod.crypto.providers import build_provider
+from terrapod.db.models import CryptoKey
+from terrapod.logging_config import get_logger
+
+logger = get_logger(__name__)
+
+# Known plaintext encrypted at key-creation; decrypted + compared on every boot.
+_CANARY = "terrapod-encryption-canary-v1"
+
+
+class EncryptionService:
+    """Holds the unwrapped DEK cache and performs the local crypto."""
+
+    def __init__(self) -> None:
+        self.enabled: bool = False
+        self._deks: dict[int, bytes] = {}
+        self._active_version: int | None = None
+        self._provider_id: str = ""
+        self._canary_ok: bool = True
+
+    def status(self) -> dict:
+        """Operator-facing health: are we currently able to decrypt everything?
+
+        ``decryptable`` is the headline durability signal — true when the canary
+        decrypts and the active DEK is loaded. Used by the admin status endpoint
+        and the encryption doctor.
+        """
+        decryptable = self._canary_ok and (not self.enabled or self._active_version is not None)
+        return {
+            "enabled": self.enabled,
+            "provider": self._provider_id,
+            "active_version": self._active_version,
+            "dek_versions": sorted(self._deks),
+            "canary_ok": self._canary_ok,
+            "decryptable": decryptable,
+        }
+
+    def encrypt(self, plaintext: str) -> str:
+        """Encrypt when enabled; otherwise return plaintext unchanged."""
+        if not self.enabled or self._active_version is None:
+            return plaintext
+        return envelope.encrypt(plaintext, self._deks[self._active_version], self._active_version)
+
+    def decrypt(self, stored: str) -> str:
+        """Decrypt a tpenc envelope; pass legacy plaintext through unchanged."""
+        if not envelope.is_encrypted(stored):
+            return stored
+        version = envelope.parse_version(stored)
+        dek = self._deks.get(version)
+        if dek is None:
+            # Fail loud — never hand a caller ciphertext as if it were plaintext.
+            raise RuntimeError(
+                f"cannot decrypt: no DEK for version {version} "
+                "(wrong/rotated-away key, or encryption disabled before a decrypt pass)"
+            )
+        return envelope.decrypt(stored, dek)
+
+    # ── State-file (binary blob) path (#635) ──────────────────────────────────
+    #
+    # State files often carry secrets (any resource attribute the provider stored
+    # in plaintext), so when encryption is on we encrypt the state blob at rest
+    # too. Same DEK cache + versioning as the column path; only the wire format
+    # differs (binary TPENC1 vs the base64 string envelope). These are CPU-bound
+    # on potentially multi-MB buffers, so callers MUST offload them with
+    # asyncio.to_thread (CLAUDE.md #13) — they are kept synchronous here so the
+    # crypto stays simple and testable.
+
+    @property
+    def state_encryption_active(self) -> bool:
+        """True when new state writes should be encrypted (enabled + active DEK)."""
+        return self.enabled and self._active_version is not None
+
+    def encrypt_state(self, data: bytes) -> bytes:
+        """Encrypt a state blob when enabled; otherwise return it unchanged."""
+        if not self.state_encryption_active:
+            return data
+        assert self._active_version is not None
+        return envelope.encrypt_blob(data, self._deks[self._active_version], self._active_version)
+
+    def decrypt_state(self, blob: bytes) -> bytes:
+        """Decrypt a TPENC1 state blob; pass legacy plaintext blobs through unchanged."""
+        if not envelope.is_encrypted_blob(blob):
+            return blob
+        version = envelope.parse_blob_version(blob)
+        dek = self._deks.get(version)
+        if dek is None:
+            # Fail loud — never hand back ciphertext as if it were plaintext state.
+            raise RuntimeError(
+                f"cannot decrypt state: no DEK for version {version} "
+                "(wrong/rotated-away key, or encryption disabled before a decrypt pass)"
+            )
+        return envelope.decrypt_blob(blob, dek)
+
+
+_service: EncryptionService | None = None
+
+
+def get_encryption() -> EncryptionService:
+    """Return the service, defaulting to a disabled passthrough if uninitialised.
+
+    Uninitialised happens in the migrations Job and in unit tests that never run
+    the app lifespan — there, encryption is simply off (passthrough).
+    """
+    global _service  # noqa: PLW0603
+    if _service is None:
+        _service = EncryptionService()
+    return _service
+
+
+async def init_encryption(db: AsyncSession) -> None:
+    """Build the provider, unwrap DEKs, run the canary. Fail closed on error."""
+    global _service  # noqa: PLW0603
+    svc = EncryptionService()
+
+    rows = (await db.execute(select(CryptoKey))).scalars().all()
+    if not settings.encryption.enabled and not rows:
+        # Off and never enabled — pure passthrough, no provider needed.
+        _service = svc
+        logger.info("Encryption at rest disabled")
+        return
+
+    # If the provider can't be built/used but encryption is DISABLED while DEK
+    # rows still exist (e.g. an operator turned encryption off AND removed the
+    # KEK before running the `decrypt` migration), do NOT boot a clean passthrough
+    # that then 500s on every encrypted read with no signal. Surface a degraded
+    # service whose status() reports decryptable:false so monitoring/the doctor
+    # catch it. When encryption is ENABLED we still fail closed (re-raise) — a
+    # wrong/missing key must crash, never serve.
+    try:
+        provider = build_provider()
+        await _load_keys_into(svc, provider, db, rows)
+    except Exception:
+        if settings.encryption.enabled:
+            raise
+        if rows:
+            svc.enabled = False
+            svc._canary_ok = False  # can't prove decryptability → not decryptable
+            _service = svc
+            logger.error(
+                "Encryption is disabled but DEK rows exist and the KEK is unusable — "
+                "existing ciphertext is UNREADABLE. Restore the key, or run "
+                "`encryption_migrate decrypt` while the key is available, before removing it.",
+            )
+            return
+        raise
+
+    _service = svc
+    logger.info(
+        "Encryption at rest initialised",
+        enabled=svc.enabled,
+        provider=svc._provider_id,
+        dek_versions=sorted(svc._deks),
+        active_version=svc._active_version,
+    )
+
+
+async def _load_keys_into(svc: "EncryptionService", provider, db: AsyncSession, rows: list) -> None:  # type: ignore[no-untyped-def]
+    """Mint-on-first-enable, unwrap every DEK into ``svc``, verify the canary.
+
+    Shared by init_encryption and refresh_keys. Raises on any provider failure so
+    the caller decides fail-closed vs degrade.
+    """
+    if not rows and settings.encryption.enabled:
+        # First enable: mint a DEK and wrap it. DEATH-BY-ENCRYPTION GUARD — before
+        # we persist the key or let a single byte of data get encrypted, PROVE the
+        # provider can both wrap AND unwrap: wrap, then unwrap and assert we get
+        # the exact DEK back. If the provider is misconfigured (wrong KMS key,
+        # no decrypt permission, unreachable Vault) this raises here and nothing
+        # is ever written encrypted — so you can never reach a state where data
+        # is encrypted under a key you cannot use.
+        dek = envelope.new_dek()
+        wrapped = await provider.wrap(dek)
+        if await provider.unwrap(wrapped) != dek:
+            raise RuntimeError(
+                "encryption enable aborted: KEK provider wrap→unwrap round-trip failed "
+                f"(provider={provider.id}). Refusing to encrypt data the provider cannot decrypt."
+            )
+        canary = envelope.encrypt(_CANARY, dek, 1)
+        row = CryptoKey(
+            version=1, wrapped_dek=wrapped, provider=provider.id, canary=canary, active=True
+        )
+        db.add(row)
+        await db.commit()
+        rows = [row]
+        logger.info("Encryption at rest enabled — minted DEK v1", provider=provider.id)
+
+    svc._provider_id = provider.id
+
+    # Unwrap all DEK versions into the cache (older versions needed for reads).
+    for row in rows:
+        svc._deks[row.version] = await provider.unwrap(row.wrapped_dek)
+        if row.active:
+            svc._active_version = row.version
+    if svc._active_version is None and rows:
+        svc._active_version = max(r.version for r in rows)
+
+    svc.enabled = settings.encryption.enabled
+
+    # Decryptability canary on the active key — fail closed on mismatch. An ACTIVE
+    # row with no canary cannot prove decryptability, so don't claim it (a normal
+    # mint/rotate always writes a canary, so this only guards hand-edited rows).
+    active = next((r for r in rows if r.version == svc._active_version), None)
+    if active is not None and active.canary:
+        if svc.decrypt(active.canary) != _CANARY:
+            raise RuntimeError("encryption canary mismatch — refusing to start (wrong key?)")
+        svc._canary_ok = True
+    elif rows:
+        svc._canary_ok = False
+
+
+async def rotate_dek(db: AsyncSession) -> int:
+    """Mint a new active DEK; retain all prior versions for decryption.
+
+    Verify-before-activate: the new DEK is wrapped and immediately unwrapped back
+    (round-trip equality) BEFORE it is persisted/activated — a broken provider
+    aborts with nothing changed. Prior DEK versions are NEVER dropped, so every
+    existing ciphertext stays decryptable; re-encrypting old rows under the new
+    DEK is the separate, idempotent migration pass. Returns the new version.
+    """
+    svc = get_encryption()
+    if not svc.enabled or svc._active_version is None:
+        raise RuntimeError("cannot rotate DEK: encryption is not enabled")
+
+    provider = build_provider()
+    rows = (await db.execute(select(CryptoKey))).scalars().all()
+    new_version = max((r.version for r in rows), default=0) + 1
+
+    dek = envelope.new_dek()
+    wrapped = await provider.wrap(dek)
+    if await provider.unwrap(wrapped) != dek:
+        raise RuntimeError(
+            "DEK rotation aborted: provider wrap→unwrap round-trip failed — nothing changed"
+        )
+    canary = envelope.encrypt(_CANARY, dek, new_version)
+
+    for r in rows:
+        r.active = False
+    db.add(
+        CryptoKey(
+            version=new_version,
+            wrapped_dek=wrapped,
+            provider=provider.id,
+            canary=canary,
+            active=True,
+        )
+    )
+    await db.commit()
+
+    # Update the live cache: keep old DEKs for reads, switch active to the new one.
+    svc._deks[new_version] = dek
+    svc._active_version = new_version
+    logger.info("Rotated DEK", new_version=new_version, retained=sorted(svc._deks))
+    return new_version
+
+
+async def refresh_keys(db: AsyncSession) -> None:
+    """Periodic multi-replica DEK propagation (no leader election).
+
+    rotate_dek only updates the in-memory cache of the replica that served the
+    request; every OTHER replica would 500 when it reads data written under the
+    new DEK until it learned the new key. This task — run on every replica via the
+    distributed scheduler — re-reads ``crypto_keys`` and tops up the local cache so
+    a DEK minted anywhere becomes usable everywhere within the refresh interval,
+    with no restart. Prior versions are never dropped.
+
+    Best-effort and non-destructive: on a transient provider/DB error we keep the
+    existing working cache (never tear down a usable cache because a refresh
+    blipped). No-ops cheaply when there's nothing new (so steady state makes no KEK
+    calls).
+    """
+    global _service  # noqa: PLW0603
+    if not settings.encryption.enabled:
+        return
+    rows = (await db.execute(select(CryptoKey))).scalars().all()
+    if not rows:
+        return
+
+    current = get_encryption()
+    active_ver = next((r.version for r in rows if r.active), None)
+    have = set(current._deks)
+    # Fast path: every persisted version is cached and the active version matches.
+    if have.issuperset(r.version for r in rows) and (
+        active_ver is None or current._active_version == active_ver
+    ):
+        return
+
+    svc = EncryptionService()
+    try:
+        provider = build_provider()
+        await _load_keys_into(svc, provider, db, list(rows))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("encryption key refresh failed; keeping existing cache", error=str(exc))
+        return
+
+    _service = svc
+    logger.info(
+        "encryption keys refreshed (new DEK picked up)",
+        dek_versions=sorted(svc._deks),
+        active_version=svc._active_version,
+    )
+
+
+async def verify_live(db: AsyncSession) -> dict:
+    """Independently prove every stored DEK is decryptable RIGHT NOW.
+
+    Unlike the cached boot state, this re-builds the provider and re-unwraps every
+    ``crypto_keys`` row live (catching e.g. a KMS permission revoked or a Vault key
+    deleted after startup), then verifies each row's canary. Returns a result dict
+    with ``ok``; the encryption doctor exits non-zero when ``ok`` is False. This is
+    the "can I still decrypt everything?" drill.
+    """
+    rows = (await db.execute(select(CryptoKey))).scalars().all()
+    if not rows:
+        return {
+            "ok": True,
+            "enabled": settings.encryption.enabled,
+            "checked_versions": [],
+            "failures": [],
+            "note": "no DEKs (encryption never enabled)",
+        }
+
+    provider = build_provider()
+    failures: list[str] = []
+    checked: list[int] = []
+    for row in rows:
+        try:
+            dek = await provider.unwrap(row.wrapped_dek)
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"v{row.version}: unwrap failed: {exc}")
+            continue
+        # The canary decrypt itself can raise (e.g. AES-GCM InvalidTag when the
+        # unwrapped key is wrong) — catch it so the doctor reports a clean
+        # failure instead of crashing.
+        try:
+            if row.canary and envelope.decrypt(row.canary, dek) != _CANARY:
+                failures.append(f"v{row.version}: canary did not decrypt to the expected value")
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"v{row.version}: canary decrypt failed: {exc}")
+            continue
+        checked.append(row.version)
+
+    return {
+        "ok": not failures,
+        "enabled": settings.encryption.enabled,
+        "provider": provider.id,
+        "checked_versions": sorted(checked),
+        "failures": failures,
+    }
+
+
+def reset_encryption_for_tests() -> None:
+    """Test helper — drop the singleton so the next get_encryption() is fresh."""
+    global _service  # noqa: PLW0603
+    _service = None

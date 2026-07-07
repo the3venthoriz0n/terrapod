@@ -22,6 +22,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from terrapod.api.dependencies import AuthenticatedUser, require_admin, require_admin_or_audit
 from terrapod.auth.builtin_roles import BUILTIN_ROLES, is_builtin_role
+from terrapod.auth.capabilities import (
+    AXIS_LEVEL_MAPS,
+    GRANTABLE_CAPABILITIES,
+    axis_all_caps,
+    capabilities_for_builtin,
+    expand_preset,
+    normalize_capabilities,
+    summarize_capabilities,
+)
 from terrapod.db.models import Role
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
@@ -32,6 +41,9 @@ logger = get_logger(__name__)
 VALID_PERMISSIONS = {"read", "plan", "write", "admin"}
 VALID_POOL_PERMISSIONS = {"read", "write", "admin"}
 VALID_REGISTRY_PERMISSIONS = {"read", "write", "admin"}
+# Catalog access is an opt-in extension: "none" (default) grants nothing, so it
+# is a valid value here (unlike the other axes, which floor at "read").
+VALID_CATALOG_PERMISSIONS = {"none", "read", "use", "admin"}
 
 
 def _rfc3339(dt) -> str:
@@ -40,7 +52,66 @@ def _rfc3339(dt) -> str:
     return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# axis JSON:API key → (short axis name, valid level values)
+_LEVEL_INPUT: dict[str, tuple[str, set[str]]] = {
+    "workspace-permission": ("workspace", VALID_PERMISSIONS),
+    "pool-permission": ("pool", VALID_POOL_PERMISSIONS),
+    "registry-permission": ("registry", VALID_REGISTRY_PERMISSIONS),
+    "catalog-permission": ("catalog", VALID_CATALOG_PERMISSIONS),
+}
+
+
+def _validate_capabilities(caps_in) -> list[str]:
+    """Normalise (alias-upgrade) then reject any token that is not a grantable
+    capability — platform:* and typos are refused here (422)."""
+    if not isinstance(caps_in, list) or not all(isinstance(c, str) for c in caps_in):
+        raise HTTPException(status_code=422, detail="capabilities must be a list of strings")
+    normalized = normalize_capabilities(caps_in)
+    unknown = sorted(set(normalized) - GRANTABLE_CAPABILITIES)
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown or non-grantable capabilities: {unknown}",
+        )
+    return normalized
+
+
+def _level(attrs: dict, key: str, default: str, valid: set[str]) -> str:
+    v = attrs.get(key, default)
+    if v not in valid:
+        raise HTTPException(status_code=422, detail=f"Invalid {key}: {v}")
+    return v
+
+
+def _caps_from_level_input(attrs: dict) -> list[str]:
+    """Expand a create request's level shorthand into a capability set. Absent
+    axes use their default (read/read/read/none)."""
+    return expand_preset(
+        workspace_permission=_level(attrs, "workspace-permission", "read", VALID_PERMISSIONS),
+        pool_permission=_level(attrs, "pool-permission", "read", VALID_POOL_PERMISSIONS),
+        registry_permission=_level(
+            attrs, "registry-permission", "read", VALID_REGISTRY_PERMISSIONS
+        ),
+        catalog_permission=_level(attrs, "catalog-permission", "none", VALID_CATALOG_PERMISSIONS),
+    )
+
+
+def _apply_level_edits(role: Role, attrs: dict) -> None:
+    """A partial level edit replaces ONLY the edited axis's capabilities in the
+    stored set, preserving any granular capabilities on the other axes."""
+    caps = set(role.capabilities)
+    for key, (axis, valid) in _LEVEL_INPUT.items():
+        if key in attrs:
+            level = _level(attrs, key, "", valid)
+            caps -= axis_all_caps(axis)
+            caps |= AXIS_LEVEL_MAPS[axis].get(level, frozenset())
+    role.capabilities = sorted(caps)
+
+
 def _role_json(role: Role) -> dict:
+    # Levels are NOT stored — derive them as a display summary from the persisted
+    # capability set (a preset name per axis, or "custom").
+    summary = summarize_capabilities(role.capabilities)
     return {
         "name": role.name,
         "type": "roles",
@@ -50,9 +121,13 @@ def _role_json(role: Role) -> dict:
             "allow-names": role.allow_names,
             "deny-labels": role.deny_labels,
             "deny-names": role.deny_names,
-            "workspace-permission": role.workspace_permission,
-            "pool-permission": role.pool_permission,
-            "registry-permission": role.registry_permission,
+            # Derived, read-only summary of the capabilities (not persisted).
+            "workspace-permission": summary["workspace_permission"],
+            "pool-permission": summary["pool_permission"],
+            "registry-permission": summary["registry_permission"],
+            "catalog-permission": summary["catalog_permission"],
+            # The role's grant + the single source of truth for enforcement (#585).
+            "capabilities": list(role.capabilities),
             "built-in": False,
             "created-at": _rfc3339(role.created_at),
             "updated-at": _rfc3339(role.updated_at),
@@ -73,6 +148,12 @@ def _builtin_role_json(name: str, info: dict) -> dict:
             "workspace-permission": "admin" if name == "admin" else "read",
             "pool-permission": "admin" if name == "admin" else "read",
             "registry-permission": "admin" if name == "admin" else "read",
+            # Catalog is opt-in with no `everyone` floor: admin → admin,
+            # audit → read, everyone → none (grants nothing).
+            "catalog-permission": (
+                "admin" if name == "admin" else "read" if name == "audit" else "none"
+            ),
+            "capabilities": capabilities_for_builtin(name),
             "built-in": True,
             "created-at": "",
             "updated-at": "",
@@ -119,18 +200,15 @@ async def create_role(
     if existing.scalar_one_or_none() is not None:
         raise HTTPException(status_code=422, detail=f"Role '{name}' already exists")
 
-    ws_perm = attrs.get("workspace-permission", "read")
-    if ws_perm not in VALID_PERMISSIONS:
-        raise HTTPException(status_code=422, detail=f"Invalid workspace-permission: {ws_perm}")
-
-    pool_perm = attrs.get("pool-permission", "read")
-    if pool_perm not in VALID_POOL_PERMISSIONS:
-        raise HTTPException(status_code=422, detail=f"Invalid pool-permission: {pool_perm}")
-
-    registry_perm = attrs.get("registry-permission", "read")
-    if registry_perm not in VALID_REGISTRY_PERMISSIONS:
-        raise HTTPException(status_code=422, detail=f"Invalid registry-permission: {registry_perm}")
-
+    # The role's grant is the persisted capability set — the single source of
+    # truth (#585). An explicit `capabilities` set is stored verbatim; otherwise
+    # the level shorthand (validated here) is expanded into it. Levels are never
+    # stored.
+    capabilities = (
+        _validate_capabilities(attrs["capabilities"])
+        if "capabilities" in attrs
+        else _caps_from_level_input(attrs)
+    )
     role = Role(
         name=name,
         description=attrs.get("description", ""),
@@ -138,9 +216,7 @@ async def create_role(
         allow_names=attrs.get("allow-names", []),
         deny_labels=attrs.get("deny-labels", {}),
         deny_names=attrs.get("deny-names", []),
-        workspace_permission=ws_perm,
-        pool_permission=pool_perm,
-        registry_permission=registry_perm,
+        capabilities=capabilities,
     )
     db.add(role)
     await db.commit()
@@ -197,23 +273,15 @@ async def update_role(
         role.deny_labels = attrs["deny-labels"]
     if "deny-names" in attrs:
         role.deny_names = attrs["deny-names"]
-    if "workspace-permission" in attrs:
-        ws_perm = attrs["workspace-permission"]
-        if ws_perm not in VALID_PERMISSIONS:
-            raise HTTPException(status_code=422, detail=f"Invalid workspace-permission: {ws_perm}")
-        role.workspace_permission = ws_perm
-    if "pool-permission" in attrs:
-        pool_perm = attrs["pool-permission"]
-        if pool_perm not in VALID_POOL_PERMISSIONS:
-            raise HTTPException(status_code=422, detail=f"Invalid pool-permission: {pool_perm}")
-        role.pool_permission = pool_perm
-    if "registry-permission" in attrs:
-        registry_perm = attrs["registry-permission"]
-        if registry_perm not in VALID_REGISTRY_PERMISSIONS:
-            raise HTTPException(
-                status_code=422, detail=f"Invalid registry-permission: {registry_perm}"
-            )
-        role.registry_permission = registry_perm
+
+    # The role's grant is the persisted capabilities. An explicit `capabilities`
+    # set replaces it wholesale; otherwise a level edit replaces only the edited
+    # axis's capabilities (preserving granular caps on the other axes). Levels are
+    # never stored. Capability-authoring wins over any level fields sent alongside.
+    if "capabilities" in attrs:
+        role.capabilities = _validate_capabilities(attrs["capabilities"])
+    elif _LEVEL_INPUT.keys() & attrs.keys():
+        _apply_level_edits(role, attrs)
 
     await db.commit()
     await db.refresh(role)

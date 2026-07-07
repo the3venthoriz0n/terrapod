@@ -1,11 +1,12 @@
 'use client'
 
-import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
+import { Suspense, useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import { useRouter, useParams, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import Convert from 'ansi-to-html'
 import NavBar from '@/components/nav-bar'
 import { PageHeader } from '@/components/page-header'
+import { ConnectionStatus } from '@/components/connection-status'
 import { LoadingSpinner } from '@/components/loading-spinner'
 import { ErrorBanner } from '@/components/error-banner'
 import { PlanSummaryBadges } from '@/components/plan-summary-badges'
@@ -27,6 +28,7 @@ interface RunAttrs {
   status: string
   source: string
   message: string
+  'discard-reason': string | null
   'error-message': string | null
   'execution-backend': string
   'created-at': string
@@ -308,7 +310,18 @@ function LogPanel({
   )
 }
 
+// useSearchParams() requires a Suspense boundary or `next build` fails to
+// statically analyse the route (Next 16). Matches the convention used by every
+// other useSearchParams page (login, workspaces, labels, …).
 export default function RunDetailPage() {
+  return (
+    <Suspense fallback={null}>
+      <RunDetailPageInner />
+    </Suspense>
+  )
+}
+
+function RunDetailPageInner() {
   const router = useRouter()
   const params = useParams()
   const workspaceId = params.id as string
@@ -372,7 +385,7 @@ export default function RunDetailPage() {
   }, [router, loadRun])
 
   // Real-time updates via SSE — reload run on status change, refresh logs on log_updated
-  useRunEvents(workspaceId, useCallback((event) => {
+  const { connected: sseConnected } = useRunEvents(workspaceId, useCallback((event) => {
     const bareId = runId.replace(/^run-/, '')
     if (event.event === 'reconnect' || (event.event === 'run_status_change' && event.run_id === bareId)) {
       loadRun()
@@ -580,6 +593,7 @@ export default function RunDetailPage() {
           description={attrs.message || `${attrs.source} run`}
           actions={
             <div className="flex items-center gap-2">
+              <ConnectionStatus connected={sseConnected} />
               {attrs['is-destroy'] && (
                 <span className="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-red-900/50 text-red-300">
                   destroy
@@ -636,6 +650,14 @@ export default function RunDetailPage() {
           <div className="mb-6 p-4 bg-red-900/20 rounded-lg border border-red-800/50">
             <h3 className="text-sm font-medium text-red-400 mb-1">Error</h3>
             <pre className="text-sm text-red-300 whitespace-pre-wrap font-mono">{attrs['error-message']}</pre>
+          </div>
+        )}
+
+        {/* Discard reason (#646/#647): why a discarded plan can no longer apply. */}
+        {attrs.status === 'discarded' && attrs['discard-reason'] && (
+          <div className="mb-6 p-4 bg-amber-900/20 rounded-lg border border-amber-800/50">
+            <h3 className="text-sm font-medium text-amber-400 mb-1">Discarded — re-plan required</h3>
+            <p className="text-sm text-amber-200">{attrs['discard-reason']}</p>
           </div>
         )}
 

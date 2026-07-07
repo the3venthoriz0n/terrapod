@@ -46,6 +46,7 @@ import asyncio
 import datetime as dt
 import io
 import json
+import os
 import pathlib
 import subprocess
 import tarfile
@@ -73,6 +74,26 @@ from terrapod.storage.keys import (
 
 logger = get_logger(__name__)
 
+# ── LiteLLM noise + resilience ────────────────────────────────────────────────
+#
+# LiteLLM is chatty by default (an INFO "LiteLLM completion() model=…" line on
+# every call) and emits provider-debug banners on errors — pure noise in our
+# logs since we wrap every call with our own structured logging. Quiet it.
+import logging as _logging  # noqa: E402
+
+litellm.suppress_debug_info = True
+_logging.getLogger("LiteLLM").setLevel(_logging.WARNING)
+
+# Bounded retry for the model call. Bedrock (and any provider) occasionally
+# fails a connection instantly under concurrency — LiteLLM surfaces these as
+# `litellm.Timeout` with ~0s elapsed even though the model isn't slow. Almost
+# all calls succeed, so a couple of backed-off retries make the intermittent
+# blips self-heal instead of failing the (best-effort) summary and spamming the
+# log. LiteLLM retries its own transient classes (Timeout / APIConnectionError /
+# RateLimitError / InternalServerError / ServiceUnavailable); a 4xx is final and
+# not retried. Matches the "outbound calls use bounded retry" invariant.
+_LLM_NUM_RETRIES = 2  # → up to 3 attempts
+
 
 # --- Input retrieval ---------------------------------------------------------
 
@@ -91,18 +112,148 @@ def _truncate_tail(data: bytes, max_bytes: int) -> str:
     )
 
 
-def _truncate_head(data: bytes, max_bytes: int) -> str:
-    """Return ``data`` decoded as UTF-8, truncated from the tail.
+# Top-level plan keys that carry no information the risk rating needs; dropped
+# first when a plan is over budget (configuration is large and is background
+# only — the grounding rule forbids rating from it anyway).
+_PLAN_BACKGROUND_KEYS = ("configuration", "planned_values", "prior_state", "relevant_attributes")
+_PLAN_CHANGE_ARRAYS = ("resource_changes", "resource_drift", "drift_observed_no_apply_action")
 
-    Plan JSON's structural value is at the head — provider config and
-    resource_changes come first.
+
+def _change_skeleton(rc: dict) -> dict:
+    """address + type + name + change.actions only — the bare risk signal that
+    preserves a change's existence and action when its full body won't fit."""
+    ch = rc.get("change") if isinstance(rc.get("change"), dict) else {}
+    return {
+        "address": rc.get("address"),
+        "type": rc.get("type"),
+        "name": rc.get("name"),
+        "change": {"actions": ch.get("actions")},
+    }
+
+
+def _fit_plan_json(data: bytes, max_bytes: int) -> str:
+    """Fit cleaned plan JSON within ``max_bytes`` by LOGICAL priority, never
+    hiding a destroy.
+
+    The old code head-truncated the bytes, silently dropping the tail of
+    ``resource_changes`` — so a destroy near the end of a large plan was
+    invisible and the model summarised a plan it only half-read. Instead we keep
+    the most consequential changes in FULL and sample the routine ones, in this
+    order:
+
+        1. every destroy (delete / replace) — full detail (which resource, what
+           data) is exactly what matters most;
+        2. every create — full;
+        3. every update — full;
+        4. a bounded sample of anything else (reads / observed drift).
+
+    Each tier is added in full while budget remains; once full entries no longer
+    fit, the remaining entries are kept as address+actions skeletons so their
+    existence is never lost; only when even skeletons don't fit are the
+    lowest-priority changes summarised as a count in ``_omitted_changes``.
+    Destroys are processed first, so they are the last thing ever reduced — a
+    destroy is effectively never hidden.
     """
     if max_bytes <= 0 or len(data) <= max_bytes:
         return data.decode("utf-8", errors="replace")
-    return (
-        data[:max_bytes].decode("utf-8", errors="replace")
-        + f"\n[... {len(data) - max_bytes} bytes truncated from tail ...]"
-    )
+    try:
+        plan = json.loads(data)
+    except (json.JSONDecodeError, ValueError):
+        return data[:max_bytes].decode("utf-8", errors="replace") + "\n[... truncated ...]"
+    if not isinstance(plan, dict):
+        return data[:max_bytes].decode("utf-8", errors="replace") + "\n[... truncated ...]"
+
+    def _size(obj: object) -> int:
+        return len(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+
+    # 1) drop background blocks the risk rating never needs.
+    for k in _PLAN_BACKGROUND_KEYS:
+        plan.pop(k, None)
+    # 2) drop the verbose computed-attribute map (not a sensitive marker).
+    for ck in _PLAN_CHANGE_ARRAYS:
+        for rc in plan.get(ck) or []:
+            ch = rc.get("change") if isinstance(rc, dict) else None
+            if isinstance(ch, dict):
+                ch.pop("after_unknown", None)
+    if _size(plan) <= max_bytes:
+        return json.dumps(plan, separators=(",", ":"))
+
+    # 3) priority reduction of resource_changes (the large array; drift arrays
+    # are small and kept intact).
+    rcs = [r for r in (plan.get("resource_changes") or []) if isinstance(r, dict)]
+
+    def _acts(rc: dict) -> list:
+        return (rc.get("change") or {}).get("actions") or []
+
+    destroys = [r for r in rcs if "delete" in _acts(r)]
+    creates = [r for r in rcs if _acts(r) == ["create"]]
+    updates = [r for r in rcs if "update" in _acts(r) and "delete" not in _acts(r)]
+    seen = {id(r) for r in destroys + creates + updates}
+    other = [r for r in rcs if id(r) not in seen]
+    real = destroys + creates + updates  # every real change, in priority order
+
+    reserve = 400  # headroom for the _note / _omitted_changes appended below
+    omitted: dict[str, int] = {}
+
+    # Pass A: list EVERY real change as a skeleton first, so its existence and
+    # action are guaranteed present (a destroy is never hidden).
+    skeletons = [_change_skeleton(r) for r in real]
+    plan["resource_changes"] = skeletons
+    base = _size(plan)
+
+    if base + reserve <= max_bytes:
+        used = base
+        # Pass B: upgrade skeletons to FULL detail in priority order (destroys,
+        # then creates, then updates) while budget remains. The most
+        # consequential changes get full attributes; routine ones may stay
+        # skeletons.
+        for i, rc in enumerate(real):
+            delta = _size(rc) - _size(skeletons[i])
+            if delta > 0 and used + delta <= max_bytes - reserve:
+                plan["resource_changes"][i] = rc
+                used += delta
+        # Pass C: a bounded sample of the lowest-priority changes (reads /
+        # observed drift); count the rest.
+        sample_budget = 25
+        for rc in other:
+            sk = _change_skeleton(rc)
+            sz = _size(sk) + 1
+            if sample_budget > 0 and used + sz + reserve <= max_bytes:
+                plan["resource_changes"].append(sk)
+                used += sz
+                sample_budget -= 1
+            else:
+                key = ",".join(_acts(rc)) or "other"
+                omitted[key] = omitted.get(key, 0) + 1
+    else:
+        # Pathological: even bare skeletons of the real changes overflow. Keep
+        # them in priority order (destroys first) until the budget is spent and
+        # count the rest — so any dropped destroy is at least counted, never
+        # silently lost.
+        plan["resource_changes"] = []
+        used = _size(plan)
+        for rc in real:
+            sk = _change_skeleton(rc)
+            sz = _size(sk) + 1
+            if used + sz + reserve <= max_bytes:
+                plan["resource_changes"].append(sk)
+                used += sz
+            else:
+                key = ",".join(_acts(rc)) or "other"
+                omitted[key] = omitted.get(key, 0) + 1
+        for rc in other:
+            key = ",".join(_acts(rc)) or "other"
+            omitted[key] = omitted.get(key, 0) + 1
+
+    if omitted:
+        plan["_omitted_changes"] = omitted
+        plan["_note"] = (
+            "plan too large to show in full; changes are shown in priority "
+            "order (all destroys, then creates, then updates, then a sample of "
+            "the rest), each in full where it fits else as address+actions. "
+            "Counts of any not shown are in _omitted_changes."
+        )
+    return json.dumps(plan, separators=(",", ":"))
 
 
 def _extract_tf_sources(tarball: bytes, max_bytes: int) -> str:
@@ -315,7 +466,14 @@ def _build_code_diff(prev_tarball: bytes | None, cur_tarball: bytes, max_bytes: 
     if max_bytes <= 0 or prev_tarball is None:
         return ""
 
-    with tempfile.TemporaryDirectory(prefix="tp-aisum-diff-") as tmp:
+    # Land the extraction on the CSP-attached PVC when configured (matches
+    # cv_diff_service / vcs_archive_cache / provider_cache_service). Only .tf
+    # /.tfvars text is extracted here, so the small-file exemption applies and
+    # /tmp is acceptable too — but the PVC keeps an unexpectedly large .tf off
+    # the RAM-backed tmpfs.
+    configured = settings.vcs.tmpdir
+    diff_dir = configured if configured and os.path.isdir(configured) else None
+    with tempfile.TemporaryDirectory(prefix="tp-aisum-diff-", dir=diff_dir) as tmp:
         tmp_root = pathlib.Path(tmp)
         prev_dir = tmp_root / "previous"
         cur_dir = tmp_root / "current"
@@ -424,7 +582,7 @@ async def _gather_inputs(db: AsyncSession, run: Run, kind: str) -> tuple[str, st
         # Clean BEFORE truncation so the head-truncate budget is spent
         # on actual changes, not no-op snapshot noise.
         cleaned = await asyncio.to_thread(_clean_plan_json_bytes, raw)
-        primary = _truncate_head(cleaned, cfg.plan_json_max_bytes)
+        primary = await asyncio.to_thread(_fit_plan_json, cleaned, cfg.plan_json_max_bytes)
     else:
         # failure_analysis. Choose log key by phase: apply-phase errors
         # carry their detail in the apply log (#419). Plan-phase errors
@@ -692,6 +850,10 @@ def _build_litellm_kwargs(
         "max_tokens": max_output_tokens,
         "messages": messages,
         "timeout": cfg.request_timeout_seconds,
+        # Self-heal transient instant-failures (see _LLM_NUM_RETRIES). LiteLLM
+        # backs off between attempts and only retries its transient classes.
+        "num_retries": _LLM_NUM_RETRIES,
+        "retry_strategy": "exponential_backoff_retry",
     }
 
     if use_tools:
@@ -990,13 +1152,51 @@ async def _upsert_summary(
     await db.execute(stmt)
 
 
+def _slack_trigger_for(run, kind: str) -> str | None:
+    """Which deferred Slack event this run's *settled* AI summary should fire
+    (#556). Only the fresh-AI, always-posted events — needs_attention and
+    errored. Drift / auto-apply / plan-only return None (drift posts from its
+    own handler with a no-changes gate; the rest aren't approval events)."""
+    if kind == "failure_analysis":
+        return "run:errored"
+    if getattr(run, "is_drift_detection", False):
+        return None
+    if run.status == "planned" and not run.auto_apply and not run.plan_only:
+        return "run:needs_attention"
+    return None
+
+
 async def handle_ai_plan_summary(payload: dict) -> None:
-    """Triggered handler: summarise (or analyse the failure of) one plan.
+    """Triggered handler: summarise a plan, then fire any deferred Slack post.
 
     Payload: ``{"run_id": "<uuid>", "kind": "plan_summary" | "failure_analysis"}``.
     Enqueued from ``run_service.transition_run`` on plan-phase terminal
     transitions when the feature is globally enabled.
+
+    The deferred Slack post (#556) is fired in a ``finally`` so a slow or failed
+    model never blocks the approval message: as soon as the summary settles
+    (ready OR errored), the deferred needs_attention/errored message posts with
+    the review included.
     """
+    holder: dict = {}
+    try:
+        await _summarise_one(payload, holder)
+    finally:
+        run_stub = holder.get("run")
+        trigger = holder.get("trigger")
+        if run_stub is not None and trigger:
+            try:
+                from terrapod.services.slack_notify_service import enqueue_slack_notify
+
+                await enqueue_slack_notify(run_stub, trigger, _from_summariser=True)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("slack notify after summary failed", error=str(e))
+
+
+async def _summarise_one(payload: dict, _slack: dict) -> None:
+    """The summarisation body. Populates ``_slack`` with the deferred Slack
+    target (a run stub + trigger) as soon as the run is loaded, so the wrapper's
+    ``finally`` can post even if summarisation raises."""
     cfg = settings.ai_summary
     if not cfg.enabled:
         return
@@ -1022,6 +1222,14 @@ async def handle_ai_plan_summary(payload: dict) -> None:
         ).scalar_one_or_none()
         if ws is None:
             return
+
+        # Capture the deferred Slack target now, while the run is loaded and
+        # fresh, so the wrapper's `finally` can post regardless of how
+        # summarisation ends (#556).
+        from types import SimpleNamespace
+
+        _slack["run"] = SimpleNamespace(id=str(run.id), workspace_id=str(run.workspace_id))
+        _slack["trigger"] = _slack_trigger_for(run, kind)
 
         # Upsert a `pending` row + emit `plan_summary_pending` so the UI
         # shows a placeholder from the moment the handler starts (#463

@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # pin and verify the same OPA_VERSION + SHA256 so a bump in one without
 # the other can't silently land an unverified binary in either image.
 ARG TARGETARCH
-ARG OPA_VERSION=1.17.0
+ARG OPA_VERSION=1.18.0
 RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
     && BASE="https://github.com/open-policy-agent/opa/releases/download/v${OPA_VERSION}" \
     && curl -fsSL --retry 6 --retry-delay 4 --retry-all-errors -o /usr/local/bin/opa "${BASE}/opa_linux_${ARCH}_static" \
@@ -29,6 +29,22 @@ RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
     && rm /tmp/opa.sha256 \
     && chmod 0755 /usr/local/bin/opa \
     && /usr/local/bin/opa version
+
+# OpenTofu — so the runner tfvars tests (terrapod.runner.phases.tfvars) parse
+# the generated terrapod.auto.tfvars with a REAL engine in CI rather than
+# skipping. tofu is MPL-licensed (clean to embed); terraform (BSL) is only run
+# locally. The test parametrizes over whichever engines are present.
+ARG OPENTOFU_VERSION=1.12.2
+RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
+    && BASE="https://github.com/opentofu/opentofu/releases/download/v${OPENTOFU_VERSION}" \
+    && curl -fsSL --retry 6 --retry-delay 4 --retry-all-errors -o /tmp/tofu.tar.gz "${BASE}/tofu_${OPENTOFU_VERSION}_linux_${ARCH}.tar.gz" \
+    && curl -fsSL --retry 6 --retry-delay 4 --retry-all-errors -o /tmp/tofu.sums "${BASE}/tofu_${OPENTOFU_VERSION}_SHA256SUMS" \
+    && EXPECTED="$(grep "  tofu_${OPENTOFU_VERSION}_linux_${ARCH}.tar.gz$" /tmp/tofu.sums | cut -d' ' -f1)" \
+    && echo "${EXPECTED}  /tmp/tofu.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/tofu.tar.gz -C /usr/local/bin tofu \
+    && rm /tmp/tofu.tar.gz /tmp/tofu.sums \
+    && chmod 0755 /usr/local/bin/tofu \
+    && /usr/local/bin/tofu version
 
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir poetry==1.8.4
@@ -43,6 +59,9 @@ RUN poetry config virtualenvs.create false \
 # Copy application and test code
 COPY services/terrapod ./terrapod
 COPY services/tests ./tests
+# AI-analysis evaluation harness (#602) — committed eval suite. Imported by
+# the offline corpus/rubric tests and run live (model sweep) on demand.
+COPY services/ai_eval ./ai_eval
 
 # Source for the API↔SDK↔provider contract test (tests/test_api_sdk_contract.py).
 # The test reads these files as raw text — no Go build is performed in the

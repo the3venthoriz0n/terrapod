@@ -363,6 +363,8 @@ def _mock_workspace(**kwargs):
     ws.name = kwargs.get("name", "test-ws")
     ws.auto_apply = kwargs.get("auto_apply", False)
     ws.terraform_version = kwargs.get("terraform_version", "1.11")
+    ws.terragrunt_enabled = kwargs.get("terragrunt_enabled", False)
+    ws.terragrunt_version = kwargs.get("terragrunt_version", "1.0")
     ws.resource_cpu = kwargs.get("resource_cpu", "1")
     ws.resource_memory = kwargs.get("resource_memory", "2Gi")
     ws.agent_pool_id = kwargs.get("agent_pool_id", None)
@@ -418,6 +420,39 @@ class TestCreateRun:
         await create_run(db, ws)
         assert MockRun.call_args[1]["resource_cpu"] == "2"
         assert MockRun.call_args[1]["resource_memory"] == "4Gi"
+
+    @patch("terrapod.services.run_service.Run")
+    async def test_terragrunt_snapshot_from_workspace(self, MockRun):
+        # Terragrunt enable+version are frozen onto the run at creation so a
+        # later workspace edit can't change an in-flight run's execution tool.
+        db = AsyncMock(spec=AsyncSession)
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = None
+        db.execute.return_value = mock_result
+
+        ws = _mock_workspace(terragrunt_enabled=True, terragrunt_version="1.0")
+        instance = MockRun.return_value
+        instance.id = uuid.uuid4()
+        instance.status = "pending"
+
+        await create_run(db, ws)
+        assert MockRun.call_args[1]["terragrunt_enabled"] is True
+        assert MockRun.call_args[1]["terragrunt_version"] == "1.0"
+
+    @patch("terrapod.services.run_service.Run")
+    async def test_terragrunt_disabled_by_default(self, MockRun):
+        db = AsyncMock(spec=AsyncSession)
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = None
+        db.execute.return_value = mock_result
+
+        ws = _mock_workspace()  # terragrunt_enabled defaults False
+        instance = MockRun.return_value
+        instance.id = uuid.uuid4()
+        instance.status = "pending"
+
+        await create_run(db, ws)
+        assert MockRun.call_args[1]["terragrunt_enabled"] is False
 
     @patch("terrapod.services.run_service.Run")
     async def test_pool_from_workspace(self, MockRun):
@@ -476,6 +511,10 @@ class TestCreateRun:
 class TestConfirmRun:
     async def test_confirms_planned_run(self):
         db = AsyncMock(spec=AsyncSession)
+        # confirm_run checks the workspace lock — return an unlocked one.
+        ws = MagicMock()
+        ws.locked = False
+        db.get.return_value = ws
         run = _mock_run(status="planned")
         result = await confirm_run(db, run)
         assert result.status == "confirmed"
@@ -484,6 +523,16 @@ class TestConfirmRun:
         db = AsyncMock(spec=AsyncSession)
         run = _mock_run(status="queued")
         with pytest.raises(ValueError, match="planned"):
+            await confirm_run(db, run)
+
+    async def test_rejects_when_workspace_locked(self):
+        db = AsyncMock(spec=AsyncSession)
+        ws = MagicMock()
+        ws.locked = True
+        ws.lock_id = "lock-ops@example.com"
+        db.get.return_value = ws
+        run = _mock_run(status="planned")
+        with pytest.raises(ValueError, match="locked"):
             await confirm_run(db, run)
 
 

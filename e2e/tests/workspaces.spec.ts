@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { getStoredToken, createWorkspace, uniqueName } from '../helpers/api';
 
 test.describe('Workspaces', () => {
   test('workspace list page loads', async ({ page }) => {
@@ -164,6 +165,43 @@ test.describe('Workspaces', () => {
     expect(isAfter).not.toBe(wasBefore);
   });
 
+  test('terragrunt toggle + version persists through settings (#534)', async ({ page }) => {
+    // Enabling terragrunt reveals a version input; both must round-trip the
+    // workspace PATCH and re-render on reload. Failure modes this catches:
+    //   - terragrunt-enabled missing from the PATCH body
+    //   - the version field not shown when enabled / not saved
+    //   - the read view not reflecting the saved state
+    // Name avoids the "terragrunt" substring so locators don't collide with it.
+    const wsName = `e2e-tg-${Date.now()}`;
+
+    await page.goto('/workspaces');
+    await page.click('button:has-text("New Workspace")');
+    await page.fill('input[placeholder*="workspace"]', wsName);
+    await page.click('button:has-text("Create Workspace")');
+    await page.click(`text=${wsName}`);
+
+    // The Terragrunt setting lives in a <div> whose <dt> is exactly "Terragrunt";
+    // scope all assertions to that block to avoid the auto-apply row.
+    const tgBlock = page.getByText('Terragrunt', { exact: true }).locator('xpath=..');
+    await expect(tgBlock).toBeVisible();
+    await expect(tgBlock.getByText('Disabled')).toBeVisible(); // read view starts Disabled
+
+    await page.click('button:has-text("Edit")');
+    await tgBlock.getByRole('checkbox').check();
+
+    // Version input appears only once enabled.
+    const tgVersion = tgBlock.getByPlaceholder('e.g. 1.0');
+    await expect(tgVersion).toBeVisible();
+    await tgVersion.fill('1.0');
+
+    await page.click('button:has-text("Save")');
+    await expect(page.locator('button:has-text("Edit")')).toBeVisible({ timeout: 10_000 });
+
+    // Reload: the read view must show Enabled (v1.0).
+    await page.reload();
+    await expect(page.getByText('Enabled (v1.0)')).toBeVisible({ timeout: 10_000 });
+  });
+
   test('drift-ignore-rules editor adds, persists, and removes a rule', async ({ page }) => {
     // #482 — verify the workspace settings drift-ignore-rules editor
     // round-trips through the API. Failure cases the spec catches:
@@ -214,5 +252,51 @@ test.describe('Workspaces', () => {
     await expect(page.locator('button:has-text("Edit")')).toBeVisible({ timeout: 10_000 });
     await page.reload();
     await expect(page.locator(`code:has-text("${rule}")`)).not.toBeVisible();
+  });
+
+  test('Health Issues indicator filters the list to unhealthy workspaces', async ({
+    page,
+  }) => {
+    // Create two workspaces via the API so the test is deterministic and
+    // self-isolated (uniquely-named, no reliance on other specs):
+    //   - healthy: default local mode → no health conditions
+    //   - unhealthy: agent mode with no pool → a `no_agent_pool` health
+    //     condition, which `_compute_health_conditions` flags. This is the
+    //     simplest condition to provoke without running anything.
+    const token = getStoredToken();
+    const healthyName = uniqueName('e2e-health-ok');
+    const unhealthyName = uniqueName('e2e-health-bad');
+    await createWorkspace(token, healthyName);
+    await createWorkspace(token, unhealthyName, { 'execution-mode': 'agent' });
+
+    await page.goto('/workspaces');
+    await expect(page.locator('h1:has-text("Workspaces")')).toBeVisible();
+
+    // Both of MY workspaces are present before filtering. (Never assert global
+    // counts/positions — other workers mutate the same org concurrently.)
+    const healthyRow = page.getByRole('link', { name: healthyName });
+    const unhealthyRow = page.getByRole('link', { name: unhealthyName });
+    await expect(unhealthyRow).toBeVisible({ timeout: 10_000 });
+    await expect(healthyRow).toBeVisible();
+
+    // The Health Issues card is a toggle button whenever the count is > 0
+    // (which my unhealthy workspace guarantees). Clicking it applies the
+    // aggregate `status:unhealthy` filter.
+    const healthBtn = page.getByRole('button', { name: /health issues/i });
+    await expect(healthBtn).toBeVisible();
+    await healthBtn.click();
+
+    // Filter now active: the term is in the box, my unhealthy ws stays, my
+    // healthy ws is filtered out. (Assert on MY named resources, not counts —
+    // the unhealthy view also contains other workers' unhealthy workspaces.)
+    await expect(page.locator('input[aria-label="Filter workspaces"]')).toHaveValue(
+      /status:unhealthy/,
+    );
+    await expect(unhealthyRow).toBeVisible();
+    await expect(healthyRow).toBeHidden();
+
+    // Toggling the badge again clears the filter — my healthy ws returns.
+    await healthBtn.click();
+    await expect(healthyRow).toBeVisible({ timeout: 10_000 });
   });
 });

@@ -31,8 +31,11 @@ from terrapod.db.models import (
     RegistryProvider,
     RegistryProviderVersion,
 )
+from terrapod.http_retry import arequest_with_retry
 from terrapod.logging_config import get_logger
 from terrapod.redis.client import get_redis_client
+from terrapod.services.artifact_verification import verify_provider
+from terrapod.services.cache_errors import CacheOnlyError
 from terrapod.services.hashing_stream import HashingStream
 from terrapod.storage.keys import provider_binary_key, provider_cache_key
 from terrapod.storage.protocol import ObjectStore
@@ -42,6 +45,11 @@ logger = get_logger(__name__)
 # Redis key for cached upstream platform metadata (24h TTL)
 _META_KEY_PREFIX = "tp:provider_meta"
 _META_TTL = 86400  # 24 hours
+
+
+def _sealed() -> bool:
+    """Sealed (cache-only) mode — never fetch upstream."""
+    return settings.registry.cache_only
 
 
 def _meta_redis_key(hostname: str, namespace: str, type_: str, version: str) -> str:
@@ -84,6 +92,20 @@ async def get_or_fetch_versions(
     we've cached binaries for — so that terraform/tofu version constraint
     resolution works correctly.
     """
+    # Sealed (cache-only) mode: the version index reflects ONLY versions we've
+    # cached binaries for — never the upstream index.
+    if _sealed():
+        result = await db.execute(
+            select(CachedProviderPackage.version)
+            .where(
+                CachedProviderPackage.hostname == hostname,
+                CachedProviderPackage.namespace == namespace,
+                CachedProviderPackage.type == type_,
+            )
+            .distinct()
+        )
+        return {"versions": {row[0]: {} for row in result.all()}}
+
     cfg = settings.registry.provider_cache
     if hostname not in cfg.upstream_registries:
         return {"versions": {}}
@@ -280,6 +302,13 @@ async def get_or_fetch_platforms(
             "archives": archives,
             "cached_platforms": sorted(configured_platforms),
         }
+
+    # Sealed (cache-only) mode: serve ONLY what's physically cached (tier 1) —
+    # never consult upstream metadata, eagerly fetch, or hand back an
+    # upstream-direct URL. terraform/tofu surfaces its own clear error if a
+    # requested platform isn't present.
+    if _sealed():
+        return _resp()
 
     # --- Tier 2: check Redis for upstream metadata ---
     meta = await _get_cached_metadata(hostname, namespace, type_, version)
@@ -726,18 +755,33 @@ async def fetch_and_cache_single_platform(
     .terraform.lock.hcl, avoiding the per-plan `tofu providers lock`
     archive download.
     """
+    # Sealed (cache-only) mode: never fetch upstream — defense in depth for the
+    # warm path and any direct caller (get_or_fetch_platforms already serves
+    # cached-only in sealed mode and won't reach here).
+    if _sealed():
+        raise CacheOnlyError(
+            f"Provider {hostname}/{namespace}/{type_} {version} ({os_}/{arch}) is not "
+            f"in the cache and sealed (cache_only) mode is enabled. Pre-populate it via "
+            f"the bulk-warm admin endpoint before sealing, or disable registry.cache_only."
+        )
+
     # Check Redis metadata for download info (avoids extra upstream call)
     platform_key = f"{os_}_{arch}"
     meta = await _get_cached_metadata(hostname, namespace, type_, version)
     download_url = None
     filename = None
+    download_info: dict | None = None
     if meta and platform_key in meta:
         download_url = meta[platform_key].get("download_url")
         filename = meta[platform_key].get("filename")
 
+    verify_level = settings.registry.provider_cache.verify
+
     async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-        # If we don't have download info from Redis, fetch from upstream
-        if not download_url or not filename:
+        # If we don't have download info from Redis — OR verification is on, in
+        # which case the reduced Redis metadata lacks the shasum/signature/keys
+        # material we need — fetch the authoritative download response upstream.
+        if not download_url or not filename or verify_level != "off":
             download_info = await _fetch_platform_download(
                 client, hostname, namespace, type_, version, os_, arch
             )
@@ -776,6 +820,21 @@ async def fetch_and_cache_single_platform(
                         fh.write(chunk)
                     shasum = stream.sha256_hex
                     size_bytes = stream.size
+
+            # Integrity gate (#607): verify the downloaded archive against the
+            # registry-advertised shasum (+ GPG signature in `signature` mode)
+            # BEFORE computing h1 / persisting. Fail closed — an unverified
+            # archive must never be cached, served, or have its h1 spliced into
+            # a lock file. `download_info` is guaranteed populated above when
+            # verify_level != "off".
+            if verify_level != "off":
+                await verify_provider(
+                    client,
+                    download_info or {},
+                    shasum,
+                    level=verify_level,
+                    allow_unsigned=settings.registry.provider_cache.allow_unsigned,
+                )
 
             # Phase 2: compute h1 from the on-disk archive (constant
             # memory). Earlier versions called `_compute_h1_from_zip_bytes(fh.read())`
@@ -999,7 +1058,9 @@ async def _fetch_upstream_versions(hostname: str, namespace: str, type_: str) ->
     """Fetch available versions from upstream registry."""
     url = f"https://{hostname}/v1/providers/{namespace}/{type_}/versions"
     async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-        resp = await client.get(url)
+        # Upstream GET — idempotent by method, so the helper retries on
+        # connection errors, read-timeouts, and 5xx from a flaky registry.
+        resp = await arequest_with_retry(client, "GET", url)
         if resp.status_code != 200:
             logger.warning(
                 "Upstream version fetch failed",
@@ -1030,7 +1091,7 @@ async def _fetch_and_cache_upstream_metadata(
     async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
         # Get the list of platforms for this version
         url = f"https://{hostname}/v1/providers/{namespace}/{type_}/versions"
-        resp = await client.get(url)
+        resp = await arequest_with_retry(client, "GET", url)
         if resp.status_code != 200:
             return None
 
@@ -1096,7 +1157,7 @@ async def _fetch_platform_download(
 ) -> dict | None:
     """Fetch download info for a specific platform from upstream."""
     url = f"https://{hostname}/v1/providers/{namespace}/{type_}/{version}/download/{os_}/{arch}"
-    resp = await client.get(url)
+    resp = await arequest_with_retry(client, "GET", url)
     if resp.status_code != 200:
         return None
     return resp.json()

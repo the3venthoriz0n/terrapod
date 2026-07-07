@@ -13,9 +13,11 @@ import (
 // Terrapod-specific quirk — historical from before the role
 // management API was tidied).
 //
-// AllowLabels/AllowNames grant the role's workspace_permission to
-// matching workspaces; DenyLabels/DenyNames override. Resolution
-// rules are documented in the platform CLAUDE.md.
+// AllowLabels/AllowNames scope the role's Capabilities to matching
+// workspaces (and pools/registry/catalog items); DenyLabels/DenyNames
+// override. Capabilities are the grant (see the Capabilities field);
+// resolution rules are documented in docs/rbac.md and
+// docs/rbac-capabilities.md.
 type Role struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
@@ -28,6 +30,15 @@ type Role struct {
 	WorkspacePermission string `json:"workspace-permission"` // read | plan | write | admin
 	PoolPermission      string `json:"pool-permission,omitempty"`
 	RegistryPermission  string `json:"registry-permission,omitempty"` // read | write | admin (modules + providers)
+	CatalogPermission   string `json:"catalog-permission,omitempty"`  // none | read | use | admin
+
+	// Capabilities is the effective capability set (#585). When the role is
+	// authored via CreateRoleRequest/UpdateRoleRequest.Capabilities it is the
+	// stored truth and the *Permission level fields above become a
+	// server-derived summary (a preset name, or the literal "custom" when the
+	// caps match no preset). When authored by level, the server still returns
+	// the levels' expanded capability set here.
+	Capabilities []string `json:"capabilities,omitempty"`
 
 	BuiltIn   bool   `json:"built-in"`
 	CreatedAt string `json:"created-at,omitempty"`
@@ -51,6 +62,13 @@ type CreateRoleRequest struct {
 	WorkspacePermission string
 	PoolPermission      string
 	RegistryPermission  string
+	CatalogPermission   string
+
+	// Capabilities authors the role's grant directly as explicit
+	// "resource:verb" tokens (#585). When set it is the source of truth and
+	// the *Permission level fields are ignored (the server derives them as a
+	// summary). Leave empty to author by level instead.
+	Capabilities []string
 }
 
 // UpdateRoleRequest is the partial-update shape. Name is immutable.
@@ -68,6 +86,11 @@ type UpdateRoleRequest struct {
 	WorkspacePermission string
 	PoolPermission      string
 	RegistryPermission  string
+	CatalogPermission   string
+
+	// Capabilities replaces the role's grant with the given explicit
+	// capability set (#585); when non-empty it wins over the level fields.
+	Capabilities []string
 }
 
 // CreateRole creates a custom role. Admin required.
@@ -134,6 +157,12 @@ func roleCreateAttrs(req CreateRoleRequest) map[string]any {
 	if req.RegistryPermission != "" {
 		attrs["registry-permission"] = req.RegistryPermission
 	}
+	if req.CatalogPermission != "" {
+		attrs["catalog-permission"] = req.CatalogPermission
+	}
+	if len(req.Capabilities) > 0 {
+		attrs["capabilities"] = req.Capabilities
+	}
 	if req.Description != "" {
 		attrs["description"] = req.Description
 	}
@@ -156,6 +185,12 @@ func roleUpdateAttrs(req UpdateRoleRequest) map[string]any {
 	}
 	if req.RegistryPermission != "" {
 		attrs["registry-permission"] = req.RegistryPermission
+	}
+	if req.CatalogPermission != "" {
+		attrs["catalog-permission"] = req.CatalogPermission
+	}
+	if len(req.Capabilities) > 0 {
+		attrs["capabilities"] = req.Capabilities
 	}
 	if req.Description != nil {
 		attrs["description"] = *req.Description
@@ -251,6 +286,8 @@ func roleFromItem(item *roleDataItem) (*Role, error) {
 		WorkspacePermission string            `json:"workspace-permission"`
 		PoolPermission      string            `json:"pool-permission"`
 		RegistryPermission  string            `json:"registry-permission"`
+		CatalogPermission   string            `json:"catalog-permission"`
+		Capabilities        []string          `json:"capabilities"`
 		BuiltIn             bool              `json:"built-in"`
 		CreatedAt           string            `json:"created-at"`
 		UpdatedAt           string            `json:"updated-at"`
@@ -270,6 +307,8 @@ func roleFromItem(item *roleDataItem) (*Role, error) {
 		WorkspacePermission: attrs.WorkspacePermission,
 		PoolPermission:      attrs.PoolPermission,
 		RegistryPermission:  attrs.RegistryPermission,
+		CatalogPermission:   attrs.CatalogPermission,
+		Capabilities:        attrs.Capabilities,
 		BuiltIn:             attrs.BuiltIn,
 		CreatedAt:           attrs.CreatedAt,
 		UpdatedAt:           attrs.UpdatedAt,

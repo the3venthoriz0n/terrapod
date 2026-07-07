@@ -24,6 +24,7 @@ from pathlib import Path
 import httpx
 import structlog
 
+from terrapod.http_retry import request_with_retry
 from terrapod.runner.runner_config import RunnerConfig
 
 logger = structlog.get_logger("runner.uploads")
@@ -51,8 +52,17 @@ def _put_file(
     *,
     content_type: str = "application/octet-stream",
     client: httpx.Client | None = None,
+    retries: int = 3,
 ) -> tuple[bool, int | None]:
-    """PUT a file as the request body. Returns (ok, status)."""
+    """PUT a file as the request body. Returns (ok, status).
+
+    PUT is idempotent (the server writes to a fixed key), so retries on
+    connection errors, read-timeouts, and 5xx are safe — most importantly
+    for the state upload, where an un-retried timeout would otherwise
+    trigger a false state-diverged. The retry policy lives in
+    ``request_with_retry``; a transport exception that exhausts all
+    attempts is caught here and returned as ``(False, None)``.
+    """
     if not cfg.has_api:
         return False, None
     if not path.exists() or path.stat().st_size == 0:
@@ -65,7 +75,15 @@ def _put_file(
 
     try:
         with path.open("rb") as fh:
-            resp = client.put(url, content=fh.read(), headers={"Content-Type": content_type})
+            resp = request_with_retry(
+                client,
+                "PUT",
+                url,
+                idempotent=True,
+                retries=retries,
+                content=fh.read(),
+                headers={"Content-Type": content_type},
+            )
         ok = 200 <= resp.status_code < 300
         return ok, resp.status_code
     except httpx.RequestError as exc:
@@ -83,7 +101,21 @@ def _post_json(
     *,
     timeout_seconds: float = 10.0,
     client: httpx.Client | None = None,
+    retries: int = 0,
+    idempotent: bool | None = None,
 ) -> tuple[bool, int | None]:
+    """POST JSON to the API; returns (ok, status_code).
+
+    The retry policy lives in ``request_with_retry``. Pass
+    ``idempotent=True`` for the authoritative result POSTs (plan-result /
+    apply-result / state-diverged) whose server handlers are
+    status-guarded / flag-set idempotent, so a transient read-timeout or
+    5xx can be retried without a double-apply. A lost plan-result left
+    ``has_changes`` unknown, and the workspace was then conservatively
+    flagged drifted (#565). A 4xx is a definitive answer and is never
+    retried. A transport exception that exhausts all attempts is caught
+    here and returned as ``(False, None)``.
+    """
     if not cfg.has_api:
         return False, None
     own_client = client is None
@@ -93,10 +125,15 @@ def _post_json(
             headers={"Authorization": f"Bearer {cfg.auth_token}"} if cfg.auth_token else {},
         )
     try:
-        if body is None:
-            resp = client.post(url)
-        else:
-            resp = client.post(url, json=body)
+        kwargs: dict = {} if body is None else {"json": body}
+        resp = request_with_retry(
+            client,
+            "POST",
+            url,
+            idempotent=idempotent,
+            retries=retries,
+            **kwargs,
+        )
         ok = 200 <= resp.status_code < 300
         return ok, resp.status_code
     except httpx.RequestError as exc:
@@ -274,7 +311,17 @@ def signal_state_diverged(
     timeout — we've already exited with a fatal status; this is just to
     surface the state divergence in the UI."""
     url = f"{cfg.api_url}/api/terrapod/v1/runs/{cfg.run_id}/state-diverged"
-    ok, status = _post_json(cfg, url, body=None, timeout_seconds=5.0, client=client)
+    # Flag-set idempotent handler — retry on timeout/5xx so the divergence
+    # still surfaces in the UI despite a transient hiccup.
+    ok, status = _post_json(
+        cfg,
+        url,
+        body=None,
+        timeout_seconds=5.0,
+        client=client,
+        retries=3,
+        idempotent=True,
+    )
     if not ok:
         logger.warning("state-diverged signal POST failed", status=status)
     return ok
@@ -290,11 +337,15 @@ def post_plan_result(
     fallback; this just drives the planning→planned transition faster
     when the runner can reach the API directly."""
     url = f"{cfg.api_url}/api/terrapod/v1/runs/{cfg.run_id}/plan-result"
+    # Authoritative has_changes signal — retry so a transient read-timeout
+    # doesn't leave the run's has_changes unknown and falsely flag drift (#565).
     ok, status = _post_json(
         cfg,
         url,
         body={"has_changes": has_changes},
         client=client,
+        retries=3,
+        idempotent=True,
     )
     if not ok:
         logger.warning("plan-result POST failed (non-fatal)", status=status)
@@ -309,7 +360,9 @@ def post_apply_result(
     """Apply phase. Best-effort. Drives applying→applied transition
     without the listener round-trip."""
     url = f"{cfg.api_url}/api/terrapod/v1/runs/{cfg.run_id}/apply-result"
-    ok, status = _post_json(cfg, url, body=None, client=client)
+    # Authoritative apply-completion trigger — retry for the same reason as
+    # plan-result (#565); complete_apply is idempotent.
+    ok, status = _post_json(cfg, url, body=None, client=client, retries=3, idempotent=True)
     if not ok:
         logger.warning("apply-result POST failed (non-fatal)", status=status)
     return ok

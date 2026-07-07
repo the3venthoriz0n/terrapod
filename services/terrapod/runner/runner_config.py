@@ -37,6 +37,12 @@ class RunnerConfig:
     backend: Literal["terraform", "tofu"]
     version: str
 
+    # Terragrunt (#534): when enabled, the runner invokes `terragrunt` wrapping
+    # the cached tofu/terraform binary (via --tf-path). version is partial,
+    # resolved against the binary cache like `version`.
+    terragrunt_enabled: bool
+    terragrunt_version: str
+
     # Workspace context
     workspace_id: str
     working_dir: str
@@ -52,11 +58,16 @@ class RunnerConfig:
     plan_only: bool
 
     # Misc behaviours
-    setup_script: str
     termination_grace_period_seconds: int
     upload_timeout_seconds: int
     download_retries: int
     download_retry_delay_seconds: int
+
+    # Runner-side executable verification (#607): "off" | "checksum" |
+    # "signature" (default). The runner re-verifies the terraform/tofu/
+    # terragrunt binary against the publisher's signed SHA256SUMS with its own
+    # pinned key before executing it. Set by job_template from binary_cache.verify.
+    verify_binaries: str
 
     # Platform — derived locally, exposed here so phases can branch
     # without re-shelling out to uname.
@@ -107,6 +118,8 @@ class RunnerConfig:
             phase=e.get("TP_PHASE", "plan"),  # type: ignore[arg-type]
             backend=e.get("TP_BACKEND", "tofu"),  # type: ignore[arg-type]
             version=e.get("TP_VERSION", ""),
+            terragrunt_enabled=_bool("TP_TERRAGRUNT_ENABLED"),
+            terragrunt_version=e.get("TP_TERRAGRUNT_VERSION", ""),
             workspace_id=e.get("TP_WORKSPACE_ID", ""),
             working_dir=e.get("TP_WORKING_DIR", ""),
             target_addrs=_json_list("TP_TARGET_ADDRS"),
@@ -117,11 +130,11 @@ class RunnerConfig:
             allow_empty_apply=_bool("TP_ALLOW_EMPTY_APPLY"),
             destroy=_bool("TP_DESTROY"),
             plan_only=_bool("TP_PLAN_ONLY"),
-            setup_script=e.get("TP_SETUP_SCRIPT", ""),
             termination_grace_period_seconds=_int("TP_TERMINATION_GRACE", 120),
             upload_timeout_seconds=_int("TP_UPLOAD_TIMEOUT", 60),
             download_retries=_int("TP_DOWNLOAD_RETRIES", 3),
             download_retry_delay_seconds=_int("TP_DOWNLOAD_RETRY_DELAY", 5),
+            verify_binaries=e.get("TP_VERIFY_BINARIES", "signature"),  # type: ignore[arg-type]
             os=os_name,
             arch=arch,
         )
