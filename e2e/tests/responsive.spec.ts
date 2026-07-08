@@ -1,5 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
-import { getStoredToken, createWorkspace, seedRun, uniqueName } from '../helpers/api';
+import { getStoredToken, createWorkspace, seedRun, seedStateVersion, seedRunTask, uniqueName } from '../helpers/api';
 
 /**
  * Responsive / mobile harness (#719).
@@ -138,5 +138,108 @@ test.describe('Responsive harness (phone viewport)', () => {
     await picker.selectOption('plan');
     await expect(page).toHaveURL(/[?&]view=plan/);
     await expectNoHorizontalPageScroll(page);
+  });
+
+  test('workspace runs list becomes tappable cards at phone width', async ({ page }) => {
+    // The 7-column runs table is unreadable on a phone, so below md it renders
+    // as stacked cards driven by the same data (#719 Stage 2). The desktop
+    // table header is hidden; the seeded run shows as a card that is itself a
+    // link to the run (one big tap target).
+    const token = getStoredToken();
+    const wsName = uniqueName('resp-runs');
+    const wsId = await createWorkspace(token, wsName);
+    await seedRun(token, wsId);
+
+    await page.goto(`/workspaces/${wsId}?tab=runs`);
+
+    // The 9-tab strip collapses to a native <select> section picker at phone
+    // width (the tab bar overflows a phone), driven by the same ?tab= URL.
+    await expect(page.locator('#ws-tab-select')).toBeVisible();
+    // The desktop table's column header is hidden at phone width...
+    await expect(page.getByRole('columnheader', { name: 'Run ID' })).toBeHidden();
+    // ...and the run renders as a card linking to the run detail page.
+    await expect(page.locator('a[href*="/runs/run-"]').first()).toBeVisible({ timeout: 15_000 });
+
+    await expectNoHorizontalPageScroll(page);
+  });
+
+  test('workspace state list becomes cards at phone width', async ({ page }) => {
+    // The state-version table hid Created-by / Run / Size / Created behind
+    // sm/md/lg breakpoints, leaving a phone with only the serial. Below md it
+    // renders as cards driven by the same data (#719), so nothing is dropped.
+    const token = getStoredToken();
+    const wsName = uniqueName('resp-state');
+    const wsId = await createWorkspace(token, wsName);
+    await seedStateVersion(token, wsId, 1);
+
+    await page.goto(`/workspaces/${wsId}?tab=state`);
+
+    // The 9-tab strip is the native <select> picker at phone width.
+    await expect(page.locator('#ws-tab-select')).toBeVisible();
+    // The desktop table's Serial column header is hidden below md...
+    await expect(page.getByRole('columnheader', { name: 'Serial' })).toBeHidden();
+    // ...and the state version renders as a card with its serial and a Download
+    // button. `#1` + Download also exist in the hidden desktop table, so filter
+    // to the visible (mobile-card) copy.
+    await expect(page.getByText('#1', { exact: true }).filter({ visible: true })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole('button', { name: 'Download' }).filter({ visible: true })).toBeVisible();
+
+    await expectNoHorizontalPageScroll(page);
+  });
+
+  test('workspace configurations list becomes cards at phone width', async ({ page }) => {
+    // The 6-column configuration-versions table is 529px wide and was clipped
+    // by its overflow-hidden wrapper on a phone (Created + Download vanished).
+    // Below md it renders as cards driven by the same data (#719). Seeding a run
+    // uploads a configuration version.
+    const token = getStoredToken();
+    const wsName = uniqueName('resp-cfg');
+    const wsId = await createWorkspace(token, wsName);
+    await seedRun(token, wsId);
+
+    await page.goto(`/workspaces/${wsId}?tab=configurations`);
+
+    await expect(page.locator('#ws-tab-select')).toBeVisible();
+    // The desktop table's column header is hidden at phone width...
+    await expect(page.getByRole('columnheader', { name: 'Source' })).toBeHidden();
+    // ...and the config version renders as a card exposing its full id + the
+    // Compare checkbox. Both also exist in the hidden desktop table, so filter
+    // to the visible (mobile-card) copy.
+    await expect(page.getByText(/^cv-/).filter({ visible: true }).first()).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole('checkbox', { name: /Select cv-.* for compare/ }).filter({ visible: true }).first()).toBeVisible();
+
+    await expectNoHorizontalPageScroll(page);
+  });
+
+  test('touch: both a reversible toggle and an irreversible delete prompt confirm()', async ({ page }) => {
+    // #719 two-tier confirm policy, coarse-pointer half. On touch EVERY mutation
+    // prompts: tier-2 (toggle) — which on a precise pointer would NOT — and
+    // tier-1 (delete). This Pixel project is the only proof of the touch path,
+    // since the maintainer doesn't test on a real device.
+    const token = getStoredToken();
+    const wsId = await createWorkspace(token, uniqueName('confirm-touch'));
+    const rtName = uniqueName('rt');
+    await seedRunTask(token, wsId, rtName);
+
+    await page.goto(`/workspaces/${wsId}?tab=run-tasks`);
+    await expect(page.getByText(rtName)).toBeVisible({ timeout: 15_000 });
+
+    // Handlers registered BEFORE the click: window.confirm() is synchronous and
+    // blocks the click handler, so the dialog must be handled as it opens
+    // (waitForEvent + click deadlocks).
+
+    // Tier 2 — the Disable toggle DOES prompt on touch; dismiss keeps it enabled.
+    let toggleMsg = '';
+    page.once('dialog', async (d) => { toggleMsg = d.message(); await d.dismiss(); });
+    await page.getByRole('button', { name: 'Disable' }).click();
+    await expect.poll(() => toggleMsg, { timeout: 5_000 }).toContain('Disable this run task');
+    await expect(page.getByText('Enabled', { exact: true })).toBeVisible();
+
+    // Tier 1 — delete prompts on touch too; dismiss keeps the row.
+    let deleteMsg = '';
+    page.once('dialog', async (d) => { deleteMsg = d.message(); await d.dismiss(); });
+    await page.getByRole('button', { name: 'Delete' }).click();
+    await expect.poll(() => deleteMsg, { timeout: 5_000 }).toContain('Delete run task');
+    await expect(page.getByText(rtName)).toBeVisible();
   });
 });

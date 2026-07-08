@@ -14,6 +14,8 @@ import { HealthConditions } from '@/components/health-conditions'
 import { PlanSummaryBadges } from '@/components/plan-summary-badges'
 import { WorkspacePicker } from '@/components/workspace-picker'
 import { SensitiveValueInput } from '@/components/sensitive-value-input'
+import { MobileCardList, MobileCard } from '@/components/mobile-card-list'
+import { useIsTouch } from '@/lib/use-media-query'
 import { getAuthState, isAdmin } from '@/lib/auth'
 import { apiFetch } from '@/lib/api'
 import { useSortable } from '@/lib/use-sortable'
@@ -300,6 +302,14 @@ function WorkspaceDetailContent() {
   const [varHcl, setVarHcl] = useState(false)
   const [addingVar, setAddingVar] = useState(false)
 
+  const isTouch = useIsTouch()
+
+  // #719 two-tier confirm policy (see AGENTS.md → Responsive → Touch model):
+  // an irreversible delete/remove prompts in BOTH modes; any other single-tap
+  // mutation prompts on touch only (a mis-tap is easy on a phone).
+  const confirmDelete = (msg: string) => window.confirm(msg)
+  const confirmTouchMutation = (msg: string) => !isTouch || window.confirm(msg)
+
   // Runs
   const [runs, setRuns] = useState<RunItem[]>([])
   const [runsLoading, setRunsLoading] = useState(false)
@@ -413,7 +423,6 @@ function WorkspaceDetailContent() {
   const [notifEmails, setNotifEmails] = useState('')
   const [notifTriggers, setNotifTriggers] = useState<Set<string>>(new Set())
   const [addingNotif, setAddingNotif] = useState(false)
-  const [deleteNotifId, setDeleteNotifId] = useState<string | null>(null)
   const [verifyingId, setVerifyingId] = useState<string | null>(null)
   const [expandedNotifId, setExpandedNotifId] = useState<string | null>(null)
 
@@ -427,8 +436,6 @@ function WorkspaceDetailContent() {
   const [rtEnforcement, setRtEnforcement] = useState<string>('mandatory')
   const [rtHmacKey, setRtHmacKey] = useState('')
   const [addingRunTask, setAddingRunTask] = useState(false)
-  const [deleteRtId, setDeleteRtId] = useState<string | null>(null)
-  const [deleteVarId, setDeleteVarId] = useState<string | null>(null)
 
   // Sorting for runs tab
   type RunSortKey = 'id' | 'status' | 'type' | 'source' | 'created-by' | 'created-at'
@@ -587,6 +594,21 @@ function WorkspaceDetailContent() {
       setError(err instanceof Error ? err.message : 'Failed to load state versions')
     } finally {
       setStateLoading(false)
+    }
+  }
+
+  async function downloadStateVersion(sv: StateVersionItem) {
+    try {
+      const resp = await apiFetch(`/api/v2/state-versions/${sv.id}/download`)
+      const blob = await resp.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `state-${sv.attributes.serial}.json`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch {
+      alert('Failed to download state file')
     }
   }
 
@@ -765,6 +787,8 @@ function WorkspaceDetailContent() {
   }
 
   async function revokeRemoteStateConsumer(edgeId: string) {
+    // Irreversible: the consumer loses access to this workspace's state.
+    if (!confirmDelete('Remove this remote state sharing? The consumer will lose access to this state.')) return
     try {
       const res = await apiFetch(`/api/terrapod/v1/remote-state-consumers/${edgeId}`, { method: 'DELETE' })
       if (!res.ok) {
@@ -838,6 +862,8 @@ function WorkspaceDetailContent() {
   }
 
   async function removeRunTrigger(triggerId: string) {
+    // Irreversible: removes the cross-workspace trigger edge.
+    if (!confirmDelete('Remove this run trigger?')) return
     try {
       const res = await apiFetch(`/api/terrapod/v1/run-triggers/${triggerId}`, { method: 'DELETE' })
       if (!res.ok) {
@@ -902,6 +928,7 @@ function WorkspaceDetailContent() {
   }
 
   async function handleToggleRunTask(rt: RunTaskItem) {
+    if (!confirmTouchMutation(rt.attributes.enabled ? 'Disable this run task?' : 'Enable this run task?')) return
     try {
       const res = await apiFetch(`/api/terrapod/v1/run-tasks/${rt.id}`, {
         method: 'PATCH',
@@ -916,10 +943,11 @@ function WorkspaceDetailContent() {
   }
 
   async function handleDeleteRunTask(rtId: string) {
+    // Irreversible delete → confirm in both modes.
+    if (!confirmDelete(`Delete run task "${runTasks.find(r => r.id === rtId)?.attributes.name ?? ''}"?`)) return
     try {
       const res = await apiFetch(`/api/terrapod/v1/run-tasks/${rtId}`, { method: 'DELETE' })
       if (!res.ok) throw new Error('Failed to delete')
-      setDeleteRtId(null)
       await loadRunTasks()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to delete run task')
@@ -1045,6 +1073,7 @@ function WorkspaceDetailContent() {
   async function handleLockToggle() {
     if (!workspace) return
     const action = workspace.attributes.locked ? 'unlock' : 'lock'
+    if (!confirmTouchMutation(action === 'unlock' ? 'Unlock this workspace?' : 'Lock this workspace?')) return
     try {
       // lock/unlock are TFE V2 CLI-contract endpoints — only at /api/v2/.
       const res = await apiFetch(`/api/v2/workspaces/${workspaceId}/actions/${action}`, {
@@ -1283,10 +1312,11 @@ function WorkspaceDetailContent() {
   }
 
   async function handleDeleteVariable(varId: string) {
+    // Irreversible delete → confirm in both modes.
+    if (!confirmDelete(`Delete variable "${variables.find(v => v.id === varId)?.attributes.key ?? ''}"?`)) return
     try {
       const res = await apiFetch(`/api/v2/workspaces/${workspaceId}/vars/${varId}`, { method: 'DELETE' })
       if (!res.ok) throw new Error('Failed to delete variable')
-      setDeleteVarId(null)
       await loadVariables()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to delete variable')
@@ -1294,6 +1324,16 @@ function WorkspaceDetailContent() {
   }
 
   async function handleQueuePlan() {
+    // Touch fat-finger guard — queuing a run is a state change (and on a
+    // non-VCS agent workspace a `plan + apply` run can change infrastructure),
+    // so a stray tap on a touch device (any width) gets a native confirm; a
+    // precise pointer runs immediately.
+    if (isTouch) {
+      const msg = planOnly
+        ? 'Queue a speculative plan for this workspace?'
+        : 'Queue a plan + apply run? This can change infrastructure.'
+      if (!window.confirm(msg)) return
+    }
     setQueueingPlan(true)
     setError('')
     try {
@@ -1469,6 +1509,7 @@ function WorkspaceDetailContent() {
   }
 
   async function handleToggleNotif(nc: NotificationConfig) {
+    if (!confirmTouchMutation(nc.attributes.enabled ? 'Disable this notification?' : 'Enable this notification?')) return
     try {
       const res = await apiFetch(`/api/terrapod/v1/notification-configurations/${nc.id}`, {
         method: 'PATCH',
@@ -1483,10 +1524,11 @@ function WorkspaceDetailContent() {
   }
 
   async function handleDeleteNotif(ncId: string) {
+    // Irreversible delete → confirm in both modes.
+    if (!confirmDelete(`Delete notification "${notifications.find(n => n.id === ncId)?.attributes.name ?? ''}"?`)) return
     try {
       const res = await apiFetch(`/api/terrapod/v1/notification-configurations/${ncId}`, { method: 'DELETE' })
       if (!res.ok) throw new Error('Failed to delete')
-      setDeleteNotifId(null)
       await loadNotifications()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to delete notification')
@@ -1651,8 +1693,28 @@ function WorkspaceDetailContent() {
           </div>
         )}
 
-        {/* Tabs */}
-        <div className="border-b border-slate-700/50 mb-6">
+        {/* Tabs. Nine sections overflow a phone-width strip, so below md they
+            collapse to a native <select> picker (same pattern as the run page);
+            the tab bar returns at md+. One source (`tabs`), two viewport-driven
+            presentations; the URL (?tab=) stays the source of truth either way. */}
+        <div className="mb-6 md:hidden">
+          <label htmlFor="ws-tab-select" className="sr-only">
+            Workspace section
+          </label>
+          <select
+            id="ws-tab-select"
+            value={activeTab}
+            onChange={(e) => setActiveTab(e.target.value as Tab)}
+            className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm font-medium text-slate-100 focus:border-brand-500 focus:outline-none"
+          >
+            {tabs.map((tab) => (
+              <option key={tab.key} value={tab.key}>
+                {tab.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="hidden border-b border-slate-700/50 mb-6 md:block">
           <div className="flex gap-1 -mb-px">
             {tabs.map((tab) => (
               <button
@@ -1678,14 +1740,23 @@ function WorkspaceDetailContent() {
               <div className="flex items-center justify-between mb-4">
                 <h3 className="text-sm font-medium text-slate-300">Settings</h3>
                 {!editing ? (
-                  perms['can-update'] && <button onClick={startEditing} className="text-xs text-brand-400 hover:text-brand-300">
+                  perms['can-update'] && <button onClick={startEditing} className="px-2.5 py-1 rounded-md text-xs font-medium bg-slate-700 hover:bg-slate-600 text-slate-200">
                     Edit
                   </button>
                 ) : (
                   <div className="flex gap-2">
-                    <button onClick={() => setEditing(false)} className="text-xs text-slate-400 hover:text-slate-200">Cancel</button>
-                    <button onClick={() => handleSave()} disabled={saving} className="text-xs text-brand-400 hover:text-brand-300">
-                      {saving ? 'Saving...' : 'Save'}
+                    <button
+                      onClick={() => setEditing(false)}
+                      className="px-4 py-2 rounded-lg text-sm font-medium bg-slate-700 hover:bg-slate-600 text-slate-200 transition-colors"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={() => handleSave()}
+                      disabled={saving}
+                      className="px-4 py-2 rounded-lg text-sm font-medium bg-brand-600 hover:bg-brand-500 disabled:bg-brand-800 disabled:text-brand-400 text-white transition-colors"
+                    >
+                      {saving ? 'Saving…' : 'Save changes'}
                     </button>
                   </div>
                 )}
@@ -2519,7 +2590,11 @@ function WorkspaceDetailContent() {
             ) : variables.length === 0 ? (
               <EmptyState message="No variables configured for this workspace." />
             ) : (
-              <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 overflow-hidden">
+              <>
+              {/* Desktop (md+): the variables table. Below md it's replaced by
+                  the stacked cards (a phone can't show the table + inline edit
+                  legibly). #719 Stage 2. */}
+              <div className="hidden md:block bg-slate-800/50 rounded-lg border border-slate-700/50 overflow-hidden">
                 <table className="w-full">
                   <thead>
                     <tr className="border-b border-slate-700/50">
@@ -2565,8 +2640,8 @@ function WorkspaceDetailContent() {
                           </td>
                           <td className="px-4 py-3 text-right">
                             <div className="flex justify-end gap-2">
-                              <button onClick={() => setEditingVarId(null)} className="text-xs text-slate-400 hover:text-slate-200">Cancel</button>
-                              <button onClick={handleSaveVar} disabled={savingVar} className="text-xs text-brand-400 hover:text-brand-300">
+                              <button onClick={() => setEditingVarId(null)} className="px-2.5 py-1 rounded-md text-xs font-medium bg-slate-700 hover:bg-slate-600 text-slate-200">Cancel</button>
+                              <button onClick={handleSaveVar} disabled={savingVar} className="px-2.5 py-1 rounded-md text-xs font-medium bg-brand-600 hover:bg-brand-500 disabled:bg-brand-800 disabled:text-brand-400 text-white">
                                 {savingVar ? 'Saving...' : 'Save'}
                               </button>
                             </div>
@@ -2588,15 +2663,8 @@ function WorkspaceDetailContent() {
                           {perms['can-update-variable'] && (
                             <td className="px-4 py-3 text-right">
                               <div className="flex justify-end gap-2">
-                                <button onClick={() => startEditingVar(v)} className="text-xs text-brand-400 hover:text-brand-300">Edit</button>
-                                {deleteVarId === v.id ? (
-                                  <>
-                                    <button onClick={() => setDeleteVarId(null)} className="text-xs text-slate-400 hover:text-slate-200">Cancel</button>
-                                    <button onClick={() => handleDeleteVariable(v.id)} className="text-xs text-red-400 hover:text-red-300">Confirm</button>
-                                  </>
-                                ) : (
-                                  <button onClick={() => setDeleteVarId(v.id)} className="text-xs text-red-400 hover:text-red-300">Delete</button>
-                                )}
+                                <button onClick={() => startEditingVar(v)} className="px-2.5 py-1 rounded-md text-xs font-medium bg-slate-700 hover:bg-slate-600 text-slate-200">Edit</button>
+                                <button onClick={() => handleDeleteVariable(v.id)} className="px-2.5 py-1 rounded-md text-xs font-medium bg-red-900/40 hover:bg-red-900/60 text-red-300">Delete</button>
                               </div>
                             </td>
                           )}
@@ -2606,6 +2674,86 @@ function WorkspaceDetailContent() {
                   </tbody>
                 </table>
               </div>
+
+              {/* Mobile (< md): variables as stacked cards — same data + inline
+                  edit / delete states as the table. Value is masked when
+                  sensitive; the category pill is kept; actions are proper
+                  buttons (not tiny text). */}
+              <ul className="md:hidden space-y-2">
+                {sortedVars.map((v) => (
+                  <li key={v.id} className="rounded-lg border border-slate-700/50 bg-slate-800/50 p-3">
+                    {editingVarId === v.id ? (
+                      <div className="space-y-2">
+                        <input
+                          type="text"
+                          value={editVarKey}
+                          onChange={(e) => setEditVarKey(e.target.value)}
+                          placeholder="Key"
+                          className="w-full px-2 py-1.5 text-sm border border-slate-600 rounded bg-slate-700 text-slate-100 font-mono focus:outline-none focus:ring-1 focus:ring-brand-500"
+                        />
+                        <SensitiveValueInput
+                          value={editVarValue}
+                          onChange={setEditVarValue}
+                          sensitive={editVarSensitive}
+                          placeholder={editVarSensitive ? 'Enter new value' : ''}
+                          rows={2}
+                          className="w-full px-2 py-1.5 text-sm border border-slate-600 rounded bg-slate-700 text-slate-100 font-mono focus:outline-none focus:ring-1 focus:ring-brand-500 resize-y"
+                        />
+                        <div className="flex flex-wrap items-center gap-3">
+                          <select
+                            value={editVarCategory}
+                            onChange={(e) => setEditVarCategory(e.target.value)}
+                            className="px-2 py-1 text-xs border border-slate-600 rounded bg-slate-700 text-slate-100 focus:outline-none focus:ring-1 focus:ring-brand-500"
+                          >
+                            <option value="terraform">terraform</option>
+                            <option value="env">env</option>
+                          </select>
+                          <label className="flex items-center gap-1 cursor-pointer">
+                            <input type="checkbox" checked={editVarSensitive} onChange={(e) => setEditVarSensitive(e.target.checked)} className="rounded border-slate-600 bg-slate-700 text-brand-600" />
+                            <span className="text-xs text-slate-400">Sensitive</span>
+                          </label>
+                          <label className="flex items-center gap-1 cursor-pointer">
+                            <input type="checkbox" checked={editVarHcl} onChange={(e) => setEditVarHcl(e.target.checked)} className="rounded border-slate-600 bg-slate-700 text-brand-600" />
+                            <span className="text-xs text-slate-400">HCL</span>
+                          </label>
+                        </div>
+                        <div className="flex gap-2 pt-1">
+                          <button onClick={() => setEditingVarId(null)} className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-700 hover:bg-slate-600 text-slate-200">Cancel</button>
+                          <button onClick={handleSaveVar} disabled={savingVar} className="px-3 py-1.5 rounded-lg text-sm font-medium bg-brand-600 hover:bg-brand-500 disabled:bg-brand-800 disabled:text-brand-400 text-white">
+                            {savingVar ? 'Saving…' : 'Save'}
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="flex items-start justify-between gap-2 mb-1.5">
+                          <span className="text-sm font-mono font-medium text-slate-200 break-all">{v.attributes.key}</span>
+                          <span className={`shrink-0 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
+                            v.attributes.category === 'terraform' ? 'bg-purple-900/50 text-purple-300' : 'bg-cyan-900/50 text-cyan-300'
+                          }`}>
+                            {v.attributes.category}
+                          </span>
+                        </div>
+                        <div className="mb-2 text-sm text-slate-400 font-mono break-all">
+                          {v.attributes.sensitive ? '***' : (v.attributes.value || <span className="text-slate-600 italic">empty</span>)}
+                        </div>
+                        {perms['can-update-variable'] && (
+                          <div className="flex gap-2">
+                            <button onClick={() => startEditingVar(v)} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-700 hover:bg-slate-600 text-slate-200">Edit</button>
+                            <button
+                              onClick={() => handleDeleteVariable(v.id)}
+                              className="px-3 py-1.5 rounded-lg text-xs font-medium bg-red-900/40 hover:bg-red-900/60 text-red-300"
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </li>
+                ))}
+              </ul>
+              </>
             )}
           </div>
         )}
@@ -2779,7 +2927,11 @@ function WorkspaceDetailContent() {
             ) : runs.length === 0 ? (
               <EmptyState message="No runs yet for this workspace." />
             ) : (
-              <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 overflow-hidden">
+              <>
+              {/* Desktop (md+): the sortable table, unchanged. Below md it is
+                  hidden in favour of the stacked cards (#719 Stage 2) — a phone
+                  can't show a 7-column table legibly. */}
+              <div className="hidden md:block bg-slate-800/50 rounded-lg border border-slate-700/50 overflow-hidden">
                 <table className="w-full">
                   <thead>
                     <tr className="border-b border-slate-700/50">
@@ -2849,6 +3001,78 @@ function WorkspaceDetailContent() {
                   </tbody>
                 </table>
               </div>
+
+              {/* Mobile (< md): each run is a tappable card. The whole card is
+                  the link (big touch target); Status stays prominent (never
+                  hidden — the primary signal), destroy/plan-only keep their
+                  coloured pills, and the rest reflow as label/value rows. */}
+              <MobileCardList>
+                {sortedRuns.map((run) => {
+                  const shortId = run.id.replace(/^run-/, '').split('-').pop()
+                  return (
+                    <MobileCard
+                      key={run.id}
+                      href={`/workspaces/${workspaceId}/runs/${run.id}`}
+                      title={<span className="text-sm font-mono text-brand-400">{shortId}</span>}
+                      badge={
+                        run.attributes.actions?.['is-confirmable'] ? (
+                          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-amber-900/50 text-amber-300">
+                            needs confirm
+                          </span>
+                        ) : (
+                          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${statusColor(run.attributes.status)}`}>
+                            {run.attributes.status}
+                          </span>
+                        )
+                      }
+                      fields={[
+                        {
+                          label: 'Type',
+                          value: run.attributes['is-destroy'] ? (
+                            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-red-900/50 text-red-300">
+                              destroy
+                            </span>
+                          ) : run.attributes['plan-only'] ? (
+                            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-cyan-900/50 text-cyan-300">
+                              plan only
+                            </span>
+                          ) : (
+                            <span className="text-slate-400">plan + apply</span>
+                          ),
+                        },
+                        ...(run.attributes['plan-summary']
+                          ? [{
+                              label: 'Changes',
+                              value: <PlanSummaryBadges summary={run.attributes['plan-summary']} size="sm" />,
+                            }]
+                          : []),
+                        {
+                          label: 'Source',
+                          value:
+                            run.attributes.source === 'module-test' ? (
+                              <span className="text-purple-400">module test</span>
+                            ) : run.attributes.source === 'module-publish' ? (
+                              <span className="text-purple-400">module publish</span>
+                            ) : (
+                              run.attributes.source
+                            ),
+                        },
+                        ...(run.attributes['created-by']
+                          ? [{ label: 'Triggered by', value: run.attributes['created-by'] }]
+                          : []),
+                        ...(run.attributes['created-at']
+                          ? [{
+                              label: 'Created',
+                              value: new Date(run.attributes['created-at']).toLocaleString(),
+                              valueClassName: 'text-slate-400',
+                            }]
+                          : []),
+                      ]}
+                    />
+                  )
+                })}
+              </MobileCardList>
+              </>
             )}
           </div>
         )}
@@ -2953,68 +3177,139 @@ function WorkspaceDetailContent() {
             ) : stateVersions.length === 0 ? (
               <EmptyState message="No state versions yet for this workspace." />
             ) : (
-              <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 overflow-hidden">
-                <table className="w-full">
-                  <thead>
-                    <tr className="border-b border-slate-700/50">
-                      <SortableHeader label="Serial" sortKey="serial" sortState={stateSortState} onSort={toggleStateSort} />
-                      <SortableHeader label="Created By" sortKey="created-by" sortState={stateSortState} onSort={toggleStateSort} className="hidden sm:table-cell" />
-                      <th className="px-4 py-3 text-left text-xs font-medium text-slate-400 uppercase tracking-wider hidden sm:table-cell">Run</th>
-                      <SortableHeader label="Size" sortKey="size" sortState={stateSortState} onSort={toggleStateSort} className="hidden md:table-cell" />
-                      <SortableHeader label="Created" sortKey="created-at" sortState={stateSortState} onSort={toggleStateSort} className="hidden lg:table-cell" />
-                      <th className="px-4 py-3 text-right text-xs font-medium text-slate-400 uppercase tracking-wider">Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-700/30">
-                    {sortedState.map((sv) => {
-                      const maxSerial = Math.max(...stateVersions.map(s => s.attributes.serial))
-                      const isLatest = sv.attributes.serial === maxSerial
-                      const runData = sv.relationships?.run?.data
-                      return (
-                        <tr key={sv.id} className="hover:bg-slate-700/20 transition-colors">
-                          <td className="px-4 py-3 text-sm text-slate-200 font-mono">#{sv.attributes.serial}</td>
-                          <td className="px-4 py-3 text-xs text-slate-400 hidden sm:table-cell">
-                            {sv.attributes['created-by'] || <span className="text-slate-500">runner</span>}
-                          </td>
-                          <td className="px-4 py-3 text-xs hidden sm:table-cell">
-                            {runData ? (
+              <>
+                {/* Desktop (md+): the sortable table, unchanged columns. Actions
+                    are proper buttons (Download/Rollback/Delete), not tiny text. */}
+                <div className="hidden md:block bg-slate-800/50 rounded-lg border border-slate-700/50 overflow-hidden">
+                  <table className="w-full">
+                    <thead>
+                      <tr className="border-b border-slate-700/50">
+                        <SortableHeader label="Serial" sortKey="serial" sortState={stateSortState} onSort={toggleStateSort} />
+                        <SortableHeader label="Created By" sortKey="created-by" sortState={stateSortState} onSort={toggleStateSort} />
+                        <th className="px-4 py-3 text-left text-xs font-medium text-slate-400 uppercase tracking-wider">Run</th>
+                        <SortableHeader label="Size" sortKey="size" sortState={stateSortState} onSort={toggleStateSort} />
+                        <SortableHeader label="Created" sortKey="created-at" sortState={stateSortState} onSort={toggleStateSort} className="hidden lg:table-cell" />
+                        <th className="px-4 py-3 text-right text-xs font-medium text-slate-400 uppercase tracking-wider">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-700/30">
+                      {sortedState.map((sv) => {
+                        const maxSerial = Math.max(...stateVersions.map(s => s.attributes.serial))
+                        const isLatest = sv.attributes.serial === maxSerial
+                        const runData = sv.relationships?.run?.data
+                        return (
+                          <tr key={sv.id} className="hover:bg-slate-700/20 transition-colors">
+                            <td className="px-4 py-3 text-sm text-slate-200 font-mono">#{sv.attributes.serial}</td>
+                            <td className="px-4 py-3 text-xs text-slate-400">
+                              {sv.attributes['created-by'] || <span className="text-slate-500">runner</span>}
+                            </td>
+                            <td className="px-4 py-3 text-xs">
+                              {runData ? (
+                                <a href={`/workspaces/${workspaceId}/runs/${runData.id}`} className="text-brand-400 hover:text-brand-300">
+                                  {runData.id.replace('run-', '').slice(0, 8)}
+                                </a>
+                              ) : (
+                                <span className="text-slate-500">-</span>
+                              )}
+                            </td>
+                            <td className="px-4 py-3 text-xs text-slate-400">
+                              {sv.attributes.size > 0 ? `${(sv.attributes.size / 1024).toFixed(1)} KB` : '-'}
+                            </td>
+                            <td className="px-4 py-3 text-xs text-slate-500 hidden lg:table-cell">
+                              {sv.attributes['created-at'] ? new Date(sv.attributes['created-at']).toLocaleString() : ''}
+                            </td>
+                            <td className="px-4 py-3 text-right">
+                              <div className="flex items-center justify-end gap-2">
+                                <button
+                                  onClick={() => downloadStateVersion(sv)}
+                                  className="px-2.5 py-1 rounded-md text-xs font-medium bg-slate-700 hover:bg-slate-600 text-slate-200"
+                                >
+                                  Download
+                                </button>
+                                {!isLatest && perms['can-create-state-versions'] && (
+                                  <button
+                                    onClick={() => setConfirmStateAction({ action: 'rollback', sv })}
+                                    className="px-2.5 py-1 rounded-md text-xs font-medium bg-amber-900/40 hover:bg-amber-900/60 text-amber-300"
+                                  >
+                                    Rollback
+                                  </button>
+                                )}
+                                {!isLatest && perms['can-update'] && (
+                                  <button
+                                    onClick={() => setConfirmStateAction({ action: 'delete', sv })}
+                                    className="px-2.5 py-1 rounded-md text-xs font-medium bg-red-900/40 hover:bg-red-900/60 text-red-300"
+                                  >
+                                    Delete
+                                  </button>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Mobile (< md): state versions as cards so nothing is dropped —
+                    the table hid Created-by / Run / Size / Created behind
+                    sm/md/lg breakpoints, leaving phones with only the serial. */}
+                <MobileCardList>
+                  {sortedState.map((sv) => {
+                    const maxSerial = Math.max(...stateVersions.map(s => s.attributes.serial))
+                    const isLatest = sv.attributes.serial === maxSerial
+                    const runData = sv.relationships?.run?.data
+                    return (
+                      <MobileCard
+                        key={sv.id}
+                        title={<span className="text-sm font-mono text-slate-200">#{sv.attributes.serial}</span>}
+                        badge={
+                          isLatest && (
+                            <span className="shrink-0 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-green-900/40 text-green-300">
+                              latest
+                            </span>
+                          )
+                        }
+                        fields={[
+                          {
+                            label: 'Created by',
+                            value: sv.attributes['created-by'] || 'runner',
+                            valueClassName: sv.attributes['created-by'] ? 'text-slate-300' : 'text-slate-500',
+                          },
+                          {
+                            label: 'Run',
+                            value: runData ? (
                               <a href={`/workspaces/${workspaceId}/runs/${runData.id}`} className="text-brand-400 hover:text-brand-300">
                                 {runData.id.replace('run-', '').slice(0, 8)}
                               </a>
                             ) : (
-                              <span className="text-slate-500">-</span>
-                            )}
-                          </td>
-                          <td className="px-4 py-3 text-xs text-slate-400 hidden md:table-cell">
-                            {sv.attributes.size > 0 ? `${(sv.attributes.size / 1024).toFixed(1)} KB` : '-'}
-                          </td>
-                          <td className="px-4 py-3 text-xs text-slate-500 hidden lg:table-cell">
-                            {sv.attributes['created-at'] ? new Date(sv.attributes['created-at']).toLocaleString() : ''}
-                          </td>
-                          <td className="px-4 py-3 text-right space-x-2">
+                              '—'
+                            ),
+                            valueClassName: 'text-slate-400',
+                          },
+                          {
+                            label: 'Size',
+                            value: sv.attributes.size > 0 ? `${(sv.attributes.size / 1024).toFixed(1)} KB` : '—',
+                            valueClassName: 'text-slate-400',
+                          },
+                          {
+                            label: 'Created',
+                            value: sv.attributes['created-at'] ? new Date(sv.attributes['created-at']).toLocaleString() : '—',
+                            valueClassName: 'text-slate-500',
+                          },
+                        ]}
+                        actions={
+                          <>
                             <button
-                              onClick={async () => {
-                                try {
-                                  const resp = await apiFetch(`/api/v2/state-versions/${sv.id}/download`)
-                                  const blob = await resp.blob()
-                                  const url = URL.createObjectURL(blob)
-                                  const a = document.createElement('a')
-                                  a.href = url
-                                  a.download = `state-${sv.attributes.serial}.json`
-                                  a.click()
-                                  URL.revokeObjectURL(url)
-                                } catch {
-                                  alert('Failed to download state file')
-                                }
-                              }}
-                              className="text-xs text-brand-400 hover:text-brand-300"
+                              onClick={() => downloadStateVersion(sv)}
+                              className="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-700 hover:bg-slate-600 text-slate-200"
                             >
                               Download
                             </button>
                             {!isLatest && perms['can-create-state-versions'] && (
                               <button
                                 onClick={() => setConfirmStateAction({ action: 'rollback', sv })}
-                                className="text-xs text-amber-400 hover:text-amber-300"
+                                className="px-3 py-1.5 rounded-lg text-xs font-medium bg-amber-900/40 hover:bg-amber-900/60 text-amber-300"
                               >
                                 Rollback
                               </button>
@@ -3022,18 +3317,18 @@ function WorkspaceDetailContent() {
                             {!isLatest && perms['can-update'] && (
                               <button
                                 onClick={() => setConfirmStateAction({ action: 'delete', sv })}
-                                className="text-xs text-red-400 hover:text-red-300"
+                                className="px-3 py-1.5 rounded-lg text-xs font-medium bg-red-900/40 hover:bg-red-900/60 text-red-300"
                               >
                                 Delete
                               </button>
                             )}
-                          </td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
-              </div>
+                          </>
+                        }
+                      />
+                    )
+                  })}
+                </MobileCardList>
+              </>
             )}
           </div>
         )}
@@ -3063,67 +3358,128 @@ function WorkspaceDetailContent() {
             ) : cvs.length === 0 ? (
               <EmptyState message="No configuration versions yet. They appear here as soon as a `terraform plan` uploads or a VCS push triggers a run." />
             ) : (
-              <div className="overflow-hidden rounded-xl border border-slate-800">
-                <table className="w-full text-sm">
-                  <thead className="bg-slate-900/50 text-slate-400">
-                    <tr>
-                      <th className="w-8 px-2 py-3" aria-hidden />
-                      <th className="px-4 py-3 text-left font-medium">ID</th>
-                      <th className="px-4 py-3 text-left font-medium">Source</th>
-                      <th className="px-4 py-3 text-left font-medium">Status</th>
-                      <th className="px-4 py-3 text-left font-medium">Created</th>
-                      <th className="px-4 py-3 text-right font-medium">Download</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-800">
-                    {cvs.map(cv => {
-                      const isCurrent = cv.id === cvCurrentId
-                      const isSelected = cvSelected.has(cv.id)
-                      const canDownload = cv.attributes.status === 'uploaded'
-                      return (
-                        <tr key={cv.id} className={isSelected ? 'bg-blue-900/20' : 'hover:bg-slate-900/30 transition-colors'}>
-                          <td className="px-2 py-3 align-middle">
-                            <input
-                              type="checkbox"
-                              aria-label={`Select ${cv.id} for compare`}
-                              checked={isSelected}
-                              onChange={() => toggleCvSelected(cv.id)}
-                              className="h-4 w-4"
-                              disabled={!canDownload}
-                            />
-                          </td>
-                          <td className="px-4 py-3 font-mono text-xs">
-                            <span className="text-slate-200">{cv.id}</span>
-                            {isCurrent && (
-                              <span className="ml-2 inline-flex items-center rounded bg-green-900/40 px-1.5 py-0.5 text-xs font-medium text-green-300">
-                                current
-                              </span>
-                            )}
-                          </td>
-                          <td className="px-4 py-3 text-slate-300">{cv.attributes.source}</td>
-                          <td className="px-4 py-3 text-slate-400">{cv.attributes.status}</td>
-                          <td className="px-4 py-3 text-slate-400">
-                            {new Date(cv.attributes['created-at']).toLocaleString()}
-                          </td>
-                          <td className="px-4 py-3 text-right">
-                            {canDownload ? (
+              <>
+                {/* Desktop (md+): the table with per-row compare checkboxes. */}
+                <div className="hidden md:block overflow-hidden rounded-xl border border-slate-800">
+                  <table className="w-full text-sm">
+                    <thead className="bg-slate-900/50 text-slate-400">
+                      <tr>
+                        <th className="w-8 px-2 py-3" aria-hidden />
+                        <th className="px-4 py-3 text-left font-medium">ID</th>
+                        <th className="px-4 py-3 text-left font-medium">Source</th>
+                        <th className="px-4 py-3 text-left font-medium">Status</th>
+                        <th className="px-4 py-3 text-left font-medium">Created</th>
+                        <th className="px-4 py-3 text-right font-medium">Download</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800">
+                      {cvs.map(cv => {
+                        const isCurrent = cv.id === cvCurrentId
+                        const isSelected = cvSelected.has(cv.id)
+                        const canDownload = cv.attributes.status === 'uploaded'
+                        return (
+                          <tr key={cv.id} className={isSelected ? 'bg-blue-900/20' : 'hover:bg-slate-900/30 transition-colors'}>
+                            <td className="px-2 py-3 align-middle">
+                              <input
+                                type="checkbox"
+                                aria-label={`Select ${cv.id} for compare`}
+                                checked={isSelected}
+                                onChange={() => toggleCvSelected(cv.id)}
+                                className="h-4 w-4"
+                                disabled={!canDownload}
+                              />
+                            </td>
+                            <td className="px-4 py-3 font-mono text-xs">
+                              <span className="text-slate-200">{cv.id}</span>
+                              {isCurrent && (
+                                <span className="ml-2 inline-flex items-center rounded bg-green-900/40 px-1.5 py-0.5 text-xs font-medium text-green-300">
+                                  current
+                                </span>
+                              )}
+                            </td>
+                            <td className="px-4 py-3 text-slate-300">{cv.attributes.source}</td>
+                            <td className="px-4 py-3 text-slate-400">{cv.attributes.status}</td>
+                            <td className="px-4 py-3 text-slate-400">
+                              {new Date(cv.attributes['created-at']).toLocaleString()}
+                            </td>
+                            <td className="px-4 py-3 text-right">
+                              {canDownload ? (
+                                <button
+                                  type="button"
+                                  onClick={() => downloadCv(cv.id)}
+                                  className="text-blue-400 hover:text-blue-300 text-sm font-medium"
+                                >
+                                  Download
+                                </button>
+                              ) : (
+                                <span className="text-slate-600 text-sm">—</span>
+                              )}
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Mobile (< md): cards — the 6-column table is 529px wide and was
+                    clipped by its overflow-hidden wrapper on a phone, hiding
+                    Created + Download entirely. Cards keep every field plus the
+                    compare checkbox and Download as tap targets. */}
+                <MobileCardList>
+                  {cvs.map(cv => {
+                    const isCurrent = cv.id === cvCurrentId
+                    const isSelected = cvSelected.has(cv.id)
+                    const canDownload = cv.attributes.status === 'uploaded'
+                    return (
+                      <MobileCard
+                        key={cv.id}
+                        title={<span className="min-w-0 text-xs font-mono text-slate-200 break-all">{cv.id}</span>}
+                        badge={
+                          isCurrent && (
+                            <span className="shrink-0 inline-flex items-center rounded bg-green-900/40 px-1.5 py-0.5 text-xs font-medium text-green-300">
+                              current
+                            </span>
+                          )
+                        }
+                        fields={[
+                          { label: 'Source', value: cv.attributes.source },
+                          { label: 'Status', value: cv.attributes.status, valueClassName: 'text-slate-400' },
+                          {
+                            label: 'Created',
+                            value: new Date(cv.attributes['created-at']).toLocaleString(),
+                            valueClassName: 'text-slate-400',
+                          },
+                        ]}
+                        actions={
+                          <>
+                            <label className={`flex items-center gap-1.5 text-xs ${canDownload ? 'text-slate-400' : 'text-slate-600'}`}>
+                              <input
+                                type="checkbox"
+                                aria-label={`Select ${cv.id} for compare`}
+                                checked={isSelected}
+                                onChange={() => toggleCvSelected(cv.id)}
+                                className="h-4 w-4"
+                                disabled={!canDownload}
+                              />
+                              Compare
+                            </label>
+                            {canDownload && (
                               <button
                                 type="button"
                                 onClick={() => downloadCv(cv.id)}
-                                className="text-blue-400 hover:text-blue-300 text-sm font-medium"
+                                className="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-700 hover:bg-slate-600 text-slate-200"
                               >
                                 Download
                               </button>
-                            ) : (
-                              <span className="text-slate-600 text-sm">—</span>
                             )}
-                          </td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
-              </div>
+                          </>
+                        }
+                      />
+                    )
+                  })}
+                </MobileCardList>
+              </>
             )}
 
             {cvDiffError && (
@@ -3292,8 +3648,8 @@ function WorkspaceDetailContent() {
 
                   return (
                     <div key={nc.id} className="bg-slate-800/50 rounded-lg border border-slate-700/50 overflow-hidden">
-                      <div className="px-4 py-3 flex items-center gap-3">
-                        <div className="flex-1 min-w-0">
+                      <div className="px-4 py-3 flex flex-col gap-3 sm:flex-row sm:items-center">
+                        <div className="min-w-0 sm:flex-1">
                           <div className="flex items-center gap-2 mb-1">
                             <span className="text-sm font-medium text-slate-200 truncate">{a.name}</span>
                             <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${destTypeBadge(a['destination-type'])}`}>
@@ -3311,7 +3667,7 @@ function WorkspaceDetailContent() {
                             ))}
                           </div>
                         </div>
-                        <div className="flex items-center gap-1.5 shrink-0">
+                        <div className="flex flex-wrap items-center gap-2 sm:shrink-0">
                           {lastResponse && (
                             <span className={`text-xs ${lastResponse.success ? 'text-green-400' : 'text-red-400'}`}>
                               {lastResponse.success ? 'OK' : `Err ${lastResponse.status}`}
@@ -3319,30 +3675,23 @@ function WorkspaceDetailContent() {
                           )}
                           {perms['can-update'] && (
                             <>
-                              <button onClick={() => handleToggleNotif(nc)} className="text-xs text-brand-400 hover:text-brand-300 px-1">
+                              <button onClick={() => handleToggleNotif(nc)} className="px-2.5 py-1 rounded-md text-xs font-medium bg-slate-700 hover:bg-slate-600 text-slate-200">
                                 {a.enabled ? 'Disable' : 'Enable'}
                               </button>
                               <button onClick={() => handleVerifyNotif(nc.id)} disabled={verifyingId === nc.id}
-                                className="text-xs text-brand-400 hover:text-brand-300 px-1">
+                                className="px-2.5 py-1 rounded-md text-xs font-medium bg-slate-700 hover:bg-slate-600 text-slate-200 disabled:opacity-50">
                                 {verifyingId === nc.id ? 'Sending...' : 'Verify'}
                               </button>
                             </>
                           )}
                           {responses.length > 0 && (
                             <button onClick={() => setExpandedNotifId(isExpanded ? null : nc.id)}
-                              className="text-xs text-slate-400 hover:text-slate-200 px-1">
+                              className="px-2.5 py-1 rounded-md text-xs font-medium bg-slate-700 hover:bg-slate-600 text-slate-300">
                               {isExpanded ? 'Hide' : 'History'}
                             </button>
                           )}
                           {perms['can-update'] && (
-                            deleteNotifId === nc.id ? (
-                              <>
-                                <button onClick={() => setDeleteNotifId(null)} className="text-xs text-slate-400 hover:text-slate-200 px-1">Cancel</button>
-                                <button onClick={() => handleDeleteNotif(nc.id)} className="text-xs text-red-400 hover:text-red-300 px-1">Confirm</button>
-                              </>
-                            ) : (
-                              <button onClick={() => setDeleteNotifId(nc.id)} className="text-xs text-red-400 hover:text-red-300 px-1">Delete</button>
-                            )
+                            <button onClick={() => handleDeleteNotif(nc.id)} className="px-2.5 py-1 rounded-md text-xs font-medium bg-red-900/40 hover:bg-red-900/60 text-red-300">Delete</button>
                           )}
                         </div>
                       </div>
@@ -3438,10 +3787,14 @@ function WorkspaceDetailContent() {
                 {runTasks.map((rt) => {
                   const a = rt.attributes
                   return (
-                    <div key={rt.id} className="bg-slate-800/50 rounded-lg border border-slate-700/50 px-4 py-3 flex items-center gap-3">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-1">
-                          <span className="text-sm font-medium text-slate-200 truncate">{a.name}</span>
+                    <div key={rt.id} className="bg-slate-800/50 rounded-lg border border-slate-700/50 px-4 py-3 flex flex-col gap-3 sm:flex-row sm:items-center">
+                      <div className="min-w-0 sm:flex-1">
+                        {/* Below sm the name takes its own line (w-full) so the
+                            badges wrap beneath it instead of squeezing it to an
+                            ellipsis; sm+ they share one line and the name
+                            truncates as before. */}
+                        <div className="flex flex-wrap items-center gap-2 mb-1">
+                          <span className="w-full sm:w-auto text-sm font-medium text-slate-200 break-words sm:truncate">{a.name}</span>
                           <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${stageBadge(a.stage)}`}>
                             {a.stage.replace('_', ' ')}
                           </span>
@@ -3454,21 +3807,19 @@ function WorkspaceDetailContent() {
                             {a.enabled ? 'Enabled' : 'Disabled'}
                           </span>
                         </div>
-                        <div className="text-xs text-slate-500 truncate">{a.url}</div>
+                        <div className="text-xs text-slate-500 break-all sm:truncate">{a.url}</div>
                       </div>
                       {perms['can-update'] && (
-                        <div className="flex items-center gap-1.5 shrink-0">
-                          <button onClick={() => handleToggleRunTask(rt)} className="text-xs text-brand-400 hover:text-brand-300 px-1">
+                        <div className="flex items-center gap-2 sm:shrink-0">
+                          <button onClick={() => handleToggleRunTask(rt)} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-700 hover:bg-slate-600 text-slate-200">
                             {a.enabled ? 'Disable' : 'Enable'}
                           </button>
-                          {deleteRtId === rt.id ? (
-                            <>
-                              <button onClick={() => setDeleteRtId(null)} className="text-xs text-slate-400 hover:text-slate-200 px-1">Cancel</button>
-                              <button onClick={() => handleDeleteRunTask(rt.id)} className="text-xs text-red-400 hover:text-red-300 px-1">Confirm</button>
-                            </>
-                          ) : (
-                            <button onClick={() => setDeleteRtId(rt.id)} className="text-xs text-red-400 hover:text-red-300 px-1">Delete</button>
-                          )}
+                          <button
+                            onClick={() => handleDeleteRunTask(rt.id)}
+                            className="px-3 py-1.5 rounded-lg text-xs font-medium bg-red-900/40 hover:bg-red-900/60 text-red-300"
+                          >
+                            Delete
+                          </button>
                         </div>
                       )}
                     </div>
