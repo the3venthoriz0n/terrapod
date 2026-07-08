@@ -1,6 +1,6 @@
 'use client'
 
-import { Suspense, useEffect, useState, useCallback, useMemo, useRef } from 'react'
+import { Suspense, useEffect, useLayoutEffect, useState, useCallback, useMemo, useRef } from 'react'
 import { useRouter, useParams, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import Convert from 'ansi-to-html'
@@ -9,13 +9,13 @@ import { PageHeader } from '@/components/page-header'
 import { ConnectionStatus } from '@/components/connection-status'
 import { LoadingSpinner } from '@/components/loading-spinner'
 import { ErrorBanner } from '@/components/error-banner'
-import { PlanSummaryBadges } from '@/components/plan-summary-badges'
 import { PlanAiSummary } from '@/components/plan-ai-summary'
-import { ResourceUsage } from '@/components/resource-usage'
+import { ResourceUsage, parseMemoryToBytes, humanBytes } from '@/components/resource-usage'
 import { getAuthState, isAdmin } from '@/lib/auth'
 import { apiFetch } from '@/lib/api'
 import { useRunEvents } from '@/lib/use-run-events'
-import { ChevronsDown, ChevronsUp, ArrowDownToLine, RefreshCw } from 'lucide-react'
+import { useIsMobile } from '@/lib/use-media-query'
+import { ArrowDownToLine, RefreshCw, Download, Copy, Check, Palette } from 'lucide-react'
 
 interface RunActions {
   'is-confirmable': boolean
@@ -84,6 +84,12 @@ interface PlanApply {
   }
 }
 
+// Top-level run views (#721). Overview summarises the run; each aspect with
+// more to show has its own tab — AI analysis and OPA policy only appear when
+// the run actually has them. Details holds the metadata / timeline / run
+// options / resource usage.
+type RunView = 'overview' | 'ai' | 'opa' | 'plan' | 'apply' | 'details'
+
 const ansiConverter = new Convert({
   fg: '#cbd5e1',
   bg: 'transparent',
@@ -109,6 +115,164 @@ function downloadFile(content: string, filename: string) {
   URL.revokeObjectURL(url)
 }
 
+function fmtDuration(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000))
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  const rs = s % 60
+  if (m < 60) return `${m}m ${rs}s`
+  const h = Math.floor(m / 60)
+  return `${h}h ${m % 60}m`
+}
+
+function relTime(iso: string, now: number): string {
+  const t = Date.parse(iso)
+  if (Number.isNaN(t)) return ''
+  const s = Math.floor((now - t) / 1000)
+  if (s < 60) return 'just now'
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m} minute${m === 1 ? '' : 's'} ago`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h} hour${h === 1 ? '' : 's'} ago`
+  const d = Math.floor(h / 24)
+  return `${d} day${d === 1 ? '' : 's'} ago`
+}
+
+// The "at a glance" strip at the top of Overview (#721) — the run's current
+// state and what it's doing right now. Live phases pulse and show a ticking
+// elapsed timer; terminal states show how long ago they finished.
+function RunActivityHeader({
+  status,
+  timestamps,
+  planOnly,
+  isConfirmable,
+}: {
+  status: string
+  timestamps: Record<string, string>
+  planOnly: boolean
+  isConfirmable: boolean
+}) {
+  const live = ['pending', 'queued', 'planning', 'confirmed', 'applying', 'canceling'].includes(status)
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!live) return
+    const h = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(h)
+  }, [live])
+
+  type Info = { label: string; activity: string; dot: string; card: string; sinceKey?: string }
+  const map: Record<string, Info> = {
+    pending: { label: 'Pending', activity: 'Preparing the run', dot: 'bg-slate-400', card: 'border-slate-700/50 bg-slate-800/40' },
+    queued: { label: 'Queued', activity: 'Waiting for an available agent', dot: 'bg-yellow-400', card: 'border-yellow-800/40 bg-yellow-900/10', sinceKey: 'queued-at' },
+    planning: { label: 'Planning', activity: 'Running terraform plan', dot: 'bg-yellow-400', card: 'border-yellow-800/40 bg-yellow-900/10', sinceKey: 'planning-at' },
+    planned: {
+      label: 'Planned',
+      activity: isConfirmable ? 'Waiting for you to confirm & apply' : planOnly ? 'Speculative plan complete' : 'Plan complete',
+      dot: 'bg-blue-400',
+      card: isConfirmable ? 'border-blue-800/40 bg-blue-900/10' : 'border-slate-700/50 bg-slate-800/40',
+      sinceKey: 'planned-at',
+    },
+    confirmed: { label: 'Confirmed', activity: 'Starting apply', dot: 'bg-blue-400', card: 'border-blue-800/40 bg-blue-900/10', sinceKey: 'confirmed-at' },
+    applying: { label: 'Applying', activity: 'Running terraform apply', dot: 'bg-yellow-400', card: 'border-yellow-800/40 bg-yellow-900/10', sinceKey: 'applying-at' },
+    canceling: { label: 'Canceling', activity: 'Stopping the run', dot: 'bg-yellow-400', card: 'border-yellow-800/40 bg-yellow-900/10' },
+    applied: { label: 'Applied', activity: 'Apply complete', dot: 'bg-green-400', card: 'border-green-800/40 bg-green-900/10', sinceKey: 'applied-at' },
+    errored: { label: 'Errored', activity: 'Run failed', dot: 'bg-red-400', card: 'border-red-800/40 bg-red-900/10', sinceKey: 'errored-at' },
+    canceled: { label: 'Canceled', activity: 'Run canceled', dot: 'bg-slate-400', card: 'border-slate-700/50 bg-slate-800/40', sinceKey: 'canceled-at' },
+    discarded: { label: 'Discarded', activity: 'Plan discarded', dot: 'bg-slate-400', card: 'border-slate-700/50 bg-slate-800/40', sinceKey: 'discarded-at' },
+  }
+  const info = map[status] ?? { label: status, activity: '', dot: 'bg-slate-400', card: 'border-slate-700/50 bg-slate-800/40' }
+  const sinceTs = info.sinceKey ? timestamps[info.sinceKey] : undefined
+  const sinceMs = sinceTs ? Date.parse(sinceTs) : NaN
+  const elapsed = !Number.isNaN(sinceMs) ? now - sinceMs : undefined
+
+  return (
+    <div className={`mb-6 rounded-lg border p-4 flex items-center gap-3 ${info.card}`}>
+      <span className="relative flex h-3 w-3 flex-shrink-0">
+        {live && (
+          <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${info.dot}`} />
+        )}
+        <span className={`relative inline-flex rounded-full h-3 w-3 ${info.dot}`} />
+      </span>
+      <div className="min-w-0 flex-1">
+        <span className="text-sm font-semibold text-slate-100">{info.label}</span>
+        {info.activity && <span className="text-sm text-slate-400"> — {info.activity}</span>}
+      </div>
+      {live && elapsed !== undefined && (
+        <span className="text-xs text-slate-400 tabular-nums flex-shrink-0" title="Elapsed in this phase">
+          {fmtDuration(elapsed)}
+        </span>
+      )}
+      {!live && sinceTs && (
+        <span className="text-xs text-slate-500 flex-shrink-0">{relTime(sinceTs, now)}</span>
+      )}
+    </div>
+  )
+}
+
+type CardTone = 'neutral' | 'good' | 'warn' | 'bad' | 'active'
+
+const CARD_TONE: Record<CardTone, string> = {
+  neutral: 'text-slate-300',
+  good: 'text-green-300',
+  warn: 'text-amber-300',
+  bad: 'text-red-300',
+  active: 'text-blue-300',
+}
+
+// One at-a-glance summary card on Overview. When `onClick` is set the whole
+// card is a button that drills into the matching tab (#721).
+function SummaryCard({
+  label,
+  value,
+  sub,
+  tone = 'neutral',
+  onClick,
+}: {
+  label: string
+  value: React.ReactNode
+  sub?: string
+  tone?: CardTone
+  onClick?: () => void
+}) {
+  const base = 'rounded-lg border border-slate-700/50 bg-slate-800/40 p-4 text-left w-full'
+  const body = (
+    <>
+      <div className="text-xs uppercase tracking-wider text-slate-500 mb-1 flex items-center justify-between">
+        <span>{label}</span>
+        {onClick && <span className="text-slate-600" aria-hidden="true">›</span>}
+      </div>
+      <div className={`text-sm font-semibold ${CARD_TONE[tone]}`}>{value}</div>
+      {sub && <div className="text-xs text-slate-500 mt-0.5">{sub}</div>}
+    </>
+  )
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        className={`${base} transition-colors hover:bg-slate-700/50 hover:border-slate-600 focus:outline-none focus:ring-2 focus:ring-brand-500`}
+      >
+        {body}
+      </button>
+    )
+  }
+  return <div className={base}>{body}</div>
+}
+
+/**
+ * Log viewer (#722). The log is rendered inline with **no inner scrollbar** —
+ * the page itself is the scroll container, so the newest streaming lines can
+ * never be trapped inside an off-screen fixed-height box (the old
+ * `max-h-[600px] overflow-y-auto` bug: on a tall viewport the tail lived
+ * inside a small pane below the fold, and the pane growing from "no output"
+ * reflowed the page and shifted the window). Instead:
+ *  - the `<pre>` grows with the content and wraps long lines (no horizontal
+ *    scroll either — mobile-friendly);
+ *  - "follow" pins the **window** to the tail. We scroll in `useLayoutEffect`
+ *    (before paint) so an append/resize never shows a visible jump;
+ *  - at-bottom is measured against the **window**, so scrolling up to read
+ *    disengages follow and a floating "Jump to latest" affordance snaps back.
+ */
 function LogPanel({
   log,
   precomputedHtml,
@@ -128,8 +292,16 @@ function LogPanel({
   isStreaming: boolean
   onRefresh?: () => void
 }) {
+  // Scroll model is viewport-driven (#722, #719): on desktop the log is a
+  // normal inner-scroll pane (the familiar CI-log behaviour — it scrolls
+  // independently of the page); on a phone a nested scroll region is a touch
+  // trap, so the pane just expands and the *page* is the scroll container.
+  // Same component, the scroll target branches on width.
+  const isMobile = useIsMobile()
   const [colorMode, setColorMode] = useState(true)
-  const [following, setFollowing] = useState(true)
+  // Follow the tail by default while streaming; a static (finished) log opens
+  // at the top so the operator reads from the start.
+  const [following, setFollowing] = useState(isStreaming)
   const [copied, setCopied] = useState(false)
   const preRef = useRef<HTMLPreElement>(null)
 
@@ -147,42 +319,58 @@ function LogPanel({
     return stripAnsi(cleanLog)
   }, [cleanLog])
 
-  // Auto-scroll to bottom when following and content changes
-  useEffect(() => {
-    if (following && preRef.current) {
-      preRef.current.scrollTop = preRef.current.scrollHeight
+  const isAtBottom = useCallback(() => {
+    if (isMobile) {
+      const doc = document.documentElement
+      return window.innerHeight + window.scrollY >= doc.scrollHeight - 80
     }
-  }, [log, following])
-
-  const handleScroll = useCallback(() => {
     const el = preRef.current
-    if (!el) return
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40
-    setFollowing(atBottom)
-  }, [])
+    if (!el) return true
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 60
+  }, [isMobile])
 
-  const scrollToTop = useCallback(() => {
-    preRef.current?.scrollTo({ top: 0, behavior: 'smooth' })
-  }, [])
+  const scrollToBottom = useCallback(
+    (smooth = false) => {
+      const opts: ScrollToOptions = { behavior: smooth ? 'smooth' : 'auto' }
+      if (isMobile) window.scrollTo({ top: document.documentElement.scrollHeight, ...opts })
+      else preRef.current?.scrollTo({ top: preRef.current.scrollHeight, ...opts })
+    },
+    [isMobile],
+  )
 
-  const scrollToEnd = useCallback(() => {
-    if (preRef.current) {
-      preRef.current.scrollTo({ top: preRef.current.scrollHeight, behavior: 'smooth' })
+  // Pin the active scroller to the tail when following and the content changes.
+  // Runs in useLayoutEffect (synchronously before paint) so a fresh chunk or
+  // the panel's own resize never flashes an intermediate scroll position.
+  useLayoutEffect(() => {
+    if (following) scrollToBottom(false)
+  }, [log, colorMode, following, scrollToBottom])
+
+  // Track the scroller's position so scrolling up to read disengages follow and
+  // scrolling back to the bottom re-engages it. The listener is on the window
+  // (mobile) or the inner pane (desktop).
+  useEffect(() => {
+    const onScroll = () => {
+      setFollowing(isAtBottom())
     }
-  }, [])
+    const el = isMobile ? window : preRef.current
+    if (!el) return
+    el.addEventListener('scroll', onScroll, { passive: true })
+    onScroll()
+    return () => el.removeEventListener('scroll', onScroll)
+  }, [isMobile, isAtBottom])
 
   if (loading) {
     return (
-      <div className="bg-slate-900 rounded-lg border border-slate-700/50 overflow-hidden">
-        <div className="p-6"><LoadingSpinner /></div>
+      <div className="bg-slate-900 rounded-lg border border-slate-700/50 p-6">
+        <LoadingSpinner />
       </div>
     )
   }
 
   if (!log) {
     return (
-      <div className="bg-slate-900 rounded-lg border border-slate-700/50 overflow-hidden">
-        <div className="p-6 text-sm text-slate-500">{emptyMessage}</div>
+      <div className="bg-slate-900 rounded-lg border border-slate-700/50 p-6 text-sm text-slate-500">
+        {emptyMessage}
       </div>
     )
   }
@@ -191,121 +379,137 @@ function LogPanel({
 
   return (
     <div className="bg-slate-900 rounded-lg border border-slate-700/50 overflow-hidden">
-      <div className="flex items-center justify-between px-4 py-2 border-b border-slate-700/50 bg-slate-800/50">
+      <div className="flex items-center justify-between gap-2 flex-wrap px-4 py-2 border-b border-slate-700/50 bg-slate-800/50">
         <div className="flex items-center gap-2">
+          {/* Single Color toggle (checkbox-style): on = ANSI colours, off =
+              plain text. Consolidated from the old two-button Color/Plain pair
+              to free a slot on a phone-width toolbar row. */}
           <button
-            onClick={() => setColorMode(true)}
-            className={`px-2.5 py-1 text-xs rounded font-medium transition-colors ${
+            onClick={() => setColorMode((c) => !c)}
+            aria-pressed={colorMode}
+            className={`px-2 py-1 text-xs rounded font-medium transition-colors inline-flex items-center gap-1 ${
               colorMode
                 ? 'bg-brand-600 text-white'
                 : 'bg-slate-700 text-slate-400 hover:text-slate-200'
             }`}
+            title={colorMode ? 'Showing ANSI colours — click for plain text' : 'Showing plain text — click for colours'}
           >
-            Color
-          </button>
-          <button
-            onClick={() => setColorMode(false)}
-            className={`px-2.5 py-1 text-xs rounded font-medium transition-colors ${
-              !colorMode
-                ? 'bg-brand-600 text-white'
-                : 'bg-slate-700 text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            Plain
+            <Palette className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">Color</span>
           </button>
         </div>
+        {/* Two groups: utility icons (refresh/copy/download — icon-only on a
+            phone) and, separated by a divider, the scroll-nav controls
+            (Follow/End). End keeps its text label at every width — an unlabelled
+            down-arrow reads as a second Download next to the real one. */}
         <div className="flex items-center gap-2">
-          {onRefresh && (
+          <div className="flex items-center gap-1.5">
+            {onRefresh && (
+              <button
+                onClick={onRefresh}
+                className="px-2 py-1 text-xs rounded font-medium bg-slate-700 text-slate-400 hover:text-slate-200 transition-colors inline-flex items-center gap-1"
+                title="Refresh log"
+                aria-label="Refresh log"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Refresh</span>
+              </button>
+            )}
+            {plainContent && (
+              <button
+                onClick={() => {
+                  navigator.clipboard.writeText(plainContent)
+                  setCopied(true)
+                  setTimeout(() => setCopied(false), 2000)
+                }}
+                className="px-2 py-1 text-xs rounded font-medium bg-slate-700 text-slate-400 hover:text-slate-200 transition-colors inline-flex items-center gap-1"
+                title="Copy plain text to clipboard"
+                aria-label="Copy log to clipboard"
+              >
+                {copied ? <Check className="w-3.5 h-3.5 text-green-400" /> : <Copy className="w-3.5 h-3.5" />}
+                <span className="hidden sm:inline">{copied ? 'Copied!' : 'Copy'}</span>
+              </button>
+            )}
+            {/* One download button — the current Color/Plain mode decides what
+                it saves: colored (ANSI codes preserved) in Color mode, stripped
+                plain text in Plain mode. */}
             <button
-              onClick={onRefresh}
-              className="px-2.5 py-1 text-xs rounded font-medium bg-slate-700 text-slate-400 hover:text-slate-200 transition-colors inline-flex items-center gap-1"
-              title="Refresh log"
+              onClick={() =>
+                colorMode
+                  ? downloadFile(cleanLog ?? '', `${shortId}-${phase}.log`)
+                  : downloadFile(plainContent, `${shortId}-${phase}-plain.log`)
+              }
+              className="px-2 py-1 text-xs rounded font-medium bg-slate-700 text-slate-400 hover:text-slate-200 transition-colors inline-flex items-center gap-1"
+              title={colorMode ? 'Download log (with ANSI colour codes)' : 'Download log (plain text)'}
+              aria-label="Download log"
             >
-              <RefreshCw className="w-3 h-3" />
-              Refresh
+              <Download className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Download</span>
             </button>
-          )}
-          {isStreaming && (
+          </div>
+          {/* Scroll-nav group, divider-separated from the utilities. Both keep
+              their text label at all widths so they never read as another icon. */}
+          <div className="flex items-center gap-1.5 border-l border-slate-700/60 pl-2">
+            {/* Follow appears only while the log is streaming: a persistent
+                auto-tail toggle. Green when engaged; the scroll listener also
+                flips it as the operator scrolls up/down. */}
+            {isStreaming && (
+              <button
+                onClick={() => {
+                  const next = !following
+                  setFollowing(next)
+                  if (next) scrollToBottom(true)
+                }}
+                aria-pressed={following}
+                className={`px-2 py-1 text-xs rounded font-medium transition-colors inline-flex items-center gap-1 ${
+                  following
+                    ? 'bg-green-600/20 text-green-300'
+                    : 'bg-slate-700 text-slate-400 hover:text-slate-200'
+                }`}
+                title={following ? 'Following the live tail — click to stop' : 'Follow the live tail'}
+              >
+                <span className={`w-1.5 h-1.5 rounded-full bg-green-400 ${following ? 'animate-pulse' : ''}`} />
+                Follow
+              </button>
+            )}
+            {/* "End" jumps to the tail (one-shot). Distinct from Follow: End is a
+                single scroll-to-bottom, always available; Follow is the streaming
+                auto-tail mode. Phones have a built-in scroll-to-top, so no Top. */}
             <button
-              onClick={() => {
-                setFollowing(f => !f)
-                if (!following && preRef.current) {
-                  preRef.current.scrollTop = preRef.current.scrollHeight
-                }
-              }}
-              className={`px-2.5 py-1 text-xs rounded font-medium transition-colors inline-flex items-center gap-1 ${
-                following
-                  ? 'bg-brand-600 text-white'
-                  : 'bg-slate-700 text-slate-400 hover:text-slate-200'
-              }`}
-              title={following ? 'Following output — click to stop' : 'Click to follow output'}
+              onClick={() => scrollToBottom(true)}
+              className="px-2 py-1 text-xs rounded font-medium bg-slate-700 text-slate-400 hover:text-slate-200 transition-colors inline-flex items-center gap-1"
+              title="Jump to the end of the log"
             >
-              <ArrowDownToLine className="w-3 h-3" />
-              Follow
+              <ArrowDownToLine className="w-3.5 h-3.5" />
+              End
             </button>
-          )}
-          <button
-            onClick={scrollToEnd}
-            className="px-2.5 py-1 text-xs rounded font-medium bg-slate-700 text-slate-400 hover:text-slate-200 transition-colors inline-flex items-center gap-1"
-            title="Jump to end"
-          >
-            <ChevronsDown className="w-3 h-3" />
-            End
-          </button>
-          <button
-            onClick={scrollToTop}
-            className="px-2.5 py-1 text-xs rounded font-medium bg-slate-700 text-slate-400 hover:text-slate-200 transition-colors inline-flex items-center gap-1"
-            title="Jump to top"
-          >
-            <ChevronsUp className="w-3 h-3" />
-            Top
-          </button>
-          {plainContent && (
-            <button
-              onClick={() => {
-                navigator.clipboard.writeText(plainContent)
-                setCopied(true)
-                setTimeout(() => setCopied(false), 2000)
-              }}
-              className="px-2.5 py-1 text-xs rounded font-medium bg-slate-700 text-slate-400 hover:text-slate-200 transition-colors"
-              title="Copy plain text to clipboard"
-            >
-              {copied ? 'Copied!' : 'Copy'}
-            </button>
-          )}
-          <button
-            onClick={() => downloadFile(cleanLog!, `${shortId}-${phase}.log`)}
-            className="px-2.5 py-1 text-xs rounded font-medium bg-slate-700 text-slate-400 hover:text-slate-200 transition-colors"
-            title="Download with ANSI color codes"
-          >
-            Download colored
-          </button>
-          <button
-            onClick={() => downloadFile(plainContent, `${shortId}-${phase}-plain.log`)}
-            className="px-2.5 py-1 text-xs rounded font-medium bg-slate-700 text-slate-400 hover:text-slate-200 transition-colors"
-            title="Download plain text (no color codes)"
-          >
-            Download plain
-          </button>
+          </div>
         </div>
       </div>
 
+      {/* On desktop (`md:`) the pane is a bounded inner-scroll region — it
+          scrolls independently of the page, the familiar CI-log behaviour.
+          Below `md` it has no max-height and no inner overflow, so it expands
+          and the page scrolls (no nested-scroll touch trap). The `md` boundary
+          matches `useIsMobile` (768px), so the CSS scroller and the JS scroll
+          logic agree. */}
       {colorMode ? (
         <pre
           ref={preRef}
-          onScroll={handleScroll}
-          className="p-4 text-sm text-slate-300 font-mono overflow-x-auto whitespace-pre-wrap max-h-[600px] overflow-y-auto"
+          data-testid={`log-pre-${phase}`}
+          className="p-4 text-sm text-slate-300 font-mono whitespace-pre-wrap break-words md:max-h-[70vh] md:overflow-y-auto"
           dangerouslySetInnerHTML={{ __html: htmlContent }}
         />
       ) : (
         <pre
           ref={preRef}
-          onScroll={handleScroll}
-          className="p-4 text-sm text-slate-300 font-mono overflow-x-auto whitespace-pre-wrap max-h-[600px] overflow-y-auto"
+          data-testid={`log-pre-${phase}`}
+          className="p-4 text-sm text-slate-300 font-mono whitespace-pre-wrap break-words md:max-h-[70vh] md:overflow-y-auto"
         >
           {plainContent}
         </pre>
       )}
+
     </div>
   )
 }
@@ -327,6 +531,7 @@ function RunDetailPageInner() {
   const workspaceId = params.id as string
   const runId = params.runId as string
 
+  const isMobile = useIsMobile()
   const [run, setRun] = useState<Run | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -343,6 +548,16 @@ function RunDetailPageInner() {
   // reload.
   const [aiSummaryRefresh, setAiSummaryRefresh] = useState(0)
 
+  // Lightweight status of the AI analysis + policy checks, used by the
+  // Overview summary cards and to decide whether the AI / OPA tabs appear.
+  // The full panels in those tabs self-fetch as before; these are just the
+  // at-a-glance rollups. `present:false` means the run has no such data (AI
+  // disabled / no policy sets), so the corresponding tab is hidden.
+  const [aiInfo, setAiInfo] = useState<{ present: boolean; status?: string; risk?: string } | null>(null)
+  const [policyInfo, setPolicyInfo] = useState<
+    { present: boolean; status?: string; passed?: number; total?: number; failed?: number } | null
+  >(null)
+
   // Offset tracking for incremental log fetching (byte position in raw log data)
   const planLogOffset = useRef(0)
   const applyLogOffset = useRef(0)
@@ -355,15 +570,34 @@ function RunDetailPageInner() {
 
   const searchParams = useSearchParams()
   const tabParam = searchParams.get('tab')
-  const [activeSection, setActiveSection] = useState<'plan' | 'apply'>(
-    tabParam === 'apply' ? 'apply' : 'plan'
-  )
 
-  const switchSection = useCallback((section: 'plan' | 'apply') => {
-    setActiveSection(section)
+  // Top-level view (#721): this is a faithful split — everything that was on
+  // the single-scroll run page stays on the default "Overview" view exactly as
+  // before (banners, policy, plan-summary, AI, actions, details, timeline,
+  // resource usage); ONLY the plan and apply logs move to their own top-level
+  // tabs (Plan Log / Apply Log). Nothing that was visible becomes hidden.
+  // Deep-link preservation: a legacy `?tab=plan|apply` link (and the
+  // transitional `?view=logs`/`?view=details`) with no explicit log view maps
+  // onto the matching tab, so old links from the runs list and the
+  // confirm-redirect keep working.
+  const viewParam = searchParams.get('view')
+  const KNOWN_VIEWS: RunView[] = ['overview', 'ai', 'opa', 'plan', 'apply', 'details']
+  const initialView: RunView = KNOWN_VIEWS.includes(viewParam as RunView)
+    ? (viewParam as RunView)
+    : viewParam === 'logs' || tabParam === 'plan'
+      ? 'plan'
+      : tabParam === 'apply'
+        ? 'apply'
+        : 'overview'
+  const [activeView, setActiveView] = useState<RunView>(initialView)
+
+  const switchView = useCallback((view: RunView) => {
+    setActiveView(view)
     const url = new URL(window.location.href)
-    url.searchParams.set('tab', section)
+    url.searchParams.set('view', view)
+    url.searchParams.delete('tab') // superseded by `view`
     window.history.replaceState({}, '', url.toString())
+    window.scrollTo({ top: 0 })
   }, [])
 
   const loadRun = useCallback(async () => {
@@ -379,10 +613,49 @@ function RunDetailPageInner() {
     }
   }, [runId])
 
+  // Overview rollups for AI + policy (see aiInfo/policyInfo above).
+  const loadAiInfo = useCallback(async () => {
+    try {
+      const res = await apiFetch(`/api/terrapod/v1/runs/${runId}/plan-summary`)
+      if (res.status === 404) { setAiInfo({ present: false }); return }
+      if (!res.ok) return
+      const d = await res.json()
+      const a = d.data?.attributes
+      setAiInfo({ present: true, status: a?.status, risk: a?.['risk-level'] })
+    } catch {
+      /* rollup is best-effort chrome */
+    }
+  }, [runId])
+
+  const loadPolicyInfo = useCallback(async () => {
+    try {
+      const res = await apiFetch(`/api/terrapod/v1/runs/${runId}/policy-evaluations`)
+      if (!res.ok) return
+      const d = await res.json()
+      const evals = (d.data || []) as unknown[]
+      const s = d.meta?.summary
+      setPolicyInfo({
+        present: evals.length > 0,
+        status: s?.status,
+        passed: s?.passed,
+        total: s?.total,
+        failed: s?.failed,
+      })
+    } catch {
+      /* rollup is best-effort chrome */
+    }
+  }, [runId])
+
   useEffect(() => {
     if (!getAuthState()) { router.push('/login'); return }
     loadRun()
   }, [router, loadRun])
+
+  // Keep the Overview rollups fresh: AI on mount + whenever a summary
+  // lifecycle SSE event bumps aiSummaryRefresh; policy on mount + whenever the
+  // run status changes (evals land during planning / an override can unblock).
+  useEffect(() => { loadAiInfo() }, [loadAiInfo, aiSummaryRefresh])
+  useEffect(() => { loadPolicyInfo() }, [loadPolicyInfo, run?.attributes.status])
 
   // Real-time updates via SSE — reload run on status change, refresh logs on log_updated
   const { connected: sseConnected } = useRunEvents(workspaceId, useCallback((event) => {
@@ -422,6 +695,24 @@ function RunDetailPageInner() {
       loadApplyLog(true).finally(() => setApplyLogLoading(false))
     }
   }, [run?.id, run?.attributes.status])
+
+  // Poll the streaming phase's log on a short interval (#722). SSE
+  // `log_updated` events are the primary trigger, but they can be missed
+  // (dropped connection, coalesced bursts) and only fire when the server
+  // relays new bytes; a lightweight incremental poll guarantees the client
+  // catches up even if an event is lost. The fetch is offset-based and
+  // fetch-locked, so a poll with nothing new is a cheap empty read. It only
+  // runs while the relevant phase is actively streaming.
+  useEffect(() => {
+    const status = run?.attributes.status
+    if (status !== 'planning' && status !== 'applying') return
+    const handle = window.setInterval(() => {
+      if (status === 'planning') loadPlanLog()
+      else if (status === 'applying') loadApplyLog()
+    }, 2500)
+    return () => window.clearInterval(handle)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- loadPlanLog/loadApplyLog are stable function declarations
+  }, [run?.attributes.status])
 
   async function fetchLogUrl(phase: 'plan' | 'apply'): Promise<string | null> {
     const urlRef = phase === 'plan' ? planLogUrl : applyLogUrl
@@ -537,10 +828,10 @@ function RunDetailPageInner() {
           return
         }
       }
-      // Confirm = applies — jump straight to the apply tab so the user sees
-      // the apply log streaming instead of the plan log they were just on.
+      // Confirm = applies — jump straight to the Apply Log tab so the user
+      // watches the apply stream instead of staying on the overview.
       if (action === 'confirm') {
-        switchSection('apply')
+        switchView('apply')
       }
       await loadRun()
     } catch (err) {
@@ -548,6 +839,24 @@ function RunDetailPageInner() {
     } finally {
       setActionLoading('')
     }
+  }
+
+  // Mobile is a fat-finger danger zone — a stray tap on Apply/Discard/Cancel/
+  // Retry mutates infra or state. On a phone, gate every state-changing action
+  // behind the browser-native confirm() (accessible, familiar, and reusable for
+  // any future mobile action); on desktop (larger targets, precise pointer)
+  // execute immediately, unchanged.
+  function requestAction(action: 'confirm' | 'discard' | 'cancel' | 'retry') {
+    if (isMobile) {
+      const prompts: Record<string, string> = {
+        confirm: 'Apply this run? This applies the plan and changes infrastructure.',
+        discard: 'Discard this plan?',
+        cancel: 'Cancel this run?',
+        retry: 'Retry this run?',
+      }
+      if (!window.confirm(prompts[action])) return
+    }
+    handleAction(action)
   }
 
   function statusColor(status: string): string {
@@ -574,6 +883,203 @@ function RunDetailPageInner() {
   const actions = attrs.actions
   const timestamps = attrs['status-timestamps'] || {}
 
+  // ── Tabs (#721) — AI + OPA appear only when the run has them; Apply only
+  // for plan+apply runs. `view` clamps to Overview if the active tab isn't
+  // available (e.g. a deep link to ?view=ai on a run with no AI summary).
+  // Labels shorten below `md` so all six tabs need less horizontal scroll on a
+  // phone ("Plan"/"Apply" vs "Plan Log"/"Apply Log"); desktop keeps the full
+  // words. The " Log" suffix is CSS-hidden on mobile — one DRY label.
+  const planLabel = (
+    <>
+      Plan<span className="hidden md:inline"> Log</span>
+    </>
+  )
+  const applyLabel = (
+    <>
+      Apply<span className="hidden md:inline"> Log</span>
+    </>
+  )
+  // Each tab carries a rich label (for the desktop bar) AND a plain-text label
+  // (for the mobile <select>, whose <option>s can't hold JSX).
+  const tabs: [RunView, React.ReactNode, string][] = [
+    ['overview', 'Overview', 'Overview'],
+    ...((aiInfo?.present ? [['ai', 'AI', 'AI analysis']] : []) as [RunView, React.ReactNode, string][]),
+    ...((policyInfo?.present ? [['opa', 'OPA', 'OPA policies']] : []) as [RunView, React.ReactNode, string][]),
+    ['plan', planLabel, 'Plan log'],
+    ...((attrs['plan-only'] ? [] : [['apply', applyLabel, 'Apply log']]) as [RunView, React.ReactNode, string][]),
+    ['details', 'Details', 'Details'],
+  ]
+  const availableViews = new Set(tabs.map((t) => t[0]))
+  const view: RunView = availableViews.has(activeView) ? activeView : 'overview'
+
+  // ── Overview summary cards ──────────────────────────────────────────
+  const ps = attrs['plan-summary']
+  const changeCard: { value: React.ReactNode; sub?: string; tone: CardTone } = (() => {
+    if (attrs['has-changes'] === false && !attrs['plan-only'] && ['planned', 'applied'].includes(attrs.status)) {
+      return { value: 'No changes', tone: 'neutral' }
+    }
+    if (ps) {
+      // Colour-coded counts (add=green, change=amber, destroy=red,
+      // replace=orange, import=blue) read far faster than a flat "+2 ~1 -3",
+      // with a plain-English breakdown underneath now there's room for it.
+      const segs: { k: string; sym: string; n: number; cls: string; word: string }[] = [
+        { k: 'add', sym: '+', n: ps.add, cls: 'text-green-400', word: 'to add' },
+        { k: 'change', sym: '~', n: ps.change, cls: 'text-amber-400', word: 'to change' },
+        { k: 'destroy', sym: '−', n: ps.destroy, cls: 'text-red-400', word: 'to destroy' },
+        { k: 'replace', sym: '±', n: ps.replace, cls: 'text-orange-400', word: 'to replace' },
+        { k: 'import', sym: '↓', n: ps.import, cls: 'text-blue-400', word: 'to import' },
+      ].filter((s) => s.n > 0)
+      if (segs.length === 0) return { value: 'No changes', tone: 'neutral' }
+      return {
+        value: (
+          <span className="flex flex-wrap gap-x-3 gap-y-0.5 tabular-nums">
+            {segs.map((s) => (
+              <span key={s.k} className={s.cls}>
+                {s.sym}
+                {s.n}
+              </span>
+            ))}
+          </span>
+        ),
+        sub: segs.map((s) => `${s.n} ${s.word}`).join(', '),
+        tone: 'neutral',
+      }
+    }
+    if (['pending', 'queued', 'planning'].includes(attrs.status)) return { value: 'Planning…', tone: 'neutral' }
+    return { value: '—', tone: 'neutral' }
+  })()
+
+  const aiCard: { value: string; sub?: string; tone: CardTone; clickable: boolean } = (() => {
+    if (!aiInfo) return { value: '…', tone: 'neutral', clickable: false }
+    if (!aiInfo.present) return { value: 'Not available', tone: 'neutral', clickable: false }
+    switch (aiInfo.status) {
+      case 'ready':
+        return {
+          value: 'Ready',
+          sub: aiInfo.risk ? `${aiInfo.risk} risk` : undefined,
+          tone: aiInfo.risk === 'high' || aiInfo.risk === 'critical' ? 'bad' : aiInfo.risk === 'medium' ? 'warn' : 'good',
+          clickable: true,
+        }
+      case 'pending':
+        return { value: 'Generating…', tone: 'active', clickable: true }
+      case 'skipped':
+        return { value: 'Skipped', tone: 'neutral', clickable: true }
+      case 'errored':
+        return { value: 'Failed', tone: 'bad', clickable: true }
+      default:
+        return { value: aiInfo.status ?? 'Available', tone: 'neutral', clickable: true }
+    }
+  })()
+
+  const policyCard: { value: string; sub?: string; tone: CardTone; clickable: boolean } = (() => {
+    if (!policyInfo) return { value: '…', tone: 'neutral', clickable: false }
+    if (!policyInfo.present) return { value: 'None', tone: 'neutral', clickable: false }
+    if (policyInfo.status === 'blocked') return { value: 'Blocked', sub: `${policyInfo.failed ?? 0} failed`, tone: 'bad', clickable: true }
+    if ((policyInfo.failed ?? 0) > 0)
+      return { value: 'Advisory issues', sub: `${policyInfo.passed}/${policyInfo.total} passed`, tone: 'warn', clickable: true }
+    return { value: 'Passed', sub: `${policyInfo.passed}/${policyInfo.total}`, tone: 'good', clickable: true }
+  })()
+
+  const resourceCard: { value: string; sub?: string; tone: CardTone } = (() => {
+    const exit = attrs['runner-exit-status']
+    const peak = attrs['peak-memory-bytes']
+    if (exit === 'oom' || exit === 'killed') return { value: 'Over limit', sub: 'OOM-killed', tone: 'bad' }
+    if (peak != null) {
+      const limit = parseMemoryToBytes(attrs['resource-memory']) * 2
+      const pct = Number.isFinite(limit) && limit > 0 ? Math.round((peak / limit) * 100) : null
+      const tone: CardTone = pct == null ? 'neutral' : pct >= 95 ? 'bad' : pct >= 80 ? 'warn' : 'good'
+      const label = pct == null ? 'Recorded' : pct >= 95 ? 'Near limit' : pct >= 80 ? 'High' : 'Within limits'
+      return { value: label, sub: `${humanBytes(peak)}${pct != null ? ` · ${pct}%` : ''}`, tone }
+    }
+    return { value: '—', tone: 'neutral' }
+  })()
+
+  const hasActions =
+    actions['is-confirmable'] ||
+    actions['is-discardable'] ||
+    actions['is-cancelable'] ||
+    actions['is-retryable']
+
+  // Status pills — reused in the desktop header (top-right) and, on mobile, in
+  // the combined status+actions row below the title (one row, not two).
+  const statusBadges = (
+    <>
+      {attrs['is-destroy'] && (
+        <span className="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-red-900/50 text-red-300">
+          destroy
+        </span>
+      )}
+      {attrs['plan-only'] && !attrs['is-destroy'] && (
+        <span className="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-cyan-900/50 text-cyan-300">
+          plan only
+        </span>
+      )}
+      <span className={`inline-flex items-center px-3 py-1 rounded-full text-sm font-medium ${statusColor(attrs.status)}`}>
+        {attrs.status}
+      </span>
+    </>
+  )
+
+  // Primary run actions — shared between the desktop bar and the mobile row.
+  // Labels go terse below `md` (Apply / Retry / Cancel) and full at `md+`
+  // (Confirm & Apply / Retry Run / Cancel Run). `requestAction` inserts the
+  // mobile confirm step; desktop runs immediately.
+  const actionButtons = (
+    <>
+      {actions['is-retryable'] && (
+        <button
+          onClick={() => requestAction('retry')}
+          disabled={!!actionLoading}
+          className="px-3 md:px-4 py-2 rounded-lg text-sm font-medium bg-brand-600 hover:bg-brand-500 disabled:bg-brand-800 disabled:text-brand-400 text-white transition-colors"
+        >
+          {actionLoading === 'retry' ? 'Retrying…' : (
+            <>
+              <span className="md:hidden">Retry</span>
+              <span className="hidden md:inline">Retry Run</span>
+            </>
+          )}
+        </button>
+      )}
+      {actions['is-confirmable'] && (
+        <button
+          onClick={() => requestAction('confirm')}
+          disabled={!!actionLoading}
+          className="px-3 md:px-4 py-2 rounded-lg text-sm font-medium bg-green-600 hover:bg-green-500 disabled:bg-green-800 disabled:text-green-400 text-white transition-colors"
+        >
+          {actionLoading === 'confirm' ? 'Confirming…' : (
+            <>
+              <span className="md:hidden">Apply</span>
+              <span className="hidden md:inline">Confirm &amp; Apply</span>
+            </>
+          )}
+        </button>
+      )}
+      {actions['is-discardable'] && (
+        <button
+          onClick={() => requestAction('discard')}
+          disabled={!!actionLoading}
+          className="px-3 md:px-4 py-2 rounded-lg text-sm font-medium bg-slate-600 hover:bg-slate-500 disabled:bg-slate-700 disabled:text-slate-400 text-white transition-colors"
+        >
+          {actionLoading === 'discard' ? 'Discarding…' : 'Discard'}
+        </button>
+      )}
+      {actions['is-cancelable'] && (
+        <button
+          onClick={() => requestAction('cancel')}
+          disabled={!!actionLoading}
+          className="px-3 md:px-4 py-2 rounded-lg text-sm font-medium bg-red-600 hover:bg-red-500 disabled:bg-red-800 disabled:text-red-400 text-white transition-colors"
+        >
+          {actionLoading === 'cancel' ? 'Canceling…' : (
+            <>
+              <span className="md:hidden">Cancel</span>
+              <span className="hidden md:inline">Cancel Run</span>
+            </>
+          )}
+        </button>
+      )}
+    </>
+  )
+
   return (
     <>
       <NavBar />
@@ -594,24 +1100,90 @@ function RunDetailPageInner() {
           actions={
             <div className="flex items-center gap-2">
               <ConnectionStatus connected={sseConnected} />
-              {attrs['is-destroy'] && (
-                <span className="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-red-900/50 text-red-300">
-                  destroy
-                </span>
-              )}
-              {attrs['plan-only'] && !attrs['is-destroy'] && (
-                <span className="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-cyan-900/50 text-cyan-300">
-                  plan only
-                </span>
-              )}
-              <span className={`inline-flex items-center px-3 py-1 rounded-full text-sm font-medium ${statusColor(attrs.status)}`}>
-                {attrs.status}
-              </span>
+              {/* Desktop keeps the status pills top-right beside the title. On
+                  mobile they move down to share one row with the action buttons
+                  (see below), so they're hidden here below `md`. */}
+              <div className="hidden md:flex items-center gap-2">{statusBadges}</div>
             </div>
           }
         />
 
         {error && <ErrorBanner message={error} />}
+
+        {/* Primary run actions live OUTSIDE the tab structure (#721) so they
+            stay reachable from any tab — confirm an apply while watching the
+            plan log, cancel from Details, retry from anywhere.
+
+            Mobile (`< md`): the status pills + action buttons share ONE row
+            below the title (the header pills are desktop-only). A tapped
+            state-changing action is gated behind a native confirm() (see
+            requestAction). This row always renders on mobile so the status pill
+            has a home even when there are no actions. */}
+        <div className="md:hidden flex flex-wrap items-center gap-x-4 gap-y-2 mb-6">
+          <div className="flex items-center gap-2">{statusBadges}</div>
+          <div className="flex flex-wrap items-center gap-2">{actionButtons}</div>
+        </div>
+        {/* Desktop (`md+`): buttons only (pills are in the header), single
+            click — unchanged. */}
+        {hasActions && (
+          <div className="hidden md:flex flex-wrap gap-3 mb-6">{actionButtons}</div>
+        )}
+
+        {/* View tabs (#721) — Overview summarises the run; AI and OPA appear
+            only when the run has them; each log gets its own full-height tab;
+            Details holds metadata / timeline / resource usage / run options.
+            Six tabs don't fit a phone, so the strip scrolls horizontally with a
+            right-edge fade cueing there's more (mobile only — desktop fits). */}
+        {/* Mobile (`< md`): a native <select> view picker — one tap, native
+            picker, no awful horizontal-scroll strip. Desktop (`md+`): the tab
+            bar (all tabs fit, so no scroll/fade needed). One `tabs` source, two
+            viewport-driven presentations; the URL stays the source of truth via
+            switchView either way. */}
+        <div className="mb-6 md:hidden">
+          <label htmlFor="run-view-select" className="sr-only">
+            Run section
+          </label>
+          <select
+            id="run-view-select"
+            value={view}
+            onChange={(e) => switchView(e.target.value as RunView)}
+            className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm font-medium text-slate-100 focus:border-brand-500 focus:outline-none"
+          >
+            {tabs.map(([v, , text]) => (
+              <option key={v} value={v}>
+                {text}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="hidden border-b border-slate-700/50 mb-6 md:block">
+          <div className="flex gap-1 -mb-px">
+            {tabs.map(([v, label]) => (
+              <button
+                key={v}
+                onClick={() => switchView(v)}
+                aria-current={view === v ? 'page' : undefined}
+                className={`px-4 py-2 text-sm font-medium border-b-2 whitespace-nowrap transition-colors ${
+                  view === v
+                    ? 'border-brand-500 text-brand-400'
+                    : 'border-transparent text-slate-400 hover:text-slate-200 hover:border-slate-600'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {view === 'overview' && (
+        <>
+        {/* Run status + live activity at a glance (#721). */}
+        <RunActivityHeader
+          status={attrs.status}
+          timestamps={timestamps}
+          planOnly={attrs['plan-only']}
+          isConfirmable={actions['is-confirmable']}
+        />
 
         {/* Destroy run warning */}
         {attrs['is-destroy'] && (
@@ -661,12 +1233,65 @@ function RunDetailPageInner() {
           </div>
         )}
 
+        {/* At-a-glance summary cards (#721) — each drills into its own tab. */}
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
+          <SummaryCard
+            label="Changes"
+            value={changeCard.value}
+            sub={changeCard.sub}
+            tone={changeCard.tone}
+            onClick={() => switchView('plan')}
+          />
+          <SummaryCard
+            label="AI analysis"
+            value={aiCard.value}
+            sub={aiCard.sub}
+            tone={aiCard.tone}
+            onClick={aiCard.clickable ? () => switchView('ai') : undefined}
+          />
+          <SummaryCard
+            label="Policy checks"
+            value={policyCard.value}
+            sub={policyCard.sub}
+            tone={policyCard.tone}
+            onClick={policyCard.clickable ? () => switchView('opa') : undefined}
+          />
+          <SummaryCard
+            label="Resources"
+            value={resourceCard.value}
+            sub={resourceCard.sub}
+            tone={resourceCard.tone}
+            onClick={() => switchView('details')}
+          />
+        </div>
+        </>
+        )}
+
+        {/* AI analysis tab (#401) — its own full panel; the tab only appears
+            when the run has an AI summary. */}
+        {view === 'ai' && (
+          <PlanAiSummary runId={runId.replace(/^run-/, '')} refreshKey={aiSummaryRefresh} />
+        )}
+
+        {/* OPA policy tab (#343) — full evaluations + admin override; the tab
+            only appears when the run has policy checks. */}
+        {view === 'opa' && (
+          <PolicyPanel
+            runId={runId}
+            runStatus={attrs.status}
+            onChanged={() => {
+              loadRun()
+              loadPolicyInfo()
+            }}
+          />
+        )}
+
+        {view === 'details' && (
+        <>
         {/* Resource usage panel (#430) — peak memory/CPU alongside the
-            workspace's requested/limit, plus an OOM tag when the
-            listener observed an OOMKilled / exit-137 termination. The
-            ResourceUsage component returns null when no peak data is
-            present (pre-#430 runs), so this block is safe to render
-            unconditionally for new runs. */}
+            workspace's requested/limit, plus an OOM tag when the listener
+            observed an OOMKilled / exit-137 termination. Returns null when no
+            peak data is present (pre-#430 runs). */}
         <div className="mb-6">
           <ResourceUsage
             resourceMemory={attrs['resource-memory']}
@@ -674,82 +1299,6 @@ function RunDetailPageInner() {
             runnerExitStatus={attrs['runner-exit-status']}
           />
         </div>
-
-        {/* OPA policy evaluations (#343) */}
-        <PolicyPanel runId={runId} runStatus={attrs.status} onChanged={loadRun} />
-
-        {/* No-changes notice — explains why Confirm & Apply isn't shown.
-            Only relevant for plan-and-apply runs (plan-only runs simply
-            report the plan and have no concept of an apply phase). */}
-        {attrs['has-changes'] === false && !attrs['plan-only'] && ['planned', 'applied'].includes(attrs.status) && (
-          <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 p-4 mb-6 text-sm text-slate-300">
-            <span className="font-medium text-slate-100">No changes.</span>{' '}
-            {attrs.status === 'applied'
-              ? 'Plan reported nothing to do; the apply was skipped automatically.'
-              : 'Plan reported nothing to do — there is nothing to apply.'}
-          </div>
-        )}
-
-        {/* Plan summary badges — render whenever the runner has uploaded
-            and parsed the JSON plan, regardless of run status. Sits
-            immediately above the action row so the operator sees the
-            shape of the change next to Confirm & Apply.
-            Suppress when the bigger No-changes callout above will already
-            render (non-plan-only runs in planned/applied with has-changes
-            false) — the callout is the more explanatory surface and the
-            pill would just duplicate it. */}
-        {attrs['plan-summary'] &&
-          !(
-            attrs['has-changes'] === false &&
-            !attrs['plan-only'] &&
-            ['planned', 'applied'].includes(attrs.status)
-          ) && <PlanSummaryBadges summary={attrs['plan-summary']} />}
-
-        {/* Action buttons */}
-        {(actions['is-confirmable'] || actions['is-discardable'] || actions['is-cancelable'] || actions['is-retryable']) && (
-          <div className="flex gap-3 mb-6">
-            {actions['is-retryable'] && (
-              <button
-                onClick={() => handleAction('retry')}
-                disabled={!!actionLoading}
-                className="px-4 py-2 rounded-lg text-sm font-medium bg-brand-600 hover:bg-brand-500 disabled:bg-brand-800 disabled:text-brand-400 text-white transition-colors"
-              >
-                {actionLoading === 'retry' ? 'Retrying...' : 'Retry Run'}
-              </button>
-            )}
-            {actions['is-confirmable'] && (
-              <button
-                onClick={() => handleAction('confirm')}
-                disabled={!!actionLoading}
-                className="px-4 py-2 rounded-lg text-sm font-medium bg-green-600 hover:bg-green-500 disabled:bg-green-800 disabled:text-green-400 text-white transition-colors"
-              >
-                {actionLoading === 'confirm' ? 'Confirming...' : 'Confirm & Apply'}
-              </button>
-            )}
-            {actions['is-discardable'] && (
-              <button
-                onClick={() => handleAction('discard')}
-                disabled={!!actionLoading}
-                className="px-4 py-2 rounded-lg text-sm font-medium bg-slate-600 hover:bg-slate-500 disabled:bg-slate-700 disabled:text-slate-400 text-white transition-colors"
-              >
-                {actionLoading === 'discard' ? 'Discarding...' : 'Discard'}
-              </button>
-            )}
-            {actions['is-cancelable'] && (
-              <button
-                onClick={() => handleAction('cancel')}
-                disabled={!!actionLoading}
-                className="px-4 py-2 rounded-lg text-sm font-medium bg-red-600 hover:bg-red-500 disabled:bg-red-800 disabled:text-red-400 text-white transition-colors"
-              >
-                {actionLoading === 'cancel' ? 'Canceling...' : 'Cancel Run'}
-              </button>
-            )}
-          </div>
-        )}
-
-        {/* AI plan summary / failure analysis (#401) — renders nothing
-            when the feature is off or no row exists for this plan. */}
-        <PlanAiSummary runId={runId.replace(/^run-/, '')} refreshKey={aiSummaryRefresh} />
 
         {/* Run metadata */}
         <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 p-6 mb-6">
@@ -871,37 +1420,11 @@ function RunDetailPageInner() {
               ))}
           </div>
         </div>
+        </>
+        )}
 
-        {/* Log tabs */}
-        <div className="border-b border-slate-700/50 mb-4">
-          <div className="flex gap-1 -mb-px">
-            <button
-              onClick={() => switchSection('plan')}
-              className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
-                activeSection === 'plan'
-                  ? 'border-brand-500 text-brand-400'
-                  : 'border-transparent text-slate-400 hover:text-slate-200 hover:border-slate-600'
-              }`}
-            >
-              Plan Output
-            </button>
-            {!attrs['plan-only'] && (
-              <button
-                onClick={() => switchSection('apply')}
-                className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
-                  activeSection === 'apply'
-                    ? 'border-brand-500 text-brand-400'
-                    : 'border-transparent text-slate-400 hover:text-slate-200 hover:border-slate-600'
-                }`}
-              >
-                Apply Output
-              </button>
-            )}
-          </div>
-        </div>
-
-        {/* Plan output */}
-        {activeSection === 'plan' && (
+        {/* Plan log */}
+        {view === 'plan' && (
           <LogPanel
             log={planLog}
             precomputedHtml={planHtml}
@@ -914,8 +1437,8 @@ function RunDetailPageInner() {
           />
         )}
 
-        {/* Apply output */}
-        {activeSection === 'apply' && (
+        {/* Apply log */}
+        {view === 'apply' && (
           <LogPanel
             log={applyLog}
             precomputedHtml={applyHtml}
