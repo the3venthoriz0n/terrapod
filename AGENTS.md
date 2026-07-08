@@ -215,6 +215,19 @@ Mobile is a **first-class target**, not an afterthought — a UI change that is
 not mobile-friendly is **not done** and must not merge. The full brief and the
 staged plan live in issue **#719**; the rules a contributor must follow:
 
+- **Two axes — width drives *layout*, pointer drives *touch-friendliness*.**
+  These are independent signals; never infer one from the other (a wide
+  tablet/foldable is touch; a narrow desktop window is not). **Viewport width**
+  governs layout density — cards↔table, tab-bar↔`<select>` picker, hidden
+  columns — and is expressed in **CSS** (`sm:`/`md:`/`lg:`, `@container`), or in
+  JS via `useIsMobile()` only where *layout behaviour* must branch.
+  **Pointer type** governs touch-friendliness — destructive-action `confirm()`
+  guards, avoiding nested scroll traps, tap-target sizing — via the `touch:` /
+  `fine:` CSS custom variants (in `globals.css`) or `useIsTouch()`
+  (`= matchMedia('(pointer: coarse)')`, reflecting the *primary* pointer, in
+  `web/src/lib/use-media-query.ts`). So the same page can be a roomy
+  desktop-width layout **and** touch-safe at once. Still **never** branch on the
+  user agent for either axis.
 - **One DRY, viewport-driven implementation.** No forked `Mobile*`/`Desktop*`
   component trees, and **never** branch on the user agent
   (`navigator.userAgent`, device-detect libraries, server-side "is this a
@@ -234,6 +247,30 @@ staged plan live in issue **#719**; the rules a contributor must follow:
   at any width; **URL is the source of truth for tab/view state** (it must
   survive reload / back / deep-link — no `useState`-only tabs). Prefer
   drill-down to a route over cramming panels into one dense page.
+- **Confirmation guards on mutating actions (hard).** Two tiers, and they are
+  not the same: **(1) an irreversible destructive action — a delete or remove
+  with no undo (delete variable / notification / run task, remove run trigger /
+  remote-state consumer, delete state version, delete workspace) — MUST prompt a
+  `confirm()` in BOTH modes** (touch *and* precise pointer). Losing data on a
+  single stray click is a desktop hazard too, not just a touch one. **(2) Any
+  other single-tap mutation that is reversible or lower-stakes (enable/disable
+  toggles, lock/unlock, queue a destroy run, …) MUST prompt a `confirm()` on
+  touch** (via `useIsTouch()`), where a mis-tap is easy; on a precise pointer it
+  may proceed without one. Do NOT rely on a bespoke inline two-step
+  (Delete→Confirm swap) as the guard — use the native `confirm()` so the tiers
+  stay uniform. Form *submits* after deliberate data entry (create/edit save)
+  are not "single-tap mutations" and don't need a guard.
+- **Actions are real buttons, not clickable text (hard).** Any control that
+  performs an action — a row action (Edit / Delete / Enable-Disable / Verify /
+  Download / Rollback / Remove), a form Save/Cancel, a toggle — MUST render as a
+  proper button with a background, padding, and rounded corners (e.g.
+  `px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-700 hover:bg-slate-600`;
+  destructive variants use `bg-red-900/40 … text-red-300`), giving it a real
+  tap target (~44px). Do NOT ship "little clickable chunks of text" — a bare
+  coloured-text `<button>` (e.g. `text-xs text-brand-400` with no background) —
+  as an action affordance: it reads as a link, is a poor tap target on touch,
+  and is easy to miss on desktop. Genuine *navigation* (to another
+  page/resource) may still be a text link; *actions* are buttons.
 - **Enforcement (this is what blocks non-mobile-friendly changes):** the
   `responsive` Playwright project runs the suite at a **phone viewport**
   (`e2e/tests/responsive.spec.ts`) and is the **mobile guard**; the existing
