@@ -243,6 +243,14 @@ test.describe('Responsive harness (phone viewport)', () => {
     await expect(page.getByText(rtName)).toBeVisible();
   });
 
+  test('catalog browse page renders without horizontal scroll at phone width', async ({ page }) => {
+    // The catalog browse page is a responsive card grid (or an empty state);
+    // either way it must not scroll horizontally on a phone.
+    await page.goto('/catalog');
+    await expect(page.getByRole('heading', { name: 'Service Catalog' })).toBeVisible({ timeout: 15_000 });
+    await expectNoHorizontalPageScroll(page);
+  });
+
   test('registry module list renders as a card grid at phone width', async ({ page }) => {
     // The registry list pages are responsive card grids (grid-cols-1 at phone),
     // so a seeded module shows as a full-width card with no horizontal scroll.
