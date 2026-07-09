@@ -13,14 +13,23 @@ Terrapod is **not** a fork of Terraform or OpenTofu. It orchestrates them.
 
 ## Is Terrapod for you?
 
-Terrapod earns its keep when the network, the credentials boundary, or the migration is the hard part. You're likely a fit if:
+If you want an open, self-hosted alternative to Terraform Enterprise / HCP Terraform, yes. Terrapod is the **full** platform layer, not a thin slice of it — point your existing `cloud` blocks, `go-tfe` clients, and CI/CD at it and it just works.
 
-- **You run Terraform/OpenTofu across networks a SaaS can't reach into** — isolated VPCs, other regions, on-prem, or behind egress-only firewalls. Terrapod's control plane **never needs a route into an execution cluster**: runners dial *out* and create Jobs locally, so a cluster only ever makes outbound connections. VCS is polled outbound too, and cached providers/binaries can be served with no upstream internet.
-- **State and cloud credentials must not leave your boundary** — Terrapod is self-hosted end to end. One Helm release owns the API, state, registry, and caches; nothing is handed to an external control plane.
-- **You're leaving Terraform Enterprise / HCP Terraform** (cost, licensing, or the Replicated end-of-life) and want an open, self-hosted landing spot — often paired with a move to OpenTofu. The [`terrapod-migrate`](docs/migration.md) CLI imports workspaces, variables, variable sets, VCS wiring, state, run triggers, notifications, agent pools, and registry signing keys with a dry-run-first, reversible flow.
-- **You're a Kubernetes-native platform team** — Terrapod deploys only on Kubernetes, via Helm, and runs as just another workload in your stack.
+Everything you'd expect from the platform tier is here and first-class:
 
-If none of these describe you — a single team, a freely-reachable network, happy on a hosted service — a managed platform may be less to operate. Terrapod is built for the harder-network, own-your-boundary case.
+- Workspaces with versioned remote state (locking, rollback), the full plan → apply run lifecycle, and both VCS-driven and CLI-driven runs.
+- A GPG-signed private module + provider registry, variables & variable sets, run triggers, notifications, drift detection, and a polished, mobile-friendly web UI.
+- Label-based RBAC and OPA/Rego policy-as-code (the open-source equivalent of Sentinel) — advisory or mandatory.
+- API compatibility with the TFE V2 surface the `terraform`/`tofu` CLI and `go-tfe` speak, so most tooling points at it unchanged.
+
+And a few **standout, first-class features** you may really like:
+
+- **Runs anywhere your network is awkward.** Runners dial *out* and create Kubernetes Jobs locally, so the control plane never needs inbound reach into an execution cluster — isolated VPCs, other regions, on-prem, or behind egress-only firewalls. VCS is polled outbound, and a pull-through provider mirror + binary cache (with an air-gap sealed mode) lets runs resolve providers and binaries with no upstream internet.
+- **Zero static cloud credentials.** Runs and the platform reach cloud APIs through Kubernetes workload identity (AWS IRSA, GCP WIF, Azure WI) — nothing long-lived to store, leak, or rotate.
+- **An AI-augmented review layer** — optional and off by default — plan change-summaries, risk assessment, failure analysis, and a chat to interrogate a run.
+- **A reversible, dry-run-first migration** off TFE / HCP Terraform / Atlantis with [`terrapod-migrate`](docs/migration.md) — preview everything, apply, verify parity, and roll back cleanly.
+
+The one hard requirement is Kubernetes, and that's a low bar: Terrapod is a single Helm release, a one-node [k3s](https://k3s.io/) VM is plenty to start, and `make eval` spins up a throwaway [k3d](https://k3d.io/)/kind cluster in one command.
 
 ## Why Terrapod
 
@@ -192,6 +201,7 @@ quickstart pulls released images, so the only wait is the image download.
 
 - **API-first** -- every UI action is backed by a public API endpoint
 - **BFF pattern** -- Next.js frontend is the single ingress entry point; browser never talks to the API directly
+- **Responsive, mobile-first web UI** -- the whole UI adapts from desktop tables to touch-friendly card layouts on phones; one DRY viewport-driven implementation, no separate mobile app
 - **Kubernetes-native** -- deployed exclusively via Helm chart; runner Jobs are ephemeral K8s Jobs
 - **ARC-pattern execution** -- listener creates Jobs on demand (like GitHub Actions Runner Controller)
 - **OpenTofu-first** -- [OpenTofu](https://opentofu.org/) is the recommended execution backend; `terraform` is also supported
@@ -356,7 +366,7 @@ See [docs/authentication.md](docs/authentication.md) for setup guides.
 | Database | PostgreSQL |
 | Cache / Sessions | Redis |
 | Object storage | AWS S3, Azure Blob, GCS, or filesystem (native SDKs) |
-| Frontend | Next.js 16 / React 19 / TypeScript / Tailwind CSS / Radix UI |
+| Frontend | Next.js 16 / React 19 / TypeScript / Tailwind CSS / Radix UI (responsive, mobile-first) |
 | Runner listener | Python (same codebase as API) |
 | Auth | authlib (OIDC), python3-saml (SAML) |
 | Deployment | Helm chart on Kubernetes |
