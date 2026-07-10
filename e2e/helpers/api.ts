@@ -437,6 +437,7 @@ export async function seedStateVersion(
   token: string,
   workspaceId: string,
   serial = 1,
+  md5 = 'd41d8cd98f00b204e9800998ecf8427e',
 ): Promise<string> {
   const res = await fetch(
     `${API_URL}/api/v2/workspaces/${workspaceId}/state-versions`,
@@ -451,7 +452,7 @@ export async function seedStateVersion(
           type: 'state-versions',
           attributes: {
             serial,
-            md5: 'd41d8cd98f00b204e9800998ecf8427e',
+            md5,
             lineage: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
           },
         },
@@ -462,6 +463,43 @@ export async function seedStateVersion(
     throw new Error(`Create state version failed: ${res.status} ${await res.text()}`);
   }
   return (await res.json()).data.id as string;
+}
+
+/**
+ * Seed a state version AND upload real state content, so the state graph
+ * (#765) has resources to parse. `resources` is a Terraform-state v4 resource
+ * list; each entry needs at least {mode, type, name, instances:[{dependencies}]}.
+ * Returns the state-version id.
+ */
+export async function seedStateVersionWithContent(
+  token: string,
+  workspaceId: string,
+  resources: unknown[],
+  serial = 1,
+): Promise<string> {
+  const body = JSON.stringify({
+    version: 4,
+    terraform_version: '1.9.0',
+    serial,
+    lineage: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    outputs: {},
+    resources,
+  });
+  // The content endpoint enforces that the uploaded bytes hash to the md5
+  // declared at create time, so compute it up front and declare it.
+  const md5 = createHash('md5').update(body).digest('hex');
+  const svId = await seedStateVersion(token, workspaceId, serial, md5);
+  // Content upload is unauthenticated — the state-version UUID is the capability
+  // token (matches go-tfe's presigned-style upload).
+  const res = await fetch(`${API_URL}/api/v2/state-versions/${svId}/content`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+  });
+  if (!res.ok) {
+    throw new Error(`Upload state content failed: ${res.status} ${await res.text()}`);
+  }
+  return svId;
 }
 
 /**
