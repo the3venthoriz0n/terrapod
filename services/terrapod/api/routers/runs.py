@@ -58,7 +58,7 @@ from terrapod.db.models import (
 )
 from terrapod.db.session import get_db
 from terrapod.logging_config import get_logger
-from terrapod.services import agent_pool_service, run_service
+from terrapod.services import agent_pool_service, plan_graph_service, run_service
 from terrapod.services.workspace_rbac_service import (
     resolve_workspace_capabilities_for,
 )
@@ -154,6 +154,9 @@ def _run_json(
                 "allow-empty-apply": run.allow_empty_apply,
                 "is-drift-detection": run.is_drift_detection,
                 "has-changes": run.has_changes,
+                # Whether a structured JSON plan exists — gates the Impact
+                # graph tab in the UI (#761).
+                "has-json-output": bool(run.has_json_output),
                 "plan-summary": _plan_summary_attr(run),
                 "workspace-name": workspace_name,
                 "workspace-has-vcs": workspace_has_vcs,
@@ -982,6 +985,42 @@ async def show_plan_summary(
                 },
                 "relationships": {
                     "plan": {"data": {"id": f"plan-{run.id}", "type": "plans"}},
+                    "run": {"data": {"id": f"run-{run.id}", "type": "runs"}},
+                },
+            }
+        }
+    )
+
+
+@extensions_router.get("/runs/{run_id}/impact-graph")
+async def show_impact_graph(
+    run_id: str = Path(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """Compact plan dependency graph for the run-page Impact graph (#761).
+
+    Terrapod-native. Derives ``{nodes, edges, meta}`` server-side from the
+    run's stored plan JSON (see ``plan_graph_service``) and returns it inline —
+    small payload, browser-reachable through the BFF in every storage backend
+    (unlike ``/plans/{id}/json-output``, which 302s to a presigned URL that the
+    browser can't reach with the filesystem backend). 404 when the run produced
+    no JSON plan output.
+    """
+    run = await _get_run(run_id, db)
+    await _require_run_ws_capability(run, cap.RUN_READ, user, db)
+
+    graph = await plan_graph_service.get_impact_graph(run)
+    if graph is None:
+        raise HTTPException(status_code=404, detail="no plan graph for this run")
+
+    return JSONResponse(
+        content={
+            "data": {
+                "id": f"impact-graph-{run.id}",
+                "type": "impact-graphs",
+                "attributes": graph,
+                "relationships": {
                     "run": {"data": {"id": f"run-{run.id}", "type": "runs"}},
                 },
             }
