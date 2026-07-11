@@ -13,10 +13,14 @@ OpenTofu (`tofu`) as pluggable execution backends. It is **not** a fork of the
 Terraform/OpenTofu engine — it orchestrates them. Deployed via a Helm chart on
 Kubernetes. License: MPL-2.0. Current release: **v1.0.0** (stable).
 
-## Is Terrapod free / open source?
+## Is Terrapod free / open source? Will it always be?
 
-Yes — MPL-2.0 (file-level copyleft, the same license as OpenTofu). There is no
-per-resource, per-run, or per-seat pricing; you run it on your own infrastructure.
+Yes, and yes. Terrapod is MPL-2.0 (file-level copyleft, the same license as
+OpenTofu), with no per-resource, per-run, or per-seat pricing — you run it on
+your own infrastructure. And it will **stay** free: there is no commercial
+edition, no open-core split, no paid "enterprise" tier, and no plan to introduce
+one. The complete platform is in the public repository; nothing here is gated
+behind a paid plan.
 
 ## Is there a free alternative to Terraform Cloud or Terraform Enterprise?
 
@@ -110,6 +114,40 @@ So you can consolidate a fragmented estate — different engines, versions, and
 workflows, coming off different tools — onto one control plane **without first
 standardising everyone**. See [Migration](migration.md) and
 [Alternatives](alternatives.md).
+
+## Does Terrapod work with monorepos, dedicated repos, and mixed repos (Terraform alongside app code and Helm)?
+
+Yes — all three repository layouts are first-class, and you don't restructure
+your repos to adopt Terrapod:
+
+- **Dedicated repo** (one repo per workspace). Point the workspace at the repo;
+  runs use the root, or a `working-directory` subpath.
+- **Monorepo** (many Terraform root modules in one repo).
+  [Autodiscovery](autodiscovery.md) auto-creates a workspace the first time a PR
+  or push touches a directory matching your glob rules (with `ignore_paths`),
+  each scoped to its own directory — no pre-provisioning a workspace per folder.
+  Modelled on Atlantis's `autodiscover`, and proven on monorepos with thousands
+  of root modules.
+- **Mixed repo** (Terraform is one folder beside application code, Helm charts,
+  CI config, docs, …). Set the workspace's `working-directory` (or explicit
+  `trigger-prefixes`) to the Terraform subtree, and Terrapod **only starts a run
+  when files under that prefix change** — a commit that touches just the app
+  code or the Helm chart doesn't trigger a plan — while **sparse-fetching only
+  that subtree**, so a large mixed repo doesn't pull everything on every run.
+
+See [Autodiscovery](autodiscovery.md) and [VCS workflows](vcs-workflows.md).
+
+## Can I size CPU and memory per workspace, or is it one worker size for everything?
+
+Per workspace. Each workspace carries its own `resource-cpu` and
+`resource-memory` (Kubernetes requests; the runner Job's limits are computed
+automatically at 2× the request), and the values are snapshotted onto each run,
+so changing a workspace later doesn't disturb runs already in flight. A small
+workspace can run in a fraction of a CPU while a large, provider-heavy one gets
+several GB — you don't have to size a single shared worker for the worst case.
+If a run is OOM-killed, Terrapod surfaces the peak memory it reached and names
+the exact value to raise before retrying. See
+[Per-workspace resources](architecture.md#per-workspace-resources).
 
 ## How is Terrapod different from Terrakube?
 
