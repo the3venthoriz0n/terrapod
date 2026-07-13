@@ -122,6 +122,14 @@
     "empty": {
       "none": "Nay work decks yet. Forge one to set sail.",
       "noMatch": "Nay work decks match this sift."
+    },
+    "group": {
+      "label": "Group",
+      "flat": "Flat",
+      "repo": "Repository",
+      "repoPath": "Repository + Path",
+      "collapseAll": "Collapse all",
+      "expandAll": "Expand all"
     }
   },
   "status": {

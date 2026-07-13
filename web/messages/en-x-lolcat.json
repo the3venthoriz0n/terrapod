@@ -122,6 +122,14 @@
     "empty": {
       "none": "No wurkspaces yet. Maek one to get startd.",
       "noMatch": "No wurkspaces match dis filter."
+    },
+    "group": {
+      "label": "Group",
+      "flat": "Flat",
+      "repo": "Repository",
+      "repoPath": "Repository + Path",
+      "collapseAll": "Collapse all",
+      "expandAll": "Expand all"
     }
   },
   "status": {
