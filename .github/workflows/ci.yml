@@ -110,6 +110,10 @@ jobs:
         run: npm run lint
       - name: TypeScript type-check
         run: npm run type-check
+      - name: i18n completeness (every offered locale is 100% or it is not offered — #767)
+        run: npm run i18n:check
+      - name: i18n no-hardcoded-strings (no new untranslated JSX literals — #767)
+        run: npm run i18n:lint
 
   # ── Provider Lint ─────────────────────────────────────
   provider-lint:
@@ -317,7 +321,7 @@ jobs:
             # Root-level tests/*.py are NOT auto-collected by the directory
             # shards below — each must be listed here explicitly, or it silently
             # never runs in CI. All of these are pure-unit (no Postgres/Redis/S3).
-            paths: tests/auth tests/runner tests/storage tests/ai_eval tests/test_logging_config.py tests/test_dependency_pins.py tests/test_api_sdk_contract.py tests/test_schema_version.py tests/test_gpg_verify.py tests/test_http_retry.py tests/test_db_iam_auth.py tests/test_redis_iam_auth.py
+            paths: tests/auth tests/runner tests/storage tests/ai_eval tests/config tests/db tests/helm tests/test_logging_config.py tests/test_dependency_pins.py tests/test_api_sdk_contract.py tests/test_schema_version.py tests/test_gpg_verify.py tests/test_http_retry.py tests/test_db_iam_auth.py tests/test_redis_iam_auth.py
             pytest_args: -n auto
           - name: services-api
             paths: tests/services tests/api
@@ -444,7 +448,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4
+        uses: github/codeql-action/init@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
@@ -452,7 +456,7 @@ jobs:
           config-file: .github/codeql/codeql-config.yml
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4
+        uses: github/codeql-action/analyze@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
         with:
           category: codeql-${{ matrix.language }}
 
@@ -876,7 +880,7 @@ jobs:
 
       - name: Upload SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
         with:
           sarif_file: semgrep-results.sarif
           category: semgrep
@@ -1268,7 +1272,7 @@ jobs:
 
       - name: Upload SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
         with:
           sarif_file: trivy-${{ matrix.image }}-${{ matrix.arch }}.sarif
           category: trivy-${{ matrix.image }}-${{ matrix.arch }}

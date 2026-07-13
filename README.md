@@ -9,6 +9,8 @@ Get the collaboration, governance, state, registry, and UI layer of a commercial
 
 Terrapod is **not** a fork of Terraform or OpenTofu. It orchestrates them.
 
+In short: it's a free, **self-hosted, open-source alternative to Terraform Cloud (HCP Terraform) and Terraform Enterprise** — a **TACOS** (Terraform Automation and Collaboration Software) platform for teams standardizing on `terraform`, OpenTofu (`tofu`), or Terragrunt. And it will **stay** free — there is no commercial edition, no open-core split, no paid tier, and no per-resource pricing, now or planned; the complete platform is in this repository. New here and comparing options? Start with **[Alternatives to Terraform Enterprise / Terraform Cloud](docs/alternatives.md)** and the **[FAQ](docs/faq.md)**.
+
 ![Terrapod run detail — plan output with an AI change summary, per-policy OPA pass/fail, and resource-change cards](docs/images/run-detail.png)
 *A single run: plan output, an AI-generated change summary and risk assessment, per-policy OPA results, and resource-change cards.*
 
@@ -158,7 +160,7 @@ Everything below is implemented and shipped today.
 | Notifications | Webhook (HMAC-SHA512), Slack (Block Kit), and email alerts on run events |
 | Interactive Slack app | Outbound Socket Mode app — `/terrapod` account linking + opt-in per-workspace run notifications with RBAC-checked Approve/Discard buttons; multiple deployments can share one Slack workspace |
 | Run tasks | Pre/post-plan webhook hooks for external validation |
-| Execution hooks | Admin-managed custom shell steps run in the runner Job at pre_init / pre_plan / post_plan / pre_apply / post_apply, associated with workspaces |
+| Execution hooks | **Custom execution steps** — admin-managed shell run in the runner Job at pre_init / pre_plan / post_plan / pre_apply / post_apply, associated with workspaces (`pre_init` is the setup/tooling/auth slot; custom runner images cover heavier needs) |
 | Service catalog | No-code self-service provisioning over the module registry |
 | Impact graph | Interactive dependency + blast-radius view of a plan on the run page — module-clustered, click a resource to light up its transitive downstream impact |
 | Estate topology | Whole-estate dependency graph — workspaces + modules wired by run-triggers, remote-state, and module links; group by any label / pool / name prefix; RBAC-filtered; accessible table fallback |
@@ -400,6 +402,7 @@ See [docs/authentication.md](docs/authentication.md) for setup guides.
 | [Forward Proxy & Custom CA](docs/deployment-proxy.md) | Route all outbound HTTP(S) through a corporate proxy and trust a private/MITM CA, across every component including runner Jobs |
 | [Security Hardening](docs/security-hardening.md) | Pod hardening defaults, secrets, network posture |
 | [Supply-chain Verification](docs/supply-chain-verification.md) | Verify Terrapod's own signed images + SBOM/SLSA attestations, and how cached binaries/providers are verified against publisher signatures |
+| [Versioning & Support](docs/versioning-and-support.md) | SemVer contract per surface, version-skew support, deprecation window, support matrix |
 | [Known Limitations](docs/known-limitations.md) | What Terrapod does not (yet) do — deployment, scope, and feature constraints, stated plainly |
 | [Production Checklist](docs/production-checklist.md) | Pre-go-live checklist for a production deployment |
 | [Disaster Recovery](docs/disaster-recovery.md) | Break-glass state recovery, shipped DB backup CronJob + restore-verification DR drill, per-backend object-storage protection |
@@ -475,9 +478,9 @@ Reports are written to `reports/pentest/`. See [SECURITY.md](SECURITY.md) for th
 |---|---|---|
 | [Terrakube](https://terrakube.io/) | Open-source TFC/TFE replacement | Closest peer — comparable full-platform scope (see below) |
 | [OpenTofu](https://opentofu.org/) | Open-source Terraform fork (CLI) | CLI only — no collaboration platform; Terrapod runs it as an engine |
-| [Atlantis](https://www.runatlantis.io/) | PR-based plan/apply automation | No UI, no state management, no registry, no RBAC |
-| [Digger](https://digger.dev/) | CI-native Terraform orchestration | Runs inside CI; no standalone platform |
-| [Terrateam](https://terrateam.io/) | GitHub-integrated TF automation | GitHub-coupled; limited community edition |
+| [Atlantis](https://www.runatlantis.io/) | PR-based plan/apply automation | Focused PR automation; not a full state/registry/UI platform — pairs with your existing tooling |
+| [Digger](https://digger.dev/) | CI-native Terraform orchestration | Runs inside your CI; deliberately no separate execution engine to operate |
+| [Terrateam](https://terrateam.io/) | GitHub-integrated TF automation | GitHub-focused; open-core (community + paid tiers) |
 | [Spacelift](https://spacelift.io/) | Commercial TF management platform | Not open source |
 
 ### Terrakube
@@ -494,11 +497,12 @@ Reports are written to `reports/pentest/`. See [SECURITY.md](SECURITY.md) for th
 
 **Where Terrapod is genuinely differentiated.** The first three share one theme — Terrapod is built for restricted-network, multi-cluster, low-upstream-dependency topologies:
 
-- **Firewall-friendly cross-cluster execution** — Terrapod runners connect *outbound* to the control plane over SSE and create Jobs locally, so the API holds no inbound reach and no Kubernetes access into the execution cluster. This suits isolated / NAT'd / outbound-only execution clusters. Per Terrakube's documented model, its API reaches into the executor (so the executor is exposed to the control plane) — a different network topology, better fit for different constraints.
+- **Firewall-friendly cross-cluster execution** — Terrapod runners connect *outbound* to the control plane over SSE and create Jobs locally, so the API holds no inbound reach and no Kubernetes access into the execution cluster. This suits isolated / NAT'd / outbound-only execution clusters. Terrakube integrates execution differently — a control-plane-coordinated executor model — a different network topology that fits different constraints.
 - **Polling-first VCS** — Terrapod supports inbound webhooks (GitHub and GitLab) but does not require them: it also polls VCS over outbound HTTPS, so the integration works behind firewalls/NATs with no inbound delivery. Terrakube uses webhook delivery. Different fits for inbound-restricted networks.
 - **Pull-through provider mirror + terraform/tofu binary cache** — runners have zero direct upstream dependency; Terrakube ships a local plugin cache.
 - **Monorepo autodiscovery** — Atlantis-style auto-creation of workspaces from glob-matched directories on PRs (Terrakube has directory filtering, but not auto-creation).
 - **Run tasks** — pre/post-plan external webhook validation hooks (not present in Terrakube).
+- **Custom execution steps** — *execution hooks* run operator-supplied shell at five run-lifecycle points (`pre_init`, `pre_plan`, `post_plan`, `pre_apply`, `post_apply`) inside the runner Job, as reusable, workspace-associated library entries with priority ordering, fail-the-run semantics, audit logging, and a platform kill-switch. `pre_init` is the pre-`init` slot for installing extra tooling, authenticating to a secret backend, or fetching certs; heavier or image-level customization uses a custom runner image. See [docs/execution-hooks.md](docs/execution-hooks.md).
 - **In-platform AI** — plan summaries, failure analysis, and chat (Terrakube integrates AI via an external MCP server).
 - **Native Terragrunt** — a per-workspace flag wraps agent-mode runs in `terragrunt` (pull-through binary cache, local-backend reconciliation) while Terrapod keeps owning state and the run lifecycle; CLI-driven runs need no config. See [docs/terragrunt.md](docs/terragrunt.md).
 - Additionally — first-class OPA **policy sets** with mandatory/advisory enforcement, native multi-channel **notifications** (Slack/email/webhook), and cross-workspace **run triggers**.
@@ -512,6 +516,8 @@ Licensing: Terrapod is **MPL-2.0** (file-level copyleft, the same license as Ope
 ## License
 
 [MPL-2.0](LICENSE) — file-level copyleft keeps Terrapod's own source open while staying friendly to enterprise adoption (the same license as OpenTofu and the historical Terraform codebase). For most operators this is a non-issue: **running Terrapod internally, self-hosted, imposes no obligation to disclose your own code or configuration** — MPL-2.0's copyleft is file-level (it attaches to modifications of Terrapod's *own* files you distribute), and there is no network-use trigger.
+
+**Terrapod is free, and always will be.** There is no commercial edition, no open-core split, no paid "enterprise" tier, and no per-resource or per-seat pricing — now or planned. The complete platform lives in this repository; nothing documented here is gated behind a paid plan.
 
 ---
 

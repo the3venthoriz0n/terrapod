@@ -41,7 +41,7 @@ Beyond broad TFE compatibility, Terrapod is built with three deliberate design f
 | **Notifications** | Webhook (HMAC-SHA512), Slack (Block Kit), and email alerts on run events |
 | **Interactive Slack app** | Outbound Socket Mode app: `/terrapod` account linking (explicit confirm step) + opt-in per-workspace run notifications with RBAC-checked Approve/Discard buttons; multiple deployments can share one Slack workspace via per-deployment `slack.command`/`slack.label` ([Slack integration](slack-integration.md)) |
 | **Run Tasks** | Pre/post-plan webhook hooks for external validation |
-| **Execution Hooks** | Admin-managed custom shell steps run in the runner Job at five lifecycle points, associated with workspaces |
+| **Execution Hooks** | **Custom execution steps** — admin-managed shell run in the runner Job at five run-lifecycle points, associated with workspaces (`pre_init` is the setup/tooling/auth slot; custom runner images cover heavier needs) |
 | **Policy-as-Code** | OPA/Rego policy sets evaluated on every run; advisory or mandatory enforcement, label-scoped |
 | **Drift Detection** | Scheduled plan-only runs to detect out-of-band infrastructure changes |
 | **Workspace Health** | Per-workspace health conditions with status indicators on workspace list |
@@ -52,6 +52,7 @@ Beyond broad TFE compatibility, Terrapod is built with three deliberate design f
 | **Workspace Autodiscovery** | Atlantis-style monorepo autodiscovery with rule templating; safe-by-default rename/delete/orphan lifecycle (opt-in destroy) |
 | **Bulk Workspace Operations** | Server-side workspace search + all-or-nothing bulk settings update (dry-run by default; never triggers runs) |
 | **Cross-Workspace Remote State** | `terraform_remote_state` composition with a producer-controlled consumer allowlist (secure by default; secret-bearing state stays with its owner) |
+| **Internationalization** | Web UI translated into 24 languages (next-intl); AI plan summaries translated at view time; completeness-gated so a partial language is never shipped. See [i18n](internationalization.md) |
 | **Migrate in (TFE / HCP / Atlantis)** | [`terrapod-migrate`](migration.md) — a dry-run-first, reversible CLI that moves an existing Terraform Enterprise / HCP Terraform / Atlantis platform onto Terrapod: previews, creates the core (VCS connections, workspaces, variables, variable sets, state with serial + lineage preserved, run triggers, notifications, agent pools, registry signing keys), verifies parity, and rolls back cleanly. Registry versions are reported for re-publish; RBAC is suggested, never auto-applied |
 
 ---
@@ -113,6 +114,8 @@ See [Architecture](architecture.md) for the full breakdown.
 
 | Guide | Description |
 |---|---|
+| [Alternatives to Terraform Enterprise / Terraform Cloud](alternatives.md) | Where Terrapod fits among open-source TACOS (Terrakube, Digger, …); is-there-a-free-alternative answers, a neutral comparison, and when to pick Terrapod |
+| [FAQ](faq.md) | Straight answers to the common buyer questions (free — and always free, no paid tier? OpenTofu? Terragrunt? air-gapped? production-ready? do I really need Kubernetes? can mixed-tool teams share one install? monorepo / dedicated / mixed repos? per-workspace CPU+memory? vs Terrakube/Atlantis/Digger?) |
 | [Getting Started](getting-started.md) | Deploy the Helm chart on Kubernetes (or k3s), first workspace, first plan/apply |
 | [Migration](migration.md) | Move a TFE / HCP Terraform or Atlantis platform onto Terrapod with `terrapod-migrate` — dry-run-first, reversible, with an explicit "what transfers vs. what's a checklist" breakdown |
 | [Local Development](local-development.md) | Run Terrapod from source with Tilt (contributors only) |
@@ -150,6 +153,8 @@ See [Architecture](architecture.md) for the full breakdown.
 | [Optional split webhook ingress](deployment-webhook-ingress.md) | Optional second Ingress for the public-must-reach surface (VCS webhooks, run-task callbacks) |
 | [Forward proxy & custom CA trust](deployment-proxy.md) | Route all outbound HTTP(S) through a corporate proxy and trust a private/MITM CA, across every component including runner Jobs |
 | [Security Hardening](security-hardening.md) | TLS, secrets management, network policies, rate limiting |
+| [Versioning & Support](versioning-and-support.md) | What each version bump guarantees, the stable surfaces + their CI gates, component version-skew support, the deprecation window, and the support matrix |
+| [Deprecations](deprecations.md) | The authoritative list of deprecated surfaces and their sunset dates, plus how to read the API's `Deprecation`/`Sunset` headers |
 | [Known Limitations](known-limitations.md) | What Terrapod does not (yet) do — deployment, scope, and feature constraints, stated plainly |
 | [Production Checklist](production-checklist.md) | Step-by-step checklist for go-live readiness |
 | [Disaster Recovery](disaster-recovery.md) | Break-glass state recovery, shipped DB backup CronJob + restore-verification DR drill, per-backend object-storage protection |

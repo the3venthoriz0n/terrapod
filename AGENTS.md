@@ -281,6 +281,55 @@ staged plan live in issue **#719**; the rules a contributor must follow:
   and **must not** break the mobile guard. Breaking the mobile guard fails CI
   — that is the gate.
 
+## Internationalisation — every UX string is translated (hard requirement)
+
+The web UI is fully internationalised with **next-intl** (#767). Locale is
+resolved per-request from the `NEXT_LOCALE` cookie → `Accept-Language` → `en`
+(no `/[locale]/` URL segment); the nav globe switcher writes the cookie. `en`
+(US English) is the **source** catalog (`web/messages/en.json`); every other
+locale deep-merges over it, so a partial catalog always renders (English
+fallback, never a `MISSING_KEY`). The AI plan-summary/chat is translated at
+**view time** by the model (locale-agnostic — works for every locale without a
+catalog entry).
+
+The rule a contributor must follow — **a UX change is not accepted unless its
+multi-language implementation ships in the same PR**:
+
+- **No hardcoded user-facing strings.** Every label, button, heading,
+  placeholder, `<option>`, table header, empty state, toast/error/success
+  message, `confirm()` text, tooltip, and badge word goes through
+  `useTranslations(...)`/`getTranslations(...)` — never a raw English literal in
+  JSX. **Do** leave code identifiers, terraform/HCL keywords, resource
+  addresses, product names, env vars, and CLI flags untranslated (they're not
+  UX copy). This is **enforced**: the `i18n:lint` gate (`npm run i18n:lint`, in
+  CI) is an AST guard that fails on a new raw JSX literal not routed through
+  next-intl, ratcheting against a committed baseline
+  (`web/scripts/i18n-hardcoded-allowlist.json`). A genuine non-copy literal is
+  suppressed with an `i18n-ignore` comment on the line.
+- **A locale is complete or it is not offered — no partial locales ship.** Add
+  the key to `web/messages/en.json` (the source), then to **every offered
+  locale** (`web/messages/<code>.json` for each code in `locales` in
+  `src/i18n/config.ts`). The `i18n:check` gate (`npm run i18n:check`, run in CI)
+  fails the build if any offered locale is missing a key or has an extra one, so
+  a half-translated language can never merge. English deep-merge stays only as a
+  crash guard (never render `MISSING_KEY`), **not** as a licence to ship a
+  partial language. If you can't translate a new string into every offered
+  locale, either translate it (the catalogs are machine-translatable in bulk —
+  see the fill pipeline) or drop that locale from `locales` until it is caught
+  up. `de` is the maintained reference; **`en-GB` is the one exception** — a
+  British dialect *override* that carries only the spelling deltas from the
+  American source (the shared strings are genuinely identical, not a gap), so it
+  is gated as a subset, not full parity.
+- **Preserve ICU + tags.** Placeholders (`{name}`, `{count, plural, one {…}
+  other {…}}`, `#`, escaped `'{'`/`'}'`) and rich-text tag names (`<code>`,
+  `<strong>`, `<link>`, …) are structural — translate only the human words
+  between them. A lone `'` in a value starts an ICU quote; escape a literal
+  apostrophe as `''`. Every catalog string must parse as valid ICU.
+- **A new frontend page/component ships its i18n in the same PR** as the
+  component itself — the same way it ships its responsive assertion and its E2E
+  spec. A page with raw English literals is an incomplete change, not a done
+  one.
+
 ## Conventions
 
 - **Issue-first** — every change beyond a genuinely trivial tweak (a typo, a
@@ -294,10 +343,21 @@ staged plan live in issue **#719**; the rules a contributor must follow:
 - **Namespace package (hard requirement)** — `services/terrapod/__init__.py`
   must **not** exist. Its absence enables PEP 420 implicit namespace packages
   so each Docker image can include only the sub-packages it needs.
-- **Migrations** — Alembic with async SQLAlchemy and hash-based revision IDs
-  (generate with `python3 -c "import secrets; print(secrets.token_hex(6))"`),
-  not sequential numbers. Every migration has a real `upgrade()` **and**
-  `downgrade()`.
+- **Migrations — reversible + expand/contract (hard requirement, gated)** —
+  Alembic with async SQLAlchemy and hash-based revision IDs (generate with
+  `python3 -c "import secrets; print(secrets.token_hex(6))"`), not sequential
+  numbers. Every migration has a real `upgrade()` **and** `downgrade()` (no
+  stubs — enforced by `tests/db/test_migration_contract.py`). Because the API
+  runs multiple replicas, a rolling upgrade runs **old and new code against the
+  same database at once**, so a migration must never **contract** the schema
+  (drop/rename/retype a column or table in `upgrade()`) in the same release the
+  code stops using it — that breaks the old replica still serving traffic.
+  Follow **expand → migrate → wait a release → contract**: add the new column
+  and dual-write/backfill in release N, switch reads in N, and only drop the old
+  column in N+1 (or later). Every `upgrade()`-side contraction is ledgered
+  (`tests/db/migration_contractions.json`); a new one fails CI until you
+  consciously acknowledge it followed this discipline (regenerate the ledger
+  with `UPDATE_API_CONTRACT=1 pytest tests/db/test_migration_contract.py`).
 - **Substantial API tempfiles go on the attached PVC, not `/tmp`** — on the
   API pod `/tmp` is RAM-backed. Anything that can hold tens of MB (provider
   archives, VCS tarballs, state snapshots, config tarballs) must be written to
