@@ -8,12 +8,9 @@
     "start": "next start --port 3000",
     "lint": "eslint src/",
     "type-check": "tsc --noEmit",
-<<<<<<< ak/group-ws-2-clean
-    "test": "tsx --test src/lib/__tests__/**/*.test.ts"
-=======
+    "test": "tsx --test src/lib/__tests__/**/*.test.ts",
     "i18n:check": "node scripts/check-i18n-completeness.mjs",
     "i18n:lint": "node scripts/check-no-hardcoded-strings.mjs"
->>>>>>> main
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.18",

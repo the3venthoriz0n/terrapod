@@ -1331,7 +1331,6 @@ function WorkspacesPageInner() {
         ) : workspaces.length === 0 ? (
           <EmptyState message={t('empty.none')} />
         ) : filteredWorkspaces.length === 0 ? (
-<<<<<<< ak/group-ws-2-clean
           <EmptyState message="No workspaces match this filter." />
         ) : groupMode !== 'flat' && workspaceTree.length > 0 ? (
           <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 overflow-hidden">
@@ -1373,9 +1372,6 @@ function WorkspacesPageInner() {
               </tbody>
             </table>
           </div>
-=======
-          <EmptyState message={t('empty.noMatch')} />
->>>>>>> main
         ) : (
           <div className="bg-slate-800/50 rounded-lg border border-slate-700/50 overflow-hidden">
             <table className="w-full">
